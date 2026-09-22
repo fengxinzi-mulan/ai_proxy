@@ -1,0 +1,89 @@
+:root {
+  --page-bg: #f5f7fa;
+  --panel-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.06);
+  --radius: 12px;
+  --mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+html.dark {
+  --page-bg: #101014;
+  --panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--page-bg);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  /* 页面切换时不希望出现横向抖动 */
+  overflow-x: hidden;
+}
+
+/* 页面最外层容器 */
+.page {
+  /* 底部留一点余量：卡片的投影、描边都画在盒子外面，
+     内容正好顶到滚动容器下沿时这些会被裁掉。 */
+  padding-bottom: 8px;
+}
+
+/* 统一的卡片外观，让各页面的面板观感一致 */
+.panel {
+  border-radius: var(--radius);
+  box-shadow: var(--panel-shadow);
+  background: var(--n-color, #fff);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 日志报文预览：等宽、可换行、限高 */
+.code-block {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+.scroll-area {
+  overflow: auto;
+}
+
+/* 细滚动条，避免在暗色主题下过于突兀 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.35);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.55);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 细滚动条，避免在暗色主题下过于突兀 */

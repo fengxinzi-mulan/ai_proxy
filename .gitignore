@@ -1,0 +1,25 @@
+# 构建产物
+/ai_proxy
+/ai_proxy.exe
+*.exe
+
+# 运行时数据（SQLite 数据库）
+/data/
+
+# 前端构建产物：由 npm run build 生成，通过 go:embed 打进二进制。
+# 只保留 .gitkeep，让 go:embed 在未构建前端时也能找到这个目录。
+/web/dist/*
+!/web/dist/.gitkeep
+
+# 前端依赖
+/web/node_modules/
+
+# 编辑器与系统文件
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# 智能编码工具的工作目录（方案草稿等），不属于项目源码
+.zcode/

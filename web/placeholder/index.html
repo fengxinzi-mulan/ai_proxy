@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Proxy · 前端尚未构建</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f5f7fa;
+        color: #333;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+          'Microsoft YaHei', sans-serif;
+      }
+      .card {
+        max-width: 620px;
+        padding: 36px 40px;
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.08);
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 20px;
+      }
+      p {
+        line-height: 1.8;
+        color: #555;
+      }
+      code {
+        background: #f0f2f5;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 13px;
+      }
+      pre {
+        background: #1e1e1e;
+        color: #e6e6e6;
+        padding: 14px 16px;
+        border-radius: 8px;
+        overflow-x: auto;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.7;
+      }
+      .note {
+        margin-top: 18px;
+        padding: 12px 14px;
+        background: #eef6ff;
+        border-radius: 8px;
+        font-size: 13px;
+        color: #2c5f9e;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>前端还没有构建</h1>
+      <p>
+        服务端已经在正常运行，代理转发功能可以直接使用 —— 只是管理界面还没有打包进来。
+        构建一次前端，然后重新编译即可。
+      </p>
+      <pre>cd web
+npm install
+npm run build
+cd ..
+go build -o ai_proxy.exe .</pre>
+      <p>或者直接用一键脚本：<code>make release</code>（Linux / macOS / Git Bash）或 <code>build.bat</code>（Windows）。</p>
+      <div class="note">
+        代理入口不受影响：把客户端的 base_url 指向本服务即可开始转发与记账，
+        日志通过 <code>/api/logs</code> 也能查到。
+      </div>
+    </div>
+  </body>
+</html>
