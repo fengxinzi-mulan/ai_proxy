@@ -16,7 +16,10 @@ import (
 //
 // 任何一步出错（JSON 解析失败、结构不符合该格式）都直接放弃改写并原样转发 —
 // 宁可少注入一次提示词，也不能把用户的请求改坏。
-func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte) ([]byte, []string) {
+//
+// modelName 由调用方解析后传入，用于匹配「按模型正则」的提示词规则：Gemini 的模型名
+// 不在请求体里，只有调用方（能看到 URL 路径）解析得出来。
+func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, modelName string) ([]byte, []string) {
 	if len(rawBody) == 0 {
 		return rawBody, nil
 	}
@@ -25,7 +28,7 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte) 
 	// 其余格式（anthropic / gemini / responses）要么本来就返回用量，
 	// 要么不认这个字段，一律不注入。
 	wantUsageInject := prov.APIFormat == model.FormatOpenAI && shouldInjectUsageOption(prov, st)
-	promptText, promptStrategy, hasPrompt := resolvePrompt(prov, st, modelNameFromBody(rawBody))
+	promptText, promptStrategy, hasPrompt := resolvePrompt(prov, st, modelName)
 	if !wantUsageInject && !hasPrompt {
 		return rawBody, nil
 	}

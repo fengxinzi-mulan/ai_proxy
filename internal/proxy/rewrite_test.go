@@ -28,7 +28,7 @@ func TestRewriteInjectsIncludeUsage(t *testing.T) {
 	st := model.DefaultSettings() // UsageInjectDefault = true
 	body := []byte(`{"model":"m","stream":true,"messages":[]}`)
 
-	out, mods := rewriteRequestBody(baseProvider(), st, body)
+	out, mods := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	if len(mods) != 1 || mods[0] != "usage_inject" {
 		t.Fatalf("应记录 usage_inject 改动，实际 %v", mods)
 	}
@@ -42,7 +42,7 @@ func TestRewritePreservesExistingStreamOptions(t *testing.T) {
 	st := model.DefaultSettings()
 	body := []byte(`{"model":"m","stream":true,"stream_options":{"other_flag":123}}`)
 
-	out, _ := rewriteRequestBody(baseProvider(), st, body)
+	out, _ := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	so := decode(t, out)["stream_options"].(map[string]any)
 	if so["include_usage"] != true {
 		t.Error("应在保留原键的基础上补上 include_usage")
@@ -57,7 +57,7 @@ func TestRewriteSkipsNonStreaming(t *testing.T) {
 	st := model.DefaultSettings()
 	body := []byte(`{"model":"m","stream":false,"messages":[]}`)
 
-	out, mods := rewriteRequestBody(baseProvider(), st, body)
+	out, mods := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	if len(mods) != 0 {
 		t.Errorf("非流式请求不该注入 usage 参数，实际 %v", mods)
 	}
@@ -73,7 +73,7 @@ func TestRewriteSkipsNonOpenAIFormats(t *testing.T) {
 	for _, format := range []model.APIFormat{model.FormatAnthropic, model.FormatGemini, model.FormatResponses} {
 		p := baseProvider()
 		p.APIFormat = format
-		out, mods := rewriteRequestBody(p, st, body)
+		out, mods := rewriteRequestBody(p, st, body, modelNameFromBody(body))
 		if len(mods) != 0 {
 			t.Errorf("%s 不该注入 stream_options，实际 %v", format, mods)
 		}
@@ -87,7 +87,7 @@ func TestRewriteAlreadyEnabled(t *testing.T) {
 	st := model.DefaultSettings()
 	body := []byte(`{"model":"m","stream":true,"stream_options":{"include_usage":true}}`)
 
-	_, mods := rewriteRequestBody(baseProvider(), st, body)
+	_, mods := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	// 客户端本来就开了，就不算我们改的，不该留下改写标记。
 	if len(mods) != 0 {
 		t.Errorf("已开启时不应记录改动，实际 %v", mods)
@@ -100,7 +100,7 @@ func TestRewriteUsageInjectModeOverride(t *testing.T) {
 	p := baseProvider()
 	p.UsageInjectMode = "off"
 	body := []byte(`{"model":"m","stream":true}`)
-	_, mods := rewriteRequestBody(p, st, body)
+	_, mods := rewriteRequestBody(p, st, body, modelNameFromBody(body))
 	if len(mods) != 0 {
 		t.Errorf("供应商级 off 应覆盖全局默认，实际 %v", mods)
 	}
@@ -109,7 +109,7 @@ func TestRewriteUsageInjectModeOverride(t *testing.T) {
 	st.UsageInjectDefault = false
 	p = baseProvider()
 	p.UsageInjectMode = "on"
-	_, mods = rewriteRequestBody(p, st, body)
+	_, mods = rewriteRequestBody(p, st, body, modelNameFromBody(body))
 	if len(mods) != 1 {
 		t.Errorf("供应商级 on 应覆盖全局默认，实际 %v", mods)
 	}
@@ -128,7 +128,7 @@ func TestPromptAppendOpenAIStringContent(t *testing.T) {
 	st := promptSettings("全局提示", model.StrategyAppend)
 	body := []byte(`{"model":"m","messages":[{"role":"system","content":"原始提示"},{"role":"user","content":"hi"}]}`)
 
-	out, mods := rewriteRequestBody(baseProvider(), st, body)
+	out, mods := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	if len(mods) != 1 || mods[0] != "prompt_append" {
 		t.Fatalf("应记录 prompt_append，实际 %v", mods)
 	}
@@ -147,7 +147,7 @@ func TestPromptAppendOpenAIContentParts(t *testing.T) {
 	st := promptSettings("全局提示", model.StrategyAppend)
 	body := []byte(`{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"原始"}]}]}`)
 
-	out, _ := rewriteRequestBody(baseProvider(), st, body)
+	out, _ := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	parts := decode(t, out)["messages"].([]any)[0].(map[string]any)["content"].([]any)
 	if len(parts) != 2 {
 		t.Fatalf("应在分块数组中追加一块，实际 %d 块", len(parts))
@@ -161,7 +161,7 @@ func TestPromptAppendWithoutSystemMessage(t *testing.T) {
 	st := promptSettings("全局提示", model.StrategyAppend)
 	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
 
-	out, _ := rewriteRequestBody(baseProvider(), st, body)
+	out, _ := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	msgs := decode(t, out)["messages"].([]any)
 	if len(msgs) != 2 {
 		t.Fatalf("应插入一条 system 消息，实际 %d 条", len(msgs))
@@ -176,7 +176,7 @@ func TestPromptReplace(t *testing.T) {
 	st := promptSettings("新提示", model.StrategyReplace)
 	body := []byte(`{"model":"m","messages":[{"role":"system","content":"原始提示"},{"role":"user","content":"hi"}]}`)
 
-	out, _ := rewriteRequestBody(baseProvider(), st, body)
+	out, _ := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	sys := decode(t, out)["messages"].([]any)[0].(map[string]any)
 	if sys["content"] != "新提示" {
 		t.Errorf("替换策略应完全覆盖原 system，实际 %v", sys["content"])
@@ -187,7 +187,7 @@ func TestPromptPrependUser(t *testing.T) {
 	st := promptSettings("前置说明", model.StrategyPrependUser)
 	body := []byte(`{"model":"m","messages":[{"role":"system","content":"原始提示"},{"role":"user","content":"hi"}]}`)
 
-	out, _ := rewriteRequestBody(baseProvider(), st, body)
+	out, _ := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	msgs := decode(t, out)["messages"].([]any)
 	if len(msgs) != 3 {
 		t.Fatalf("应多出一条 user 消息，实际 %d 条", len(msgs))
@@ -212,7 +212,7 @@ func TestPromptAnthropicSystemField(t *testing.T) {
 	st.UsageInjectDefault = false
 
 	// system 为字符串
-	out, mods := rewriteRequestBody(p, st, []byte(`{"model":"m","system":"原有","messages":[]}`))
+	out, mods := rewriteRequestBody(p, st, []byte(`{"model":"m","system":"原有","messages":[]}`), modelNameFromBody([]byte(`{"model":"m","system":"原有","messages":[]}`)))
 	if len(mods) != 1 {
 		t.Fatalf("应发生注入，实际 %v", mods)
 	}
@@ -221,14 +221,14 @@ func TestPromptAnthropicSystemField(t *testing.T) {
 	}
 
 	// system 为 blocks 数组
-	out, _ = rewriteRequestBody(p, st, []byte(`{"model":"m","system":[{"type":"text","text":"原有"}],"messages":[]}`))
+	out, _ = rewriteRequestBody(p, st, []byte(`{"model":"m","system":[{"type":"text","text":"原有"}],"messages":[]}`), modelNameFromBody([]byte(`{"model":"m","system":[{"type":"text","text":"原有"}],"messages":[]}`)))
 	blocks := decode(t, out)["system"].([]any)
 	if len(blocks) != 2 {
 		t.Errorf("应在 blocks 数组末尾追加一块，实际 %d 块", len(blocks))
 	}
 
 	// system 缺失时新建
-	out, _ = rewriteRequestBody(p, st, []byte(`{"model":"m","messages":[]}`))
+	out, _ = rewriteRequestBody(p, st, []byte(`{"model":"m","messages":[]}`), modelNameFromBody([]byte(`{"model":"m","messages":[]}`)))
 	if decode(t, out)["system"] != "提示" {
 		t.Errorf("system 缺失时应新建: %s", out)
 	}
@@ -243,7 +243,7 @@ func TestPromptGeminiSystemInstruction(t *testing.T) {
 	st := model.DefaultSettings()
 	st.UsageInjectDefault = false
 
-	out, mods := rewriteRequestBody(p, st, []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	out, mods := rewriteRequestBody(p, st, []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`), modelNameFromBody([]byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)))
 	if len(mods) != 1 {
 		t.Fatalf("应发生注入，实际 %v", mods)
 	}
@@ -262,14 +262,14 @@ func TestPromptRuleByModelRegex(t *testing.T) {
 	}
 
 	// 命中规则
-	out, _ := rewriteRequestBody(p, model.DefaultSettings(), []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"x"}]}`))
+	out, _ := rewriteRequestBody(p, model.DefaultSettings(), []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"x"}]}`), modelNameFromBody([]byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"x"}]}`)))
 	msgs := decode(t, out)["messages"].([]any)
 	if msgs[0].(map[string]any)["content"] != "GPT4 专用" {
 		t.Errorf("模型规则未生效: %s", out)
 	}
 
 	// 未命中规则且全局提示词未启用，则不改写
-	_, mods := rewriteRequestBody(p, model.DefaultSettings(), []byte(`{"model":"claude-3","messages":[]}`))
+	_, mods := rewriteRequestBody(p, model.DefaultSettings(), []byte(`{"model":"claude-3","messages":[]}`), modelNameFromBody([]byte(`{"model":"claude-3","messages":[]}`)))
 	if len(mods) != 0 {
 		t.Errorf("模型不匹配时不应注入，实际 %v", mods)
 	}
@@ -282,7 +282,7 @@ func TestPromptInvalidRegexIsIgnored(t *testing.T) {
 	}
 	body := []byte(`{"model":"gpt-4o","messages":[]}`)
 
-	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body)
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
 	// 非法正则不应该 panic，也不应该注入；此时应原样返回。
 	if len(mods) != 0 {
 		t.Errorf("非法正则规则应被跳过，实际 %v", mods)
@@ -299,7 +299,7 @@ func TestPromptModeDisable(t *testing.T) {
 	st := promptSettings("全局提示", model.StrategyAppend)
 	body := []byte(`{"model":"m","messages":[]}`)
 
-	out, mods := rewriteRequestBody(p, st, body)
+	out, mods := rewriteRequestBody(p, st, body, modelNameFromBody(body))
 	if len(mods) != 0 {
 		t.Errorf("供应商级 disable 应阻止全局提示词注入，实际 %v", mods)
 	}
@@ -312,7 +312,7 @@ func TestRewriteMalformedBodyIsPassedThrough(t *testing.T) {
 	st := model.DefaultSettings()     // usage 注入默认开启，会触发解析
 	body := []byte(`{"stream":true,`) // 故意截断的 JSON
 
-	out, mods := rewriteRequestBody(baseProvider(), st, body)
+	out, mods := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
 	if len(mods) != 0 {
 		t.Errorf("解析失败时不应报告改写，实际 %v", mods)
 	}
@@ -322,7 +322,7 @@ func TestRewriteMalformedBodyIsPassedThrough(t *testing.T) {
 }
 
 func TestRewriteEmptyBody(t *testing.T) {
-	out, mods := rewriteRequestBody(baseProvider(), model.DefaultSettings(), nil)
+	out, mods := rewriteRequestBody(baseProvider(), model.DefaultSettings(), nil, modelNameFromBody(nil))
 	if out != nil || mods != nil {
 		t.Error("空请求体应直接返回")
 	}

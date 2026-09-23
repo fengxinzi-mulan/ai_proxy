@@ -106,7 +106,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	in.reqBody = reqBody
 
-	in.outBody, in.modifications = rewriteRequestBody(prov, settings, reqBody)
+	// 模型名与流式意图都在改写之前解析：写入日志、实时监控和提示词规则匹配都要用，
+	// 而 Gemini 这两项都不在请求体里（模型在路径上，流式靠 :streamGenerateContent / alt=sse）。
+	in.model = modelNameForRequest(prov.APIFormat, in.clientPath, reqBody)
+	in.wantStream = requestWantsStream(prov.APIFormat, in.clientPath, r.URL.RawQuery, reqBody)
+	in.outBody, in.modifications = rewriteRequestBody(prov, settings, reqBody, in.model)
 
 	s.forward(w, r, in)
 }
@@ -120,6 +124,8 @@ type forwardInput struct {
 	clientPath    string
 	clientIP      string
 	upstreamPath  string
+	model         string // 请求模型：Gemini 在 URL 路径里，其余格式在请求体里
+	wantStream    bool   // 客户端是否要求流式响应
 	reqBody       []byte // 客户端原始请求体
 	outBody       []byte // 改写后实际发出的请求体
 	modifications []string
@@ -160,9 +166,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput
 	s.live.Add(model.LiveRequest{
 		ID:           liveID,
 		ProviderName: prov.DisplayName,
-		Model:        modelNameFromBody(in.outBody),
+		Model:        in.model,
 		Path:         in.clientPath,
-		Stream:       requestWantsStream(in.outBody),
+		Stream:       in.wantStream,
 		ClientIP:     in.clientIP,
 	})
 	defer s.live.Remove(liveID)
@@ -383,10 +389,10 @@ func (s *Server) record(in forwardInput, res logResult) {
 		ProxyUsed:       res.proxyDesc,
 		Method:          in.method,
 		Path:            in.clientPath,
-		Model:           modelNameFromBody(in.outBody),
+		Model:           in.model,
 		ModelResponse:   res.model,
 		APIFormat:       string(in.provider.APIFormat),
-		Stream:          requestWantsStream(in.outBody),
+		Stream:          in.wantStream,
 		ReasoningEffort: extractReasoningEffort(in.provider.APIFormat, in.outBody),
 		ClientIP:        in.clientIP,
 
@@ -845,8 +851,53 @@ func readRequestBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-// requestWantsStream 读取请求里的 stream 字段。
-func requestWantsStream(body []byte) bool {
+// modelNameForRequest 读出本次请求的模型名。
+//
+// 除 Gemini 外的格式都把模型名放在请求体里，直接读体即可；Gemini 的模型名在 URL 路径上
+// （/v1beta/models/<model>:generateContent），请求体里没有这个字段，只读请求体会让这些请求
+// 在模型排行、实时监控和「按模型匹配的提示词规则」里一起落空。
+func modelNameForRequest(format model.APIFormat, path string, body []byte) string {
+	if format == model.FormatGemini {
+		if m := geminiModelFromPath(path); m != "" {
+			return m
+		}
+	}
+	return modelNameFromBody(body)
+}
+
+// geminiModelFromPath 从 /models/<模型名>:<方法> 里取出模型名，取不到返回空串。
+//
+// 从最后一个 /models/ 开始找：Vertex AI 形态的路径是
+// /v1/projects/<p>/locations/<l>/publishers/google/models/<model>:generateContent，
+// 取最后一个才拿得到模型名。
+func geminiModelFromPath(path string) string {
+	const marker = "/models/"
+	idx := strings.LastIndex(path, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := path[idx+len(marker):]
+	end := strings.IndexByte(rest, ':')
+	if end <= 0 {
+		return ""
+	}
+	// 模型名后面紧跟 :方法名；中间出现斜杠说明这一段不是模型名。
+	model := rest[:end]
+	if strings.Contains(model, "/") {
+		return ""
+	}
+	return model
+}
+
+// requestWantsStream 判断客户端是否要求流式响应。
+//
+// Gemini 不认请求体里的 stream 字段：流式写在路径的 :streamGenerateContent 上，
+// 或者写成 ?alt=sse。这里只判断「客户端的意图」，响应到底是不是流式由响应头决定
+// （TPS 的计算走的是那条判断）。
+func requestWantsStream(format model.APIFormat, path, rawQuery string, body []byte) bool {
+	if format == model.FormatGemini && geminiWantsStream(path, rawQuery) {
+		return true
+	}
 	if len(body) == 0 {
 		return false
 	}
@@ -854,12 +905,23 @@ func requestWantsStream(body []byte) bool {
 	if err != nil {
 		return false
 	}
-	if v, ok := obj["stream"].(bool); ok {
-		return v
+	v, _ := obj["stream"].(bool)
+	return v
+}
+
+// geminiWantsStream 识别 Gemini 的两种流式写法：路径上的 :streamGenerateContent，以及 alt=sse。
+func geminiWantsStream(path, rawQuery string) bool {
+	if strings.Contains(path, ":streamGenerateContent") {
+		return true
 	}
-	// Gemini 用 ?alt=sse 表达流式，请求体里没有 stream 字段，
-	// 这里不做推断，交给响应 Content-Type 判断。
-	return false
+	if rawQuery == "" {
+		return false
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(q.Get("alt"), "sse")
 }
 
 // computeTPS 计算生成速度，即每秒输出 token 数。

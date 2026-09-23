@@ -609,3 +609,151 @@ func TestResponseStripping(t *testing.T) {
 		t.Error("改动了响应就应标记出来")
 	}
 }
+
+// ---------- Gemini：模型名与流式标记都在 URL 上，不在请求体里 ----------
+
+func TestGeminiModelFromPath(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"generateContent", "/v1beta/models/gemini-2.5-pro:generateContent", "gemini-2.5-pro"},
+		{"streamGenerateContent", "/v1beta/models/gemini-2.5-flash:streamGenerateContent", "gemini-2.5-flash"},
+		{"带短名前缀", "/p/gemini-备用/v1beta/models/gemini-2.5-pro:streamGenerateContent", "gemini-2.5-pro"},
+		{"countTokens 也带模型名", "/v1beta/models/gemini-2.5-pro:countTokens", "gemini-2.5-pro"},
+		{"Vertex 形态取最后一个 /models/", "/v1/projects/p/locations/l/publishers/google/models/gemini-2.5-pro:generateContent", "gemini-2.5-pro"},
+		{"模型列表没有模型名", "/v1beta/models", ""},
+		{"缺少 :方法 后缀", "/v1beta/models/gemini-2.5-pro", ""},
+		{"非 Gemini 路径", "/v1/chat/completions", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := geminiModelFromPath(c.path); got != c.want {
+				t.Errorf("geminiModelFromPath(%q) = %q，期望 %q", c.path, got, c.want)
+			}
+		})
+	}
+}
+
+func TestRequestWantsStream(t *testing.T) {
+	cases := []struct {
+		name   string
+		format model.APIFormat
+		path   string
+		query  string
+		body   string
+		want   bool
+	}{
+		{"OpenAI 流式", model.FormatOpenAI, "/v1/chat/completions", "", `{"model":"m","stream":true}`, true},
+		{"OpenAI 非流式", model.FormatOpenAI, "/v1/chat/completions", "", `{"model":"m","stream":false}`, false},
+		{"Gemini 路径流式", model.FormatGemini, "/v1beta/models/gemini-2.5-pro:streamGenerateContent", "", `{"contents":[]}`, true},
+		{"Gemini alt=sse", model.FormatGemini, "/v1beta/models/gemini-2.5-pro:generateContent", "alt=sse", `{"contents":[]}`, true},
+		{"Gemini alt=sse 大小写与附加参数", model.FormatGemini, "/v1beta/models/gemini-2.5-pro:generateContent", "key=k&alt=SSE", `{"contents":[]}`, true},
+		{"Gemini 非流式", model.FormatGemini, "/v1beta/models/gemini-2.5-pro:generateContent", "", `{"contents":[]}`, false},
+		{"Gemini 请求体里也带 stream 时按字面处理", model.FormatGemini, "/v1beta/models/gemini-2.5-pro:generateContent", "", `{"contents":[],"stream":true}`, true},
+		{"其余格式不看路径", model.FormatOpenAI, "/v1beta/models/gemini-2.5-pro:streamGenerateContent", "", `{}`, false},
+		{"请求体不是合法 JSON", model.FormatAnthropic, "/v1/messages", "", `{`, false},
+		{"空请求体", model.FormatOpenAI, "/v1/chat/completions", "", ``, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := requestWantsStream(c.format, c.path, c.query, []byte(c.body)); got != c.want {
+				t.Errorf("requestWantsStream(%s, %q, %q, %s) = %v，期望 %v", c.format, c.path, c.query, c.body, got, c.want)
+			}
+		})
+	}
+}
+
+func TestModelNameForRequest(t *testing.T) {
+	if got := modelNameForRequest(model.FormatGemini, "/v1beta/models/gemini-2.5-pro:streamGenerateContent", []byte(`{"contents":[]}`)); got != "gemini-2.5-pro" {
+		t.Errorf("Gemini 的模型名应取自 URL 路径，实际 %q", got)
+	}
+	// 路径里读不到时仍然回落到请求体，避免误伤把模型放在体里的兼容实现。
+	if got := modelNameForRequest(model.FormatGemini, "/v1beta/models", []byte(`{"model":"x"}`)); got != "x" {
+		t.Errorf("路径读不到时应回落到请求体，实际 %q", got)
+	}
+	if got := modelNameForRequest(model.FormatOpenAI, "/v1/chat/completions", []byte(`{"model":"gpt-4o"}`)); got != "gpt-4o" {
+		t.Errorf("OpenAI 的模型名应取自请求体，实际 %q", got)
+	}
+	// 其余格式只看请求体：路径里出现 /models/ 也不认。
+	if got := modelNameForRequest(model.FormatAnthropic, "/v1beta/models/gemini-2.5-pro:generateContent", []byte(`{"model":"claude-sonnet-4-5"}`)); got != "claude-sonnet-4-5" {
+		t.Errorf("非 Gemini 格式不应从路径取模型名，实际 %q", got)
+	}
+}
+
+// TestForwardGeminiFromPath 端到端覆盖：模型名与流式标记都只在 URL 上时，
+// 日志要正确落库，且「按模型正则」的提示词规则要能匹配上。
+func TestForwardGeminiFromPath(t *testing.T) {
+	chunks := []string{
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"你好"}]}}],"usageMetadata":{"promptTokenCount":18,"candidatesTokenCount":22,"totalTokenCount":40,"cachedContentTokenCount":6},"modelVersion":"gemini-2.5-pro"}` + "\n\n",
+		`data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":18,"candidatesTokenCount":22,"totalTokenCount":40,"cachedContentTokenCount":6},"modelVersion":"gemini-2.5-pro"}` + "\n\n",
+	}
+
+	var gotPath, gotQuery, gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		for _, c := range chunks {
+			io.WriteString(w, c)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	p := addProvider(t, st, upstream.URL, model.FormatGemini)
+	// 规则按模型正则匹配：模型名读不到就不会注入，这条断言因此能证明修复生效。
+	p.PromptRules = []model.PromptRule{
+		{ID: "1", Enabled: true, ModelPattern: `^gemini-2\.5-pro$`, Text: "只用中文回答", Strategy: model.StrategyAppend},
+	}
+	if _, err := st.UpdateProvider(p); err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+		strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}`))
+	req.RemoteAddr = "10.0.0.7:4444"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if gotPath != "/v1beta/models/gemini-2.5-pro:streamGenerateContent" || gotQuery != "alt=sse" {
+		t.Errorf("路径与查询串应原样转发，实际 %s?%s", gotPath, gotQuery)
+	}
+	// 注入提示词的目标是 Gemini 的 systemInstruction，原始请求里没有这个字段。
+	if !strings.Contains(gotBody, "只用中文回答") {
+		t.Errorf("按模型匹配的提示词规则未生效: %s", gotBody)
+	}
+
+	entry := lastLog(t, st)
+	if entry.Model != "gemini-2.5-pro" {
+		t.Errorf("请求模型应取自 URL 路径，实际 %q", entry.Model)
+	}
+	if entry.ModelResponse != "gemini-2.5-pro" {
+		t.Errorf("响应模型记录错误: %q", entry.ModelResponse)
+	}
+	if !entry.Stream {
+		t.Error(":streamGenerateContent 应记为流式请求")
+	}
+	if !entry.Success {
+		t.Errorf("应记为成功，错误信息: %s", entry.ErrorMsg)
+	}
+	if entry.PromptTokens != 18 || entry.CompletionTokens != 22 || entry.CachedTokens != 6 {
+		t.Errorf("用量记录错误: %+v", entry)
+	}
+	if entry.TPS <= 0 {
+		t.Errorf("流式响应应计算 TPS，实际 %v", entry.TPS)
+	}
+	if len(entry.Modifications) != 1 || entry.Modifications[0] != "prompt_append" {
+		t.Errorf("改写清单错误: %v", entry.Modifications)
+	}
+}
