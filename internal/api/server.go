@@ -63,6 +63,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/providers/{id}/test", s.handleTestProvider)
 	mux.HandleFunc("POST /api/providers/{id}/models", s.handleProviderModels)
 	mux.HandleFunc("GET /api/providers/{id}/keys", s.handleKeyHealth)
+	mux.HandleFunc("POST /api/providers/{id}/usage", s.handleProviderUsage)
 
 	mux.HandleFunc("GET /api/logs", s.handleListLogs)
 	mux.HandleFunc("DELETE /api/logs", s.handleDeleteLogs)
@@ -133,6 +134,8 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"authDefaults": auths,
 		"formatHints":  defaults,
 		"liveCount":    s.proxy.Live().Count(),
+		// 内置的套餐余量查询模板。纯静态元数据，随 meta 一起下发，省一次往返。
+		"usageTemplates": proxy.UsageTemplates(),
 		// 实际监听地址，可能与数据库中的设置不同（命令行参数优先）。
 		"listen": map[string]any{"host": s.listenHost, "port": s.listenPort},
 	})
@@ -194,10 +197,23 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 	type providerView struct {
 		model.Provider
 		KeyHealth map[string]proxy.KeyHealth `json:"keyHealth"`
+		// Usage 是服务端定时刷出来的最近一次用量快照。
+		// 随列表一起下发，卡片上的额度条就不用再单独请求一次。
+		Usage *model.UsageSnapshot `json:"usage"`
+	}
+	usage, err := s.store.ListProviderUsage()
+	if err != nil {
+		// 快照读不出来不该让整个供应商列表挂掉 —— 它只是附加信息。
+		s.logger.Warn("读取用量快照失败", "err", err)
+		usage = map[int64]model.UsageSnapshot{}
 	}
 	out := make([]providerView, 0, len(list))
 	for _, p := range list {
-		out = append(out, providerView{Provider: p, KeyHealth: s.proxy.KeyHealth(p)})
+		view := providerView{Provider: p, KeyHealth: s.proxy.KeyHealth(p)}
+		if snap, ok := usage[p.ID]; ok {
+			view.Usage = &snap
+		}
+		out = append(out, view)
 	}
 	s.writeJSON(w, http.StatusOK, out)
 }
@@ -212,7 +228,18 @@ func (s *Server) handleGetProvider(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, p)
+	type providerView struct {
+		model.Provider
+		Usage *model.UsageSnapshot `json:"usage"`
+	}
+	view := providerView{Provider: p}
+	snap, err := s.store.GetProviderUsage(id)
+	if err != nil {
+		s.logger.Warn("读取用量快照失败", "err", err)
+	} else {
+		view.Usage = snap
+	}
+	s.writeJSON(w, http.StatusOK, view)
 }
 
 // providerPayload 是供应商的请求体。
@@ -384,6 +411,48 @@ func (s *Server) handleKeyHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, s.proxy.KeyHealth(prov))
+}
+
+// handleProviderUsage 立即查询一次套餐余量并落库。
+//
+// 与 /test 一样接受「待保存」的配置覆盖，这样在编辑抽屉里改完模板就能直接查，
+// 不用先保存。查询失败不是 HTTP 错误，而是结果里的 ok=false + error/warnings ——
+// 上游这类接口没有契约，能读到哪算哪，界面要能把「读到一半」也讲明白。
+//
+// 定时刷新走的是同一个入口（见 proxy.UsageRefresher），两者只有触发者不同。
+func (s *Server) handleProviderUsage(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.pathID(w, r)
+	if !ok {
+		return
+	}
+	prov, err := s.store.GetProvider(id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	var override *model.Provider
+	var body struct {
+		model.Provider
+	}
+	// 与 /test 一致：用 BaseURL 是否为空来判断「前端有没有真的传配置过来」。
+	// 空请求体（意思是用已保存的配置查一遍）走数据库里的那份。
+	if s.decodeOptional(w, r, &body) && body.BaseURL != "" {
+		candidate := body.Provider
+		candidate.ID = prov.ID
+		candidate.ApplyDefaults()
+		override = &candidate
+	}
+	target := prov
+	if override != nil {
+		target = *override
+	}
+
+	settings, _ := s.store.GetSettings()
+	// 用量查询要串行发四个小请求，给独立的超时，不沿用生成请求那种长超时。
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	s.writeJSON(w, http.StatusOK, s.proxy.RefreshUsage(ctx, target, settings))
 }
 
 // ---------- 日志 ----------

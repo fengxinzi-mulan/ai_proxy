@@ -15,6 +15,7 @@ import type {
   RequestLog,
   Settings,
   TimeSeriesPoint,
+  UsageSnapshot,
 } from '@/types'
 
 /** 访问密钥，配置了之后所有请求都要带上。 */
@@ -104,6 +105,16 @@ export const api = {
     }),
   fetchProviderModels: (id: number) =>
     request<{ models: string[] }>(`/api/providers/${id}/models`, { method: 'POST' }),
+
+  /**
+   * 查询套餐余量。与 testProvider 一样可带上尚未保存的配置，
+   * 这样在编辑抽屉里改完模板就能直接查，不用先保存。
+   */
+  queryProviderUsage: (id: number, provider?: Partial<Provider>) =>
+    request<UsageSnapshot>(`/api/providers/${id}/usage`, {
+      method: 'POST',
+      body: JSON.stringify(provider ?? {}),
+    }),
 
   listLogs: (params: {
     page?: number

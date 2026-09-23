@@ -23,14 +23,21 @@ import type { RequestLog } from '@/types'
 import {
   OUTCOME_LABELS,
   cacheHitRateOf,
+  cacheRateColor,
+  formatCompact,
   formatDuration,
   formatNumber,
   formatPercent,
   formatStamp,
   formatTps,
+  gradeLegend,
   logOutcome,
   modificationLabel,
+  totalMsColor,
+  tpsColor,
+  ttftColor,
 } from '@/utils/format'
+import type { GradeMetric } from '@/utils/format'
 
 const store = useAppStore()
 const message = useMessage()
@@ -181,6 +188,24 @@ async function clearAll() {
   }
 }
 
+/**
+ * 列头提示：把该列的档位边界显出来。
+ *
+ * 文字由 GRADES 生成，不是手写的，所以改阈值时提示会跟着变 ——
+ * 边界写在界面上，看颜色的人才知道每一档具体是从哪儿切开的。
+ */
+function gradeHeader(title: string, metric: GradeMetric, fmt: (v: number) => string) {
+  return () =>
+    h(NTooltip, null, {
+      trigger: () => h('span', null, title),
+      default: () => `${title}分档：${gradeLegend(metric, fmt)}`,
+    })
+}
+
+/** 毫秒阈值在提示里用秒表示，比「10000」好读。 */
+const msAsSeconds = (v: number) => `${v / 1000} s`
+const asPercent = (v: number) => `${v}%`
+
 const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '时间',
@@ -222,25 +247,32 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
     },
   },
   {
-    title: '首 token',
+    title: gradeHeader('首 token', 'ttftMs', msAsSeconds),
     key: 'ttftMs',
     width: 80,
     align: 'right',
-    render: (r) => h('span', { class: 'num' }, r.ttftMs ? formatDuration(r.ttftMs) : '—'),
+    // 颜色即结论：扫一眼就知道这一轮的首 token 是快是慢，不用逐个读数字
+    render: (r) =>
+      h(
+        'span',
+        { class: 'num', style: { color: ttftColor(r.ttftMs) } },
+        r.ttftMs ? formatDuration(r.ttftMs) : '—',
+      ),
   },
   {
-    title: '总耗时',
+    title: gradeHeader('总耗时', 'totalMs', msAsSeconds),
     key: 'totalMs',
     width: 80,
     align: 'right',
-    render: (r) => h('span', { class: 'num' }, formatDuration(r.totalMs)),
+    render: (r) =>
+      h('span', { class: 'num', style: { color: totalMsColor(r.totalMs) } }, formatDuration(r.totalMs)),
   },
   {
-    title: 'TPS',
+    title: gradeHeader('TPS', 'tps', String),
     key: 'tps',
     width: 58,
     align: 'right',
-    render: (r) => h('span', { class: 'num' }, formatTps(r.tps)),
+    render: (r) => h('span', { class: 'num', style: { color: tpsColor(r.tps) } }, formatTps(r.tps)),
   },
   {
     title: () =>
@@ -249,44 +281,49 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
         default: () => '输入 token（含缓存命中与写入）',
       }),
     key: 'promptTokens',
-    width: 84,
+    width: 72,
     align: 'right',
-    render: (r) => h('span', { class: 'num' }, formatNumber(r.promptTokens)),
+    render: (r) => h('span', { class: 'num' }, formatCompact(r.promptTokens)),
   },
   {
     title: () =>
       h(NTooltip, null, {
         trigger: () => h('span', null, '缓存'),
-        default: () => '命中缓存的输入 token 数，括号内为占输入总量的比例',
+        default: () =>
+          `命中缓存的输入 token 数，括号内为占输入总量的比例。${gradeLegend('cacheRate', asPercent)}`,
       }),
     key: 'cachedTokens',
-    width: 126,
+    width: 116,
     align: 'right',
     render: (r) => {
       if (!r.cachedTokens) return h('span', { style: 'opacity:.35' }, '—')
       const rate = cacheHitRateOf(r.cachedTokens, r.promptTokens)
-      return h('span', { class: 'num', style: 'color:#18a058' }, [
-        formatNumber(r.cachedTokens),
-        h('span', { style: 'opacity:.55;font-size:11px' }, ` ${formatPercent(rate)}`),
+      // 命中量和命中率同色：这两件事本来就该一起看（命中多但比例低 = 提示词太长）
+      const color = cacheRateColor(rate)
+      return h('span', { class: 'num', style: { color } }, [
+        formatCompact(r.cachedTokens),
+        h('span', { style: { opacity: 0.65, fontSize: '11px' } }, ` ${formatPercent(rate)}`),
       ])
     },
   },
   {
     title: '输出',
     key: 'completionTokens',
-    width: 84,
+    width: 72,
     align: 'right',
-    render: (r) => h('span', { class: 'num' }, formatNumber(r.completionTokens)),
+    render: (r) => h('span', { class: 'num' }, formatCompact(r.completionTokens)),
   },
   {
     title: '推理',
     key: 'reasoningEffort',
-    width: 80,
+    width: 84,
     ellipsis: { tooltip: true },
-    render: (r) =>
-      r.reasoningEffort
-        ? h(NTag, { size: 'tiny', bordered: false }, { default: () => r.reasoningEffort })
-        : h('span', { style: 'opacity:.35' }, '—'),
+    // 只标强度档位，不再带思维链 token 数：这个数字在列表里没人逐行读，
+    // 要精确值去详情抽屉看（那里是完整数字）。
+    render: (r) => {
+      if (!r.reasoningEffort) return h('span', { style: 'opacity:.35' }, '—')
+      return h(NTag, { size: 'tiny', bordered: false }, { default: () => r.reasoningEffort })
+    },
   },
   {
     title: '标记',

@@ -27,6 +27,7 @@ import {
 } from 'naive-ui'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
+import ProviderUsagePanel from '@/components/ProviderUsagePanel.vue'
 import type { APIFormat, CustomUsageMapping, ProbeResult, Provider } from '@/types'
 import { API_FORMAT_LABELS, PROMPT_STRATEGY_LABELS } from '@/types'
 import { formatDuration } from '@/utils/format'
@@ -86,6 +87,7 @@ function blank(): Provider {
     usageInjectMode: 'inherit',
     stripUsageChunk: false,
     customUsage: null,
+    usageQuery: { template: '', baseUrl: '', autoRefreshSeconds: 0 },
     tags: [],
     createdAt: '',
     updatedAt: '',
@@ -99,6 +101,7 @@ const probeModel = ref('')
 const probeResult = ref<ProbeResult | null>(null)
 const fetchedModels = ref<string[]>([])
 const baseURLManuallyEdited = ref(false)
+const activeTab = ref('basic')
 
 const isEdit = computed(() => form.id > 0)
 
@@ -152,6 +155,7 @@ watch(
     probeResult.value = null
     fetchedModels.value = []
     baseURLManuallyEdited.value = Boolean(form.baseUrl)
+    activeTab.value = 'basic'
   },
 )
 
@@ -279,6 +283,55 @@ async function fetchModels() {
   }
 }
 
+/** 用量查询模板下拉的选项。模板由后端注册表提供，加模板不用改前端。 */
+const templateOptions = computed(() => [
+  { label: '不使用', value: '' },
+  ...(store.meta?.usageTemplates ?? []).map((t) => ({
+    label: t.name,
+    value: t.id,
+    description: t.description,
+  })),
+])
+
+/**
+ * 定时刷新的间隔。默认关闭 —— 一次查询要打四个上游额度接口，
+ * 让人显式打开比默认轮询更合适。
+ */
+const autoRefreshOptions = [
+  { label: '关闭', value: 0 },
+  { label: '每 1 分钟', value: 60 },
+  { label: '每 5 分钟', value: 300 },
+  { label: '每 15 分钟', value: 900 },
+  { label: '每 30 分钟', value: 1800 },
+]
+
+const usageSnapshot = computed(() =>
+  store.providers.find((p) => p.id === form.id)?.usage ?? null,
+)
+const usageLoading = computed(() => Boolean(store.usageRefreshing[form.id]))
+const usageConfigured = computed(() => Boolean(form.usageQuery?.template))
+
+/** 让服务端立刻查一次。带上当前未保存的配置，改完模板不用先存再查。 */
+async function queryUsage() {
+  if (!isEdit.value) {
+    message.info('请先保存供应商后再查询用量')
+    return
+  }
+  if (!usageConfigured.value) {
+    message.info('请先选择用量查询模板')
+    return
+  }
+  await store.refreshUsage(form.id, collect())
+}
+
+/** 切到「用量」页时，如果服务端还没查到过，就让后端补一次。 */
+watch(activeTab, (tab) => {
+  if (tab !== 'usage') return
+  if (!isEdit.value || !usageConfigured.value) return
+  if (usageLoading.value || usageSnapshot.value) return
+  void queryUsage()
+})
+
 /** 删除是不可逆操作，走一次确认对话框。 */
 function remove() {
   dialog.warning({
@@ -309,7 +362,7 @@ function remove() {
     @update:show="emit('update:show', $event)"
   >
     <NDrawerContent :title="isEdit ? `编辑供应商 · ${form.displayName || form.name}` : '新增供应商'" closable>
-      <NTabs type="line" animated>
+      <NTabs v-model:value="activeTab" type="line" animated>
         <NTabPane name="basic" tab="基础">
           <NForm label-placement="left" label-width="120" size="small">
             <NFormItem label="短名" required>
@@ -635,6 +688,52 @@ function remove() {
               </NFormItem>
             </NForm>
           </template>
+        </NTabPane>
+        <NTabPane name="usage" tab="用量">
+          <NForm label-placement="left" label-width="120" size="small">
+            <NFormItem label="查询模板">
+              <NSelect
+                v-model:value="form.usageQuery.template"
+                :options="templateOptions"
+                style="width: 260px"
+              />
+              <span class="muted" style="margin-left: 8px">
+                {{ (store.meta?.usageTemplates ?? []).find((t) => t.id === form.usageQuery.template)?.description ?? '' }}
+              </span>
+            </NFormItem>
+            <NFormItem label="查询地址">
+              <NInput
+                v-model:value="form.usageQuery.baseUrl"
+                placeholder="留空则自动从 BaseURL 推导"
+              />
+            </NFormItem>
+            <NFormItem label="定时刷新">
+              <NSelect
+                v-model:value="form.usageQuery.autoRefreshSeconds"
+                :options="autoRefreshOptions"
+                style="width: 160px"
+              />
+              <span class="muted" style="margin-left: 8px">
+                服务端按此间隔查询并存入数据库，界面打开时直接读结果
+              </span>
+            </NFormItem>
+          </NForm>
+
+          <NDivider title-placement="left" style="font-size: 12px">当前结果</NDivider>
+          <NAlert
+            v-if="!isEdit"
+            type="info"
+            :bordered="false"
+            style="font-size: 12px; margin-bottom: 8px"
+          >
+            供应商还没保存，保存后即可查询。
+          </NAlert>
+          <ProviderUsagePanel
+            :snapshot="usageSnapshot"
+            :loading="usageLoading"
+            :configured="usageConfigured"
+            @query="queryUsage"
+          />
         </NTabPane>
       </NTabs>
 

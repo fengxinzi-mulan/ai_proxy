@@ -168,6 +168,27 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_rl_status   ON request_logs(http_status)`,
 		},
 	},
+	{
+		// 供应商的套餐余量查询配置。空串表示未启用，与 custom_usage_json 的处理一致。
+		version: 2,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN usage_query_json TEXT NOT NULL DEFAULT ''`,
+		},
+	},
+	{
+		// 服务端定时查到的用量快照，每个供应商一行。
+		//
+		// 单独一张表而不是挂在 providers 上：providers 存的是配置，前端编辑时会整份覆盖写回，
+		// 把定时刷出来的运行态数据混在里面，迟早被一次普通的「保存」抹掉。
+		version: 3,
+		stmts: []string{
+			`CREATE TABLE IF NOT EXISTS provider_usage (
+				provider_id  INTEGER PRIMARY KEY,
+				fetched_at   TEXT    NOT NULL,
+				payload_json TEXT    NOT NULL DEFAULT ''
+			)`,
+		},
+	},
 }
 
 func (s *Store) migrate() error {

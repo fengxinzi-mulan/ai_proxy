@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '@/api'
-import type { LiveRequest, MetaInfo, Provider, Settings } from '@/types'
+import type { LiveRequest, MetaInfo, Provider, Settings, UsageSnapshot } from '@/types'
 
 const THEME_STORAGE = 'ai-proxy-theme'
 
@@ -13,6 +13,10 @@ export const useAppStore = defineStore('app', () => {
   const meta = ref<MetaInfo | null>(null)
   const loading = ref(false)
   const error = ref('')
+
+  // 用量快照本身不入 store：它是服务端定时刷出来、随供应商列表一起下发的数据，
+  // 放在 providers 的每一项上即可（见 Provider.usage）。这里只维护「谁正在手动刷新」。
+  const usageRefreshing = ref<Record<number, boolean>>({})
 
   const dark = ref(localStorage.getItem(THEME_STORAGE) === 'dark')
 
@@ -67,6 +71,55 @@ export const useAppStore = defineStore('app', () => {
     providers.value = await api.activateProvider(id)
   }
 
+  /**
+   * 让服务端立刻查一次用量并落库，然后把新快照写回列表里的那一项。
+   *
+   * 定时刷新是服务端的事（见 proxy.UsageRefresher），这里只负责「用户现在就想看最新的」
+   * 这种情况：额度是查一次就能拿到的东西，不该逼用户等下一个刷新周期。
+   *
+   * provider 可以传编辑抽屉里尚未保存的配置，让「改完模板直接查」成为可能；
+   * 服务端同样会把这次结果存下来。
+   */
+  async function refreshUsage(id: number, provider?: Partial<Provider>): Promise<UsageSnapshot | null> {
+    usageRefreshing.value = { ...usageRefreshing.value, [id]: true }
+    try {
+      const snap = await api.queryProviderUsage(id, provider)
+      applyUsage(id, snap)
+      return snap
+    } catch (e) {
+      // 请求根本没发出去（网络、密钥被拒）时也要让界面看到原因，
+      // 而不是留着上一次的旧数字让人以为还是最新的。
+      const failed: UsageSnapshot = {
+        ok: false,
+        providerId: id,
+        template: provider?.usageQuery?.template ?? '',
+        templateName: '',
+        fetchedAt: new Date().toISOString(),
+        latencyMs: 0,
+        account: '',
+        planId: '',
+        planName: '',
+        status: '',
+        periodStart: null,
+        periodEnd: null,
+        balances: [],
+        windows: [],
+        period: [],
+        warnings: [],
+        error: e instanceof Error ? e.message : String(e),
+        usedUrls: [],
+      }
+      applyUsage(id, failed)
+      return failed
+    } finally {
+      usageRefreshing.value = { ...usageRefreshing.value, [id]: false }
+    }
+  }
+
+  function applyUsage(id: number, snap: UsageSnapshot) {
+    providers.value = providers.value.map((p) => (p.id === id ? { ...p, usage: snap } : p))
+  }
+
   return {
     settings,
     providers,
@@ -75,6 +128,7 @@ export const useAppStore = defineStore('app', () => {
     loading,
     error,
     dark,
+    usageRefreshing,
     activeProvider,
     enabledProviders,
     listenBaseURL,
@@ -84,5 +138,6 @@ export const useAppStore = defineStore('app', () => {
     reloadProviders,
     reloadSettings,
     activate,
+    refreshUsage,
   }
 })

@@ -7,7 +7,6 @@ import {
   NGridItem,
   NSelect,
   NSpace,
-  NTag,
   NButton,
   NSpin,
   NEmpty,
@@ -23,8 +22,8 @@ import EChart from '@/components/EChart.vue'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import {
-  CACHE_RATE,
-  SUCCESS_RATE,
+  cacheRateColor,
+  successRateColor,
   formatBucketLabel,
   formatCompact,
   formatDuration,
@@ -32,7 +31,7 @@ import {
   formatPercent,
   formatTps,
   enumerateBuckets,
-  rateAccent,
+  gradeLegend,
 } from '@/utils/format'
 import type { ModelStatsRow, OverviewStats, ProviderStatsRow, TimeSeriesPoint } from '@/types'
 
@@ -109,51 +108,99 @@ const points = computed<TimeSeriesPoint[]>(() => {
 
 onMounted(load)
 
-/** 成功率按档位着色：健康区间是绿色，轻微失败转琥珀，明显异常才标红。 */
+/** 成功率配色。与日志列表共用同一套四档，同一个数值在两处必须是同一个颜色。 */
 const successAccent = computed(() => {
   if (!stats.value || stats.value.totalRequests <= 0) return undefined
-  return rateAccent(stats.value.successRate, SUCCESS_RATE.good, SUCCESS_RATE.warn)
+  return successRateColor(stats.value.successRate)
 })
 
 /** 命中率为 0 不标红：很多上游压根不支持提示词缓存，那不是故障。 */
 const cacheAccent = computed(() => {
   if (!stats.value) return undefined
-  return rateAccent(stats.value.cacheHitRate, CACHE_RATE.good, CACHE_RATE.warn, true)
+  return cacheRateColor(stats.value.cacheHitRate)
 })
+
+/**
+ * 轴触发的悬浮提示：按系列名分派格式，表头取该桶的时间标签。
+ *
+ * 两张趋势图共用同一套写法 —— 差别只在 valueFmt，而 ECharts 默认的提示会
+ * 把 token 量级和毫秒数原样吐出来，读不下去。
+ */
+function axisTooltip(labels: string[], valueFmt: Record<string, (v: number) => string>) {
+  return (params: unknown) => {
+    const list = (Array.isArray(params) ? params : [params]) as Array<{
+      seriesName?: string
+      value?: unknown
+      marker?: string
+      dataIndex?: number
+    }>
+    const first = list[0]
+    const head = first && first.dataIndex != null ? labels[first.dataIndex] ?? '' : ''
+    const rows = list.map((p) => {
+      const fmt = valueFmt[String(p.seriesName)] ?? formatNumber
+      const value = typeof p.value === 'number' ? p.value : null
+      return `${p.marker ?? ''}${p.seriesName}：${value == null ? '—' : fmt(value)}`
+    })
+    return [head, ...rows].join('<br/>')
+  }
+}
 
 /** 请求量与 token 的双轴趋势图。 */
 const trendOption = computed<EChartsOption>(() => {
   const labels = points.value.map((p) => formatBucketLabel(p.bucket))
+  // 悬浮提示按系列分派格式：token 量级动辄几千万，原样显示会把提示框撑得读不下去。
+  const valueFmt: Record<string, (v: number) => string> = {
+    请求数: formatNumber,
+    失败数: formatNumber,
+    '输入 token': formatCompact,
+    '缓存 token': formatCompact,
+    '输出 token': formatCompact,
+    缓存命中率: (v) => formatPercent(v, 1),
+  }
   return {
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross' },
+      formatter: axisTooltip(labels, valueFmt),
+    },
     legend: {
       data: ['请求数', '失败数', '输入 token', '缓存 token', '输出 token', '缓存命中率'],
       top: 0,
       itemGap: 12,
       textStyle: { fontSize: 11 },
     },
-    // 右侧要放两个轴：token 量级与命中率百分比。轴的刻度与轴名都画在绘图区之外，
-    // 留窄了第二个轴就会被卡片边缘裁掉，所以这里给足 150px。
-    // 顶部留 56px：窄窗口下 6 项图例会折成两行，留窄了会压到绘图区上沿。
-    grid: { left: 48, right: 150, top: 56, bottom: 40 },
+    // 左右各留 56px 就够：左边只画 token 刻度（短格式，最宽「80M」），
+    // 右边只有一个百分比轴。顶部留 56px 是因为窄窗口下 6 项图例会折成两行，
+    // 留窄了会压到绘图区上沿。
+    grid: { left: 56, right: 56, top: 56, bottom: 40 },
     xAxis: {
       type: 'category',
       data: labels,
       axisLabel: { hideOverlap: true },
     },
-    // 三个轴都不写 name：图例已经逐条标注了系列名，再写轴名在窄窗口下会互相重叠。
-    // 单位直接体现在刻度上（命中率轴补 %）。
+    // 只有两个轴写 name：图例已经逐条标注了系列名，再写轴名在窄窗口下会互相重叠。
+    // 单位直接体现在刻度上（命中率轴补 %，token 轴走短格式）。
     yAxis: [
-      { type: 'value', minInterval: 1 },
-      { type: 'value' },
+      // 柱子（请求数/失败数）的刻度轴。不画出来是有意的：左侧已经被 token 轴占用，
+      // 两条轴叠在同一边必然互相压字。柱子仍然按这条轴缩放，具体数值看悬浮提示。
+      // 十字准星也要一起关掉，否则它会飘出一个「57.35」这种带小数的请求数。
+      { type: 'value', minInterval: 1, show: false, axisPointer: { show: false } },
+      {
+        type: 'value',
+        position: 'left',
+        axisLabel: { formatter: (v: number) => formatCompact(v) },
+        axisPointer: { label: { formatter: (p: { value: unknown }) => formatCompact(Number(p.value)) } },
+      },
       {
         type: 'value',
         min: 0,
         max: 100,
         position: 'right',
-        offset: 56,
         splitLine: { show: false },
         axisLabel: { formatter: '{value}%' },
+        axisPointer: {
+          label: { formatter: (p: { value: unknown }) => formatPercent(Number(p.value), 0) },
+        },
       },
     ],
     series: [
@@ -213,12 +260,18 @@ const trendOption = computed<EChartsOption>(() => {
   }
 })
 
-/** 性能趋势：首 token 耗时与 TPS。 */
+/** 性能趋势：首 token 耗时（秒）与 TPS。 */
 const perfOption = computed<EChartsOption>(() => {
   const labels = points.value.map((p) => formatBucketLabel(p.bucket))
+  const valueFmt: Record<string, (v: number) => string> = {
+    '平均首 token': (v) => `${v.toFixed(2)} s`,
+    '平均 TPS': (v) => `${v.toFixed(1)} token/s`,
+  }
   return {
-    tooltip: { trigger: 'axis' },
+    tooltip: { trigger: 'axis', formatter: axisTooltip(labels, valueFmt) },
     legend: { data: ['平均首 token', '平均 TPS'], top: 0 },
+    // 左轴用秒而不是毫秒：几秒级的读数比四位数毫秒好认，也和指标卡、
+    // 模型排行里的「4.02 s」是同一个口径。
     grid: { left: 60, right: 60, top: 44, bottom: 40 },
     xAxis: {
       type: 'category',
@@ -226,7 +279,7 @@ const perfOption = computed<EChartsOption>(() => {
       axisLabel: { hideOverlap: true },
     },
     yAxis: [
-      { type: 'value', name: 'ms' },
+      { type: 'value', name: 's' },
       { type: 'value', name: 'token/s' },
     ],
     series: [
@@ -234,7 +287,7 @@ const perfOption = computed<EChartsOption>(() => {
         name: '平均首 token',
         type: 'line',
         smooth: true,
-        data: points.value.map((p) => Math.round(p.avgTtftMs)),
+        data: points.value.map((p) => Number((p.avgTtftMs / 1000).toFixed(2))),
         itemStyle: { color: '#f0a020' },
       },
       {
@@ -316,8 +369,6 @@ const modelColumns: DataTableColumns<ModelStatsRow> = [
   },
   { title: 'TPS', key: 'avgTps', align: 'right', width: 72, render: (r) => formatTps(r.avgTps) },
 ]
-
-const activeProvider = computed(() => store.activeProvider)
 </script>
 
 <template>
@@ -340,31 +391,6 @@ const activeProvider = computed(() => store.activeProvider)
       <NButton text type="primary" @click="router.push('/providers')">去添加</NButton>
     </NAlert>
 
-    <!-- 当前生效供应商：这是最常确认的一件事，放在最显眼的位置 -->
-    <NCard size="small" class="active-card" :bordered="false">
-      <div class="active-row">
-        <div>
-          <div class="active-label">当前生效供应商</div>
-          <div class="active-name">
-            <template v-if="activeProvider">
-              {{ activeProvider.displayName }}
-              <NTag size="tiny" :bordered="false" type="info">{{ activeProvider.name }}</NTag>
-              <NTag size="tiny" :bordered="false">{{ activeProvider.apiFormat }}</NTag>
-            </template>
-            <span v-else class="muted">未配置</span>
-          </div>
-          <div v-if="activeProvider" class="mono muted">{{ activeProvider.baseUrl }}</div>
-        </div>
-        <div class="active-right">
-          <div class="muted small">客户端 base_url</div>
-          <code class="mono">{{ store.listenBaseURL }}</code>
-          <div class="muted small" style="margin-top: 6px">
-            也可用 <code class="mono">/p/{{ activeProvider?.name ?? '&lt;短名&gt;' }}/…</code> 显式指定
-          </div>
-        </div>
-      </div>
-    </NCard>
-
     <!-- 指标卡用 CSS grid 的 auto-fit：列数随宽度自动增减，
          不用为每个断点单独写栅格跨度。 -->
     <div class="stat-row">
@@ -372,14 +398,14 @@ const activeProvider = computed(() => store.activeProvider)
       <StatCard
         label="成功率"
         :value="formatPercent(stats?.successRate)"
-        :hint="`成功 ${formatNumber(stats?.successRequests ?? 0)} / 失败 ${formatNumber(stats?.failedRequests ?? 0)}。≥${SUCCESS_RATE.good}% 绿色，≥${SUCCESS_RATE.warn}% 琥珀色，更低为红色`"
+        :hint="`成功 ${formatNumber(stats?.successRequests ?? 0)} / 失败 ${formatNumber(stats?.failedRequests ?? 0)}。${gradeLegend('successRate', (v) => `${v}%`)}`"
         :accent="successAccent"
         :loading="loading"
       />
       <StatCard
         label="缓存命中率"
         :value="formatPercent(stats?.cacheHitRate)"
-        :hint="`输入中命中缓存 ${formatCompact(stats?.cachedTokens ?? 0)} / 共 ${formatCompact(stats?.promptTokens ?? 0)}。≥${CACHE_RATE.good}% 绿色，≥${CACHE_RATE.warn}% 琥珀色。命中率越高，重复内容的请求越便宜、首 token 越快`"
+        :hint="`输入中命中缓存 ${formatCompact(stats?.cachedTokens ?? 0)} / 共 ${formatCompact(stats?.promptTokens ?? 0)}。${gradeLegend('cacheRate', (v) => `${v}%`)}。命中率越高，重复内容的请求越便宜、首 token 越快`"
         :accent="cacheAccent"
         :loading="loading"
       />
@@ -482,7 +508,6 @@ h2 {
   margin-top: 12px;
 }
 
-.active-card,
 .chart-card {
   border-radius: 12px;
   box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.06);
@@ -492,39 +517,5 @@ h2 {
    底部会明显短于同排的图表卡，一排卡片的底边参差不齐。 */
 .chart-card {
   height: 100%;
-}
-
-.active-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-  flex-wrap: wrap;
-}
-
-.active-label {
-  font-size: 12px;
-  opacity: 0.6;
-}
-
-.active-name {
-  font-size: 17px;
-  font-weight: 600;
-  margin: 4px 0 2px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.active-right {
-  text-align: right;
-}
-
-.small {
-  font-size: 11px;
-}
-
-.muted {
-  opacity: 0.6;
 }
 </style>

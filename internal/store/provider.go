@@ -26,7 +26,7 @@ const providerColumns = `id, name, display_name, remark, enabled, active, sort_o
 	keys_json, extra_headers_json,
 	timeout_seconds, connect_timeout_seconds, insecure_skip_tls,
 	proxy_mode, proxy_json, prompt_mode, prompt_json, prompt_rules_json,
-	usage_inject_mode, strip_usage_chunk, custom_usage_json, tags_json,
+	usage_inject_mode, strip_usage_chunk, custom_usage_json, usage_query_json, tags_json,
 	created_at, updated_at`
 
 func boolToInt(b bool) int {
@@ -108,7 +108,7 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		p.DisplayName = p.Name
 	}
 
-	keysJSON, headersJSON, rulesJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, err := marshalProviderParts(p)
+	keysJSON, headersJSON, rulesJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, usageQueryJSON, err := marshalProviderParts(p)
 	if err != nil {
 		return p, err
 	}
@@ -119,15 +119,15 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		keys_json, extra_headers_json,
 		timeout_seconds, connect_timeout_seconds, insecure_skip_tls,
 		proxy_mode, proxy_json, prompt_mode, prompt_json, prompt_rules_json,
-		usage_inject_mode, strip_usage_chunk, custom_usage_json, tags_json,
+		usage_inject_mode, strip_usage_chunk, custom_usage_json, usage_query_json, tags_json,
 		created_at, updated_at
-	) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?, ?,?, ?,?,?, ?,?,?,?, ?,?)`,
+	) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?)`,
 		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), boolToInt(p.Active), p.SortOrder,
 		p.BaseURL, string(p.APIFormat), p.CustomPath, p.AuthHeader, p.AuthPrefix,
 		keysJSON, headersJSON,
 		p.TimeoutSeconds, p.ConnectTimeoutSeconds, boolToInt(p.InsecureSkipTLS),
 		p.ProxyMode, proxyJSON, p.PromptMode, promptJSON, rulesJSON,
-		p.UsageInjectMode, boolToInt(p.StripUsageChunk), customUsageJSON, tagsJSON,
+		p.UsageInjectMode, boolToInt(p.StripUsageChunk), customUsageJSON, usageQueryJSON, tagsJSON,
 		tsToDB(p.CreatedAt), tsToDB(p.UpdatedAt),
 	)
 	if err != nil {
@@ -166,7 +166,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 	p.CreatedAt = existing.CreatedAt
 	p.UpdatedAt = time.Now()
 
-	keysJSON, headersJSON, rulesJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, err := marshalProviderParts(p)
+	keysJSON, headersJSON, rulesJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, usageQueryJSON, err := marshalProviderParts(p)
 	if err != nil {
 		return p, err
 	}
@@ -177,7 +177,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		keys_json=?, extra_headers_json=?,
 		timeout_seconds=?, connect_timeout_seconds=?, insecure_skip_tls=?,
 		proxy_mode=?, proxy_json=?, prompt_mode=?, prompt_json=?, prompt_rules_json=?,
-		usage_inject_mode=?, strip_usage_chunk=?, custom_usage_json=?, tags_json=?,
+		usage_inject_mode=?, strip_usage_chunk=?, custom_usage_json=?, usage_query_json=?, tags_json=?,
 		updated_at=?
 		WHERE id=?`,
 		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), p.SortOrder,
@@ -185,7 +185,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		keysJSON, headersJSON,
 		p.TimeoutSeconds, p.ConnectTimeoutSeconds, boolToInt(p.InsecureSkipTLS),
 		p.ProxyMode, proxyJSON, p.PromptMode, promptJSON, rulesJSON,
-		p.UsageInjectMode, boolToInt(p.StripUsageChunk), customUsageJSON, tagsJSON,
+		p.UsageInjectMode, boolToInt(p.StripUsageChunk), customUsageJSON, usageQueryJSON, tagsJSON,
 		tsToDB(p.UpdatedAt), p.ID,
 	)
 	if err != nil {
@@ -205,6 +205,10 @@ func (s *Store) DeleteProvider(id int64) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	// 用量快照跟着供应商一起走，否则删掉再新建一个同名供应商会读到旧快照。
+	if err := s.DeleteProviderUsage(id); err != nil {
+		return err
 	}
 
 	// 删掉的正好是当前生效供应商时，自动把生效位交给第一个启用的供应商。
@@ -259,7 +263,7 @@ func (s *Store) ReorderProviders(ids []int64) error {
 
 // ---------- 序列化辅助 ----------
 
-func marshalProviderParts(p model.Provider) (keys, headers, rules, tags, proxy, prompt, customUsage string, err error) {
+func marshalProviderParts(p model.Provider) (keys, headers, rules, tags, proxy, prompt, customUsage, usageQuery string, err error) {
 	marshal := func(v any, what string) (string, error) {
 		b, e := json.Marshal(v)
 		if e != nil {
@@ -290,6 +294,12 @@ func marshalProviderParts(p model.Provider) (keys, headers, rules, tags, proxy, 
 	} else if customUsage, err = marshal(p.CustomUsage, "自定义用量映射"); err != nil {
 		return
 	}
+	// 模板为空即「未启用」，存空串而不是 {}，便于人工看库时一眼区分。
+	if p.UsageQuery.Template == "" {
+		usageQuery = ""
+	} else if usageQuery, err = marshal(p.UsageQuery, "用量查询配置"); err != nil {
+		return
+	}
 	return
 }
 
@@ -304,7 +314,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		enabled, active, insecureTLS, stripUsage int
 		keysJSON, headersJSON, rulesJSON         string
 		tagsJSON, proxyJSON, promptJSON          string
-		customUsageJSON                          string
+		customUsageJSON, usageQueryJSON          string
 		apiFormat                                string
 		createdAt, updatedAt                     string
 	)
@@ -314,7 +324,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		&keysJSON, &headersJSON,
 		&p.TimeoutSeconds, &p.ConnectTimeoutSeconds, &insecureTLS,
 		&p.ProxyMode, &proxyJSON, &p.PromptMode, &promptJSON, &rulesJSON,
-		&p.UsageInjectMode, &stripUsage, &customUsageJSON, &tagsJSON,
+		&p.UsageInjectMode, &stripUsage, &customUsageJSON, &usageQueryJSON, &tagsJSON,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -348,6 +358,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		decode(customUsageJSON, &cu)
 		p.CustomUsage = &cu
 	}
+	decode(usageQueryJSON, &p.UsageQuery)
 
 	p.CreatedAt = tsFromDB(createdAt)
 	p.UpdatedAt = tsFromDB(updatedAt)

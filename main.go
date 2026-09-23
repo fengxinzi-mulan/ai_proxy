@@ -130,6 +130,9 @@ func run(hostFlag string, portFlag int, dataDir string, logger *slog.Logger) err
 	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
 	defer stopCleanup()
 	go runLogCleanup(cleanupCtx, st, logger)
+	// 用量的定时刷新挂在同一个「进程生命周期」上下文上：它和日志清理一样，
+	// 是常驻后台任务，进程退出时一起停。
+	go proxy.NewUsageRefresher(st, proxySrv, logger).Run(cleanupCtx)
 
 	errCh := make(chan error, 1)
 	go func() {

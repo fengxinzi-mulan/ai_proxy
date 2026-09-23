@@ -27,6 +27,7 @@ import {
 import type { MenuOption, GlobalThemeOverrides } from 'naive-ui'
 import { useAppStore } from '@/stores/app'
 import { useEvents } from '@/composables/useEvents'
+import BaseUrlChip from '@/components/BaseUrlChip.vue'
 import { getAccessKey, setAccessKey } from '@/api'
 
 const store = useAppStore()
@@ -193,6 +194,7 @@ function submitKey() {
                   <NTag v-else type="warning" size="small" :bordered="false">
                     尚未配置供应商
                   </NTag>
+                  <BaseUrlChip />
                 </div>
 
                 <div class="topbar-right">

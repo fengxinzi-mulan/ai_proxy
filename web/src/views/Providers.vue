@@ -16,6 +16,7 @@ import {
   NPopconfirm,
 } from 'naive-ui'
 import ProviderEditor from '@/components/ProviderEditor.vue'
+import ProviderUsagePanel from '@/components/ProviderUsagePanel.vue'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import type { Provider } from '@/types'
@@ -80,6 +81,16 @@ async function remove(p: Provider) {
 /** 每个供应商的密钥健康概览：有几个在冷却。 */
 function coolingCount(p: Provider): number {
   return Object.values(p.keyHealth ?? {}).filter((h) => h.cooling).length
+}
+
+/** 是否配了用量查询模板 —— 没配就不在卡片上占位置。 */
+function hasUsageQuery(p: Provider): boolean {
+  return Boolean(p.usageQuery?.template)
+}
+
+/** 卡片的用量区读服务端定时刷出来的快照；按钮只是让后端立刻再查一次。 */
+function queryUsage(p: Provider) {
+  void store.refreshUsage(p.id, p)
 }
 
 const totalKeys = computed(() =>
@@ -172,6 +183,16 @@ const totalKeys = computed(() =>
             </div>
 
             <div v-if="p.remark" class="remark">{{ p.remark }}</div>
+
+            <div v-if="hasUsageQuery(p)" class="card-usage">
+              <ProviderUsagePanel
+                compact
+                :snapshot="p.usage ?? null"
+                :loading="Boolean(store.usageRefreshing[p.id])"
+                :configured="true"
+                @query="queryUsage(p)"
+              />
+            </div>
 
             <div class="card-foot">
               <span class="muted small">更新于 {{ formatRelative(p.updatedAt) }}</span>
@@ -309,6 +330,12 @@ h2 {
   opacity: 0.68;
   margin-top: 8px;
   line-height: 1.5;
+}
+
+.card-usage {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(128, 128, 128, 0.16);
 }
 
 .card-foot {

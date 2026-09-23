@@ -159,6 +159,149 @@ func TestProviderCRUD(t *testing.T) {
 	}
 }
 
+// 用量查询配置也走 JSON 列，需要确认迁移之后能完整往返，且未配置时不留下垃圾值。
+func TestProviderUsageQueryRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+
+	// 未配置：应保持零值，而不是被写成一个空对象。
+	plain, err := st.CreateProvider(newProvider("plain"))
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+	if got, err := st.GetProvider(plain.ID); err != nil {
+		t.Fatalf("读取供应商失败: %v", err)
+	} else if got.UsageQuery.Template != "" || got.UsageQuery.BaseURL != "" {
+		t.Errorf("未配置用量查询时应保持为空，实际 %+v", got.UsageQuery)
+	}
+
+	p := newProvider("cc")
+	p.UsageQuery = model.UsageQueryConfig{
+		Template:           "commandcode",
+		BaseURL:            "https://usage.example.com",
+		AutoRefreshSeconds: 300,
+	}
+	created, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+	got, err := st.GetProvider(created.ID)
+	if err != nil {
+		t.Fatalf("读取供应商失败: %v", err)
+	}
+	if got.UsageQuery.Template != "commandcode" || got.UsageQuery.BaseURL != "https://usage.example.com" {
+		t.Fatalf("用量查询配置未正确往返: %+v", got.UsageQuery)
+	}
+	// 定时刷新间隔也要能存住，否则重启后自动刷新会静默失效
+	if got.UsageQuery.AutoRefreshSeconds != 300 {
+		t.Fatalf("定时刷新间隔未正确往返: %+v", got.UsageQuery)
+	}
+
+	// 改模板
+	got.UsageQuery.Template = "other"
+	got.UsageQuery.BaseURL = ""
+	got.UsageQuery.AutoRefreshSeconds = 0
+	updated, err := st.UpdateProvider(got)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if updated.UsageQuery.Template != "other" || updated.UsageQuery.BaseURL != "" {
+		t.Fatalf("更新未生效: %+v", updated.UsageQuery)
+	}
+	if updated.UsageQuery.AutoRefreshSeconds != 0 {
+		t.Fatalf("关闭定时刷新未生效: %+v", updated.UsageQuery)
+	}
+
+	// 关掉用量查询：应回到零值
+	updated.UsageQuery = model.UsageQueryConfig{}
+	cleared, err := st.UpdateProvider(updated)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if cleared.UsageQuery.Template != "" {
+		t.Fatalf("关闭后应回到零值: %+v", cleared.UsageQuery)
+	}
+}
+
+// 用量快照是服务端定时刷出来的运行态数据，要能覆盖写、能按供应商索引、
+// 还要随供应商删除一起清掉（否则新建同名供应商会读到上一个的旧快照）。
+func TestProviderUsageSnapshot(t *testing.T) {
+	st := newTestStore(t)
+
+	p, err := st.CreateProvider(newProvider("cc"))
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+
+	// 没查过时是 nil，不是错误
+	got, err := st.GetProviderUsage(p.ID)
+	if err != nil {
+		t.Fatalf("读取不存在的快照不该报错: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("没查过时应返回 nil，实际 %+v", got)
+	}
+
+	first := model.UsageSnapshot{
+		OK:         true,
+		ProviderID: p.ID,
+		Template:   "commandcode",
+		PlanName:   "GOAT",
+		Account:    "tester",
+		FetchedAt:  time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond),
+		Windows: []model.UsageWindow{
+			{Label: "5 小时", Used: 1, Cap: 14, Percent: 7.1},
+			{Label: "本月", Used: 26, Cap: 70, Percent: 37, Hint: "推导"},
+		},
+		Raw: map[string]any{"/alpha/whoami": map[string]any{"ok": true}},
+	}
+	if err := st.SaveProviderUsage(first); err != nil {
+		t.Fatalf("保存快照失败: %v", err)
+	}
+
+	got, err = st.GetProviderUsage(p.ID)
+	if err != nil {
+		t.Fatalf("读取快照失败: %v", err)
+	}
+	if got == nil || got.PlanName != "GOAT" || got.ProviderID != p.ID {
+		t.Fatalf("快照未正确往返: %+v", got)
+	}
+	if len(got.Windows) != 2 || got.Windows[1].Hint != "推导" {
+		t.Fatalf("窗口未正确往返: %+v", got.Windows)
+	}
+	if !got.FetchedAt.Equal(first.FetchedAt) {
+		t.Fatalf("抓取时间未正确往返: %v vs %v", got.FetchedAt, first.FetchedAt)
+	}
+	if _, ok := got.Raw["/alpha/whoami"]; !ok {
+		t.Fatalf("原始响应未正确往返: %+v", got.Raw)
+	}
+
+	// 覆盖写：同一个供应商只保留最近一份
+	second := first
+	second.PlanName = "Pro"
+	second.FetchedAt = time.Now().UTC().Truncate(time.Millisecond)
+	if err := st.SaveProviderUsage(second); err != nil {
+		t.Fatalf("覆盖保存快照失败: %v", err)
+	}
+	all, err := st.ListProviderUsage()
+	if err != nil {
+		t.Fatalf("列出快照失败: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("同一个供应商应只保留一份快照，实际 %d 份", len(all))
+	}
+	if all[p.ID].PlanName != "Pro" {
+		t.Fatalf("覆盖写未生效: %+v", all[p.ID])
+	}
+
+	// 删除供应商时快照跟着走
+	if err := st.DeleteProvider(p.ID); err != nil {
+		t.Fatalf("删除供应商失败: %v", err)
+	}
+	if all, err = st.ListProviderUsage(); err != nil || len(all) != 0 {
+		t.Fatalf("删除供应商后不该残留快照: %+v err=%v", all, err)
+	}
+}
+
 func TestProviderNameUniqueness(t *testing.T) {
 	st := newTestStore(t)
 	if _, err := st.CreateProvider(newProvider("dup")); err != nil {

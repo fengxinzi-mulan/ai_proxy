@@ -253,6 +253,10 @@ func (a *analyzer) handleOpenAI(obj map[string]any) {
 				a.addOutput(s)
 			}
 		}
+		// 工具调用轮次没有正文，但参数分片就是模型吐出的第一批 token。
+		if calls, ok := container["tool_calls"].([]any); ok && len(calls) > 0 {
+			a.markContent()
+		}
 	}
 }
 
@@ -281,6 +285,17 @@ func (a *analyzer) handleResponses(event string, obj map[string]any) {
 		"response.reasoning_text.delta":
 		if s, ok := getString(obj, "delta"); ok {
 			a.addOutput(s)
+		}
+	case "response.output_item.added":
+		// 函数调用项开始：这一轮没有正文，但内容已经出现。
+		if item, ok := getMap(obj, "item"); ok {
+			if t, _ := getString(item, "type"); t == "function_call" {
+				a.markContent()
+			}
+		}
+	case "response.function_call_arguments.delta":
+		if s, ok := getString(obj, "delta"); ok && s != "" {
+			a.markContent()
 		}
 	case "response.failed":
 		if e := extractError(obj); e != "" {
@@ -319,12 +334,23 @@ func (a *analyzer) handleAnthropic(event string, obj map[string]any) {
 	}
 
 	switch event {
+	case "content_block_start":
+		// 工具调用块的开头还没有文本，但模型此刻已经开始产出了。
+		if cb, ok := getMap(obj, "content_block"); ok {
+			if t, _ := getString(cb, "type"); t == "tool_use" {
+				a.markContent()
+			}
+		}
 	case "content_block_delta":
 		if delta, ok := getMap(obj, "delta"); ok {
 			for _, key := range []string{"text", "thinking"} {
 				if s, ok := delta[key].(string); ok {
 					a.addOutput(s)
 				}
+			}
+			// 工具参数分片：算内容出现，但不参与 token 估算。
+			if t, _ := getString(delta, "type"); t == "input_json_delta" {
+				a.markContent()
 			}
 		}
 	case "message_delta":
@@ -378,9 +404,30 @@ func (a *analyzer) handleGemini(obj map[string]any) {
 			var sb strings.Builder
 			appendTextValue(parts, &sb)
 			a.addOutput(sb.String())
+			// 纯 functionCall 的分片没有文本，但同样是模型产出的内容。
+			for _, p := range parts {
+				pm, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				if _, ok := pm["functionCall"]; ok {
+					a.markContent()
+					break
+				}
+			}
 		}
 	}
 }
+
+// markContent 标记「模型已经吐出了内容」。
+//
+// 转发层用这个标记打首 token 的时间点，也用它判断一条流是不是有内容却没正常收尾
+// （那样会被记成被上游切断）。所以任何模型真正产出过的片段都必须走到这里，
+// 工具调用也算 —— 纯工具调用的一轮没有正文，但工具参数分片就是这批 token。
+//
+// 与 addOutput 分开是因为工具参数是结构化 JSON 分片，能证明「已经开始产出」，
+// 却不适合参与 token 估算。
+func (a *analyzer) markContent() { a.gotContent = true }
 
 // addOutput 累积输出文本的 token 估算，同时标记已出现内容。
 //
@@ -390,7 +437,7 @@ func (a *analyzer) addOutput(s string) {
 	if s == "" {
 		return
 	}
-	a.gotContent = true
+	a.markContent()
 	a.estTokens += estimateTokens(s)
 }
 

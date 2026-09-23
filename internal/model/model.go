@@ -119,6 +119,20 @@ type CustomUsageMapping struct {
 	Model            string `json:"model"`
 }
 
+// UsageQueryConfig 描述如何向供应商查询套餐余量。
+//
+// 只有「模板 id」是必填的：具体请求哪些接口、怎么解析响应，都由模板决定。
+// 模板 id 为空表示该供应商不启用用量查询。
+type UsageQueryConfig struct {
+	Template string `json:"template"`
+	// BaseURL 留空时由模板从供应商的 BaseURL 推导（例如 commandcode 会去掉 /provider/v1），
+	// 只在推导结果不对时才需要手填。
+	BaseURL string `json:"baseUrl"`
+	// AutoRefreshSeconds 是管理界面的自动刷新间隔，0 表示关闭。
+	// 它只影响前端多久查一次，服务端不按它做任何轮询。
+	AutoRefreshSeconds int `json:"autoRefreshSeconds"`
+}
+
 // Provider 是被代理的上游供应商配置。
 type Provider struct {
 	ID          int64  `json:"id"`
@@ -158,6 +172,9 @@ type Provider struct {
 
 	// 自定义用量映射（apiFormat=custom 时使用）
 	CustomUsage *CustomUsageMapping `json:"customUsage"`
+
+	// 套餐余量查询（可选，需要一个能读账号额度的接口）
+	UsageQuery UsageQueryConfig `json:"usageQuery"`
 
 	Tags      []string  `json:"tags"`
 	CreatedAt time.Time `json:"createdAt"`
@@ -242,6 +259,9 @@ func (p *Provider) ApplyDefaults() {
 	}
 	if p.Prompt.Strategy == "" {
 		p.Prompt.Strategy = StrategyAppend
+	}
+	if p.UsageQuery.AutoRefreshSeconds < 0 {
+		p.UsageQuery.AutoRefreshSeconds = 0
 	}
 }
 

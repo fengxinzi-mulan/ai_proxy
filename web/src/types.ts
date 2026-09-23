@@ -67,6 +67,77 @@ export interface CustomUsageMapping {
   model: string
 }
 
+/** 套餐余量查询配置。template 为空表示该供应商不启用用量查询。 */
+export interface UsageQueryConfig {
+  template: string
+  /** 留空时由模板从 baseUrl 推导 */
+  baseUrl: string
+  /** 定时刷新间隔（秒）。0 = 关闭。只在管理页面打开时生效。 */
+  autoRefreshSeconds: number
+}
+
+export interface UsageBalance {
+  label: string
+  amount: number
+  hint?: string
+}
+
+export interface UsageWindow {
+  label: string
+  used: number
+  cap: number
+  /** 0-100，服务端算好，避免各处口径不一致 */
+  percent: number
+  resetAt: string | null
+  exceeded: boolean
+  /** 这个数字怎么来的。推导出来的窗口（上游没直接给）才有，界面上以悬浮提示展示。 */
+  hint?: string
+}
+
+export type UsageStatUnit = 'usd' | 'count' | 'percent' | 'tokens'
+
+export interface UsageStat {
+  label: string
+  value: number
+  unit: UsageStatUnit
+  hint?: string
+}
+
+export interface UsageTemplateInfo {
+  id: string
+  name: string
+  description: string
+}
+
+/**
+ * 一次用量查询的结果。
+ *
+ * ok=false 不等于请求失败：上游那组接口没有公开契约，可能只读到一部分，
+ * 这时 warnings 里会写明哪一段不可用，raw 里保留原始响应供排查。
+ * 读不到的段落一律留空，不会显示成 0。
+ */
+export interface UsageSnapshot {
+  ok: boolean
+  providerId: number
+  template: string
+  templateName: string
+  fetchedAt: string
+  latencyMs: number
+  account: string
+  planId: string
+  planName: string
+  status: string
+  periodStart: string | null
+  periodEnd: string | null
+  balances: UsageBalance[]
+  windows: UsageWindow[]
+  period: UsageStat[]
+  warnings: string[]
+  error: string
+  raw?: Record<string, unknown>
+  usedUrls: string[]
+}
+
 export interface Provider {
   id: number
   name: string
@@ -100,10 +171,17 @@ export interface Provider {
 
   customUsage: CustomUsageMapping | null
 
+  usageQuery: UsageQueryConfig
+
   tags: string[]
   createdAt: string
   updatedAt: string
   keyHealth?: Record<string, KeyHealth>
+  /**
+   * 服务端定时刷出来的最近一次用量快照，随供应商列表一起下发。
+   * null 表示服务端还没查过（或该供应商没配模板）。
+   */
+  usage?: UsageSnapshot | null
 }
 
 export interface Settings {
@@ -249,6 +327,8 @@ export interface MetaInfo {
   strategies: PromptStrategy[]
   proxyTypes: string[]
   authDefaults: { format: APIFormat; header: string; prefix: string }[]
+  /** 内置的套餐余量查询模板。 */
+  usageTemplates: UsageTemplateInfo[]
   liveCount: number
   /** 进程实际监听的地址，可能与设置里的值不同（命令行参数优先）。 */
   listen: { host: string; port: number }

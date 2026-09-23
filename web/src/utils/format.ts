@@ -36,29 +36,141 @@ export function formatTps(v: number | null | undefined): string {
   return v.toFixed(1)
 }
 
+/** 四档分档的档位。全站统一：优秀(绿) → 良好(蓝) → 一般(琥珀) → 差(红)。 */
+export type Grade = 'excellent' | 'good' | 'fair' | 'poor'
+
 /**
- * 按百分比数值给出配色：达到 good 为绿色，达到 warn 为琥珀色，其余为红色。
+ * 全站唯一的配色表。
  *
- * neutralAtZero 为 true 时把 0 当作「未启用」而不判为差，返回 undefined 用默认文字色 ——
- * 缓存命中率为 0 可能只是上游根本不支持提示词缓存，标红属于误报。
+ * 颜色只在这里定义一次：同一个档位在任何指标、任何页面上都必须是同一个颜色。
+ * 「绿」如果在列表里表示优秀、在总览里表示另一件事，颜色就不再是信息，
+ * 只是装饰。中间两档用蓝色而不是灰色 —— 灰色读起来像「没有数据」，
+ * 把「正常」和「没测到」混在一起同样是失去意义。
  */
-export function rateAccent(
-  rate: number,
-  good: number,
-  warn: number,
-  neutralAtZero = false,
-): string | undefined {
-  if (neutralAtZero && rate <= 0) return undefined
-  if (rate >= good) return '#18a058'
-  if (rate >= warn) return '#f0a020'
-  return '#d03050'
+export const GRADE_STYLE: Record<Grade, { label: string; color: string }> = {
+  excellent: { label: '优秀', color: '#18a058' },
+  good: { label: '良好', color: '#2080f0' },
+  fair: { label: '一般', color: '#f0a020' },
+  poor: { label: '差', color: '#d03050' },
 }
 
-/** 成功率配色阈值。代理会记录客户端取消、限流等各类失败，95% 以上算健康。 */
-export const SUCCESS_RATE = { good: 95, warn: 85 } as const
+/** 一个指标的档位边界。better 说明数值往哪个方向算好。 */
+interface GradeBounds {
+  better: 'lower' | 'higher'
+  excellent: number
+  good: number
+  fair: number
+}
 
-/** 缓存命中率配色阈值。命中率取决于客户端是否复用前缀，60% 以上算工作良好。 */
-export const CACHE_RATE = { good: 60, warn: 20 } as const
+/**
+ * 各指标的档位边界，全站唯一出处。
+ *
+ * 边界整体放得比较宽，目标是让绝大多数正常请求落在优秀/良好，只有真正异常
+ * （首 token 十几秒、总耗时几分钟、缓存基本没命中）才掉进一般和差。
+ * 阈值定太严会让列表长期一片红与琥珀，反而看不出哪一次是真的有问题。
+ *
+ * 首 token 10 秒、总耗时 60 秒算优秀，是照着 agent 客户端这种动辄几十万 token
+ * 提示词的场景定的：这类请求本来就要等，拿普通聊天接口的标准衡量会满屏告警。
+ */
+export const GRADES = {
+  /** 首 token 耗时（毫秒） */
+  ttftMs: { better: 'lower', excellent: 10_000, good: 20_000, fair: 30_000 },
+  /** 总耗时（毫秒） */
+  totalMs: { better: 'lower', excellent: 60_000, good: 120_000, fair: 300_000 },
+  /** 生成速度（token/秒） */
+  tps: { better: 'higher', excellent: 200, good: 120, fair: 60 },
+  /** 缓存命中率（百分比）。越高越省，所以门槛也最高档。 */
+  cacheRate: { better: 'higher', excellent: 90, good: 60, fair: 30 },
+  /** 成功率（百分比） */
+  successRate: { better: 'higher', excellent: 98, good: 95, fair: 85 },
+  /** 思维链 token 数 */
+  reasoningTokens: { better: 'lower', excellent: 500, good: 1500, fair: 4000 },
+} as const satisfies Record<string, GradeBounds>
+
+/** 可分档的指标名。 */
+export type GradeMetric = keyof typeof GRADES
+
+/**
+ * 把数值判成一个档位。
+ *
+ * 0 或缺失返回 undefined 而不是「差」：这些指标里的 0 通常只意味着「没测到」
+ * （非流式请求没有 TPS、上游没回缓存字段），标红属于误报。
+ */
+export function gradeOf(value: number, metric: GradeMetric): Grade | undefined {
+  if (!value || value <= 0) return undefined
+  const b: GradeBounds = GRADES[metric]
+  if (b.better === 'higher') {
+    if (value >= b.excellent) return 'excellent'
+    if (value >= b.good) return 'good'
+    if (value >= b.fair) return 'fair'
+    return 'poor'
+  }
+  if (value <= b.excellent) return 'excellent'
+  if (value <= b.good) return 'good'
+  if (value <= b.fair) return 'fair'
+  return 'poor'
+}
+
+/** 数值对应的颜色。缺失时返回 undefined，由调用方用默认文字色。 */
+export function metricColor(value: number, metric: GradeMetric): string | undefined {
+  const grade = gradeOf(value, metric)
+  return grade ? GRADE_STYLE[grade].color : undefined
+}
+
+/**
+ * 把某个指标的档位边界写成一句人话，用于列头提示。
+ *
+ * 由 GRADES 生成而不是手写：边界值和说明一旦分开维护，改阈值时必然有一处被忘掉，
+ * 界面上就会显示错的边界 —— 那比不显示更糟。
+ */
+export function gradeLegend(metric: GradeMetric, fmt: (v: number) => string): string {
+  const b: GradeBounds = GRADES[metric]
+  const sign = b.better === 'higher' ? '≥' : '≤'
+  return [
+    `${GRADE_STYLE.excellent.label} ${sign} ${fmt(b.excellent)}`,
+    `${GRADE_STYLE.good.label} ${sign} ${fmt(b.good)}`,
+    `${GRADE_STYLE.fair.label} ${sign} ${fmt(b.fair)}`,
+    `${GRADE_STYLE.poor.label} 其余`,
+  ].join(' · ')
+}
+
+// 各指标的取色入口。保留语义化的名字，调用方不必记指标键名。
+export const ttftColor = (ms: number) => metricColor(ms, 'ttftMs')
+export const totalMsColor = (ms: number) => metricColor(ms, 'totalMs')
+export const tpsColor = (v: number) => metricColor(v, 'tps')
+export const cacheRateColor = (v: number) => metricColor(v, 'cacheRate')
+export const successRateColor = (v: number) => metricColor(v, 'successRate')
+export const reasoningTokenColor = (v: number) => metricColor(v, 'reasoningTokens')
+
+
+/**
+ * 额度用量的配色。
+ *
+ * 故意不并入上面那套四档：方向是反的 —— 其它指标都是「高 = 好」，
+ * 而套餐额度是「用得越多越接近断供」，所以高百分比才是告警，
+ * 「优秀/良好」这套话术套上去会自相矛盾。
+ * 0 值给中性灰：窗口刚重置时用量为 0，标绿会让人以为「很健康」，
+ * 其实那一刻没有任何信息。
+ */
+export function quotaColor(percent: number): string {
+  if (percent <= 0) return 'rgba(128, 128, 128, 0.9)'
+  if (percent >= 85) return '#d03050'
+  if (percent >= 60) return '#f0a020'
+  return '#18a058'
+}
+
+/**
+ * 金额显示。额度多是几美元到几十美元，但单次请求成本可能只有千分之几，
+ * 所以小额保留更多位数，避免全部显示成 $0.00。
+ */
+export function formatUSD(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '—'
+  const abs = Math.abs(v)
+  if (abs === 0) return '$0'
+  if (abs < 0.01) return `$${v.toFixed(4)}`
+  if (abs < 1000) return `$${v.toFixed(2)}`
+  return `$${v.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+}
 
 /**
  * 缓存命中率（百分比）：命中缓存的输入量 ÷ 输入总量。
@@ -112,6 +224,24 @@ export function formatRelative(iso: string | null | undefined): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
   return `${Math.floor(diff / 86_400_000)} 天前`
+}
+
+/**
+ * 未来时间点的相对描述（「4 小时后」）。
+ *
+ * 额度窗口的重置时间、计费周期的结束时间都在未来，用 formatRelative 会算出负的差值，
+ * 落进它的「小于 1 秒」分支显示成「刚刚」——把「还有 4 小时重置」说成「刚刚重置」。
+ */
+export function formatUntil(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const d = new Date(iso).getTime()
+  if (Number.isNaN(d)) return iso
+  const diff = d - Date.now()
+  if (diff <= 0) return '即将重置'
+  if (diff < 60_000) return '不到 1 分钟后'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟后`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时后`
+  return `${Math.floor(diff / 86_400_000)} 天后`
 }
 
 /** 字节数，用于报文长度。 */

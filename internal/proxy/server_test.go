@@ -244,6 +244,68 @@ func TestForwardStreaming(t *testing.T) {
 	}
 }
 
+// 纯工具调用的一轮没有正文，但工具参数分片就是模型吐出的第一批 token。
+// 修复前这种响应打不上首 token 的点，首 token 与 TPS 两列都会显示「—」。
+func TestForwardStreamingToolCallsSetTTFT(t *testing.T) {
+	chunks := []string{
+		"data: {\"model\":\"deepseek-v4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":50,\"total_tokens\":950}}\n\n",
+		"data: [DONE]\n\n",
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for i, c := range chunks {
+			io.WriteString(w, c)
+			flusher.Flush()
+			// 在首个 tool_calls 之后停顿，让总耗时明显大于首 token，
+			// TPS 的分母（total − ttft）才不会是 0。
+			if i == 1 {
+				time.Sleep(40 * time.Millisecond)
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4","stream":true,"messages":[{"role":"user","content":"读一下 a.txt"}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	entry := lastLog(t, st)
+	if !entry.Success {
+		t.Errorf("应记为成功，错误信息: %s", entry.ErrorMsg)
+	}
+	if !entry.Stream {
+		t.Error("应标记为流式")
+	}
+	if entry.TTFTMs <= 0 {
+		t.Error("纯工具调用也应打上首 token 的时间点")
+	}
+	if entry.TPS <= 0 {
+		t.Errorf("首 token 有值后 TPS 应能算出，实际 %v", entry.TPS)
+	}
+	// 工具参数是结构化 JSON，不能参与 token 估算，用量仍要取上游给的值。
+	if entry.CompletionTokens != 50 {
+		t.Errorf("输出 token 应取上游 usage 的 50，实际 %d", entry.CompletionTokens)
+	}
+	if entry.TokensEstimated {
+		t.Error("上游返回了用量，不应标记为估算值")
+	}
+}
+
 func TestForwardStreamingTruncated(t *testing.T) {
 	// 上游只推了内容就断开，没有 [DONE]：这种半截的 200 不能算成功，
 	// 否则成功率指标会失真。

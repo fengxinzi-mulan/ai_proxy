@@ -132,6 +132,80 @@ func TestAnalyzerReasoningCountsAsContent(t *testing.T) {
 	}
 }
 
+func TestAnalyzerToolCallsCountAsContent(t *testing.T) {
+	// 纯工具调用的一轮没有正文，但工具参数分片就是模型吐出的第一批 token。
+	// 不标记内容的话首 token 永远打不上点（列表里表现为「—」），TPS 也会跟着缺失。
+	body := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	a := newAnalyzer(model.FormatOpenAI, nil, "text/event-stream")
+	feedSSE(a, body)
+
+	if !a.HasContent() {
+		t.Error("仅收到 tool_calls 时也应视为已出现内容")
+	}
+	// 参数是结构化 JSON，参与估算会让「上游没给用量」时的输出量严重虚高。
+	if got := a.EstimateOutputTokens(); got != 0 {
+		t.Errorf("工具参数不应参与 token 估算，实际估出 %d", got)
+	}
+	if !a.StreamFinished() {
+		t.Error("finish_reason 与 [DONE] 都应视为流正常结束")
+	}
+}
+
+func TestAnalyzerAnthropicToolUseCountsAsContent(t *testing.T) {
+	body := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\",\"input\":{}}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+	a := newAnalyzer(model.FormatAnthropic, nil, "text/event-stream")
+	feedSSE(a, body)
+
+	if !a.HasContent() {
+		t.Error("tool_use 块应视为已出现内容")
+	}
+	if got := a.EstimateOutputTokens(); got != 0 {
+		t.Errorf("工具参数不应参与 token 估算，实际估出 %d", got)
+	}
+	if !a.StreamFinished() {
+		t.Error("message_stop 应视为流正常结束")
+	}
+}
+
+func TestAnalyzerGeminiFunctionCallCountsAsContent(t *testing.T) {
+	body := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.txt\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n"
+
+	a := newAnalyzer(model.FormatGemini, nil, "text/event-stream")
+	feedSSE(a, body)
+
+	if !a.HasContent() {
+		t.Error("functionCall 分片应视为已出现内容")
+	}
+	if !a.StreamFinished() {
+		t.Error("finishReason 应视为流正常结束")
+	}
+}
+
+func TestAnalyzerResponsesFunctionCallCountsAsContent(t *testing.T) {
+	body := "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"read\"}}\n\n" +
+		"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"a\\\":1}\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"
+
+	a := newAnalyzer(model.FormatResponses, nil, "text/event-stream")
+	feedSSE(a, body)
+
+	if !a.HasContent() {
+		t.Error("function_call 项应视为已出现内容")
+	}
+	if !a.StreamFinished() {
+		t.Error("response.completed 应视为流正常结束")
+	}
+}
+
 func TestAnalyzerOpenAINonStreaming(t *testing.T) {
 	body := `{"id":"1","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
 		"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
