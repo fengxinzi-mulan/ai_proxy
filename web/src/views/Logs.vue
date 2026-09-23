@@ -23,10 +23,10 @@ import type { RequestLog } from '@/types'
 import {
   OUTCOME_LABELS,
   cacheHitRateOf,
-  formatCompact,
   formatDuration,
   formatNumber,
-  formatTime,
+  formatPercent,
+  formatStamp,
   formatTps,
   logOutcome,
   modificationLabel,
@@ -185,21 +185,21 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '时间',
     key: 'tsStart',
-    width: 92,
+    width: 158,
     fixed: 'left',
-    render: (r) => h('span', { class: 'num' }, formatTime(r.tsStart)),
+    render: (r) => h('span', { class: 'num' }, formatStamp(r.tsStart)),
   },
   {
     title: '供应商',
     key: 'providerName',
-    width: 104,
+    width: 118,
     ellipsis: { tooltip: true },
     render: (r) => r.providerName || '—',
   },
   {
     title: '模型',
     key: 'model',
-    width: 148,
+    width: 256,
     ellipsis: { tooltip: true },
     render: (r) =>
       h('span', { class: 'mono' }, r.model || r.modelResponse || '—'),
@@ -207,7 +207,7 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '状态',
     key: 'status',
-    width: 94,
+    width: 90,
     render: (r) => {
       const o = logOutcome(r)
       const type =
@@ -224,21 +224,21 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '首 token',
     key: 'ttftMs',
-    width: 86,
+    width: 80,
     align: 'right',
     render: (r) => h('span', { class: 'num' }, r.ttftMs ? formatDuration(r.ttftMs) : '—'),
   },
   {
     title: '总耗时',
     key: 'totalMs',
-    width: 86,
+    width: 80,
     align: 'right',
     render: (r) => h('span', { class: 'num' }, formatDuration(r.totalMs)),
   },
   {
     title: 'TPS',
     key: 'tps',
-    width: 64,
+    width: 58,
     align: 'right',
     render: (r) => h('span', { class: 'num' }, formatTps(r.tps)),
   },
@@ -249,9 +249,9 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
         default: () => '输入 token（含缓存命中与写入）',
       }),
     key: 'promptTokens',
-    width: 74,
+    width: 84,
     align: 'right',
-    render: (r) => h('span', { class: 'num' }, formatCompact(r.promptTokens)),
+    render: (r) => h('span', { class: 'num' }, formatNumber(r.promptTokens)),
   },
   {
     title: () =>
@@ -260,28 +260,28 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
         default: () => '命中缓存的输入 token 数，括号内为占输入总量的比例',
       }),
     key: 'cachedTokens',
-    width: 104,
+    width: 126,
     align: 'right',
     render: (r) => {
       if (!r.cachedTokens) return h('span', { style: 'opacity:.35' }, '—')
       const rate = cacheHitRateOf(r.cachedTokens, r.promptTokens)
       return h('span', { class: 'num', style: 'color:#18a058' }, [
-        formatCompact(r.cachedTokens),
-        h('span', { style: 'opacity:.55;font-size:11px' }, ` ${rate.toFixed(0)}%`),
+        formatNumber(r.cachedTokens),
+        h('span', { style: 'opacity:.55;font-size:11px' }, ` ${formatPercent(rate)}`),
       ])
     },
   },
   {
     title: '输出',
     key: 'completionTokens',
-    width: 74,
+    width: 84,
     align: 'right',
-    render: (r) => h('span', { class: 'num' }, formatCompact(r.completionTokens)),
+    render: (r) => h('span', { class: 'num' }, formatNumber(r.completionTokens)),
   },
   {
     title: '推理',
     key: 'reasoningEffort',
-    width: 90,
+    width: 80,
     ellipsis: { tooltip: true },
     render: (r) =>
       r.reasoningEffort
@@ -291,7 +291,7 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '标记',
     key: 'flags',
-    width: 136,
+    width: 130,
     render: (r) => {
       const tags: ReturnType<typeof h>[] = []
       if (r.stream) tags.push(h(NTag, { size: 'tiny', bordered: false, type: 'info' }, { default: () => '流式' }))
@@ -393,7 +393,7 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
         :data="rows"
         :loading="loading"
         :row-key="(r: RequestLog) => r.id"
-        :scroll-x="1080"
+        :scroll-x="1400"
         :bordered="false"
         size="small"
         flex-height

@@ -86,6 +86,21 @@ export function formatDateTime(iso: string | null | undefined): string {
   return d.toLocaleString('zh-CN', { hour12: false })
 }
 
+/**
+ * 固定格式的本地日期时间（YYYY-MM-DD HH:mm:ss）。
+ *
+ * 与 formatDateTime 的区别是不走 toLocaleString —— 后者在 zh-CN 下输出
+ * 「2026/9/22 17:48:20」，月日不补零、宽度还会随月份位数跳动，在表格列里
+ * 对不齐。这里统一补零，配合 tabular-nums 得到整齐的一列。
+ */
+export function formatStamp(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 /** 相对时间，用于「多久以前」。 */
 export function formatRelative(iso: string | null | undefined): string {
   if (!iso) return '—'
