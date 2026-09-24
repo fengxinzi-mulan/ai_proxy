@@ -268,11 +268,16 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
       h('span', { class: 'num', style: { color: totalMsColor(r.totalMs) } }, formatDuration(r.totalMs)),
   },
   {
-    title: gradeHeader('TPS', 'tps', String),
+    title: gradeHeader('TPS', 'tps', (v) => `${v} t/s`),
     key: 'tps',
-    width: 58,
+    width: 78,
     align: 'right',
-    render: (r) => h('span', { class: 'num', style: { color: tpsColor(r.tps) } }, formatTps(r.tps)),
+    render: (r) =>
+      h(
+        'span',
+        { class: 'num', style: { color: tpsColor(r.tps) } },
+        r.tps > 0 ? `${formatTps(r.tps)} t/s` : '—',
+      ),
   },
   {
     title: () =>
