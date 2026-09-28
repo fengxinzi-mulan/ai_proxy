@@ -11,8 +11,10 @@ import (
 
 // rewriteRequestBody 按供应商与全局配置改写请求体，返回改写后的字节与改动清单。
 //
-// 这是整个程序里唯一会改动请求内容的地方，改动项各自独立开关，并且每一项都会
-// 记进日志（req_body_original 保存改写前的原文），保证「透明转发」可核查。
+// 这是整个程序里唯一会改动请求内容的地方，每一项改动都会记进日志
+// （req_body_original 保存改写前的原文），保证「透明转发」可核查。
+// 提示词与用量注入各自有独立开关；responses 的 input 合规性修正（见
+// normalizeResponsesInput）只在客户端确实写漏字段时才动手，因此不设开关。
 //
 // 任何一步出错（JSON 解析失败、结构不符合该格式）都直接放弃改写并原样转发 —
 // 宁可少注入一次提示词，也不能把用户的请求改坏。
@@ -28,8 +30,12 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 	// 其余格式（anthropic / gemini / responses）要么本来就返回用量，
 	// 要么不认这个字段，一律不注入。
 	wantUsageInject := prov.APIFormat == model.FormatOpenAI && shouldInjectUsageOption(prov, st)
+	// responses 的 input 项缺 type 时上游会整条请求判 400，而 OpenAI 规范允许省略
+	// 这个字段，所以客户端省略不算写错。这是合规性修正，不设开关：客户端本来就
+	// 带 type 时它是空操作，不会留下改写标记。
+	wantResponsesFix := prov.APIFormat == model.FormatResponses
 	promptText, promptStrategy, hasPrompt := resolvePrompt(prov, st, modelName)
-	if !wantUsageInject && !hasPrompt {
+	if !wantUsageInject && !hasPrompt && !wantResponsesFix {
 		return rawBody, nil
 	}
 
@@ -48,6 +54,10 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 		if applyPrompt(obj, prov.APIFormat, promptText, promptStrategy) {
 			mods = append(mods, "prompt_"+promptStrategy)
 		}
+	}
+	// 放在提示词注入之后：注入出来的项同样会被补齐，最终发出去的 body 一律合规。
+	if wantResponsesFix && normalizeResponsesInput(obj) {
+		mods = append(mods, "responses_input_type")
 	}
 	if len(mods) == 0 {
 		return rawBody, nil
@@ -325,4 +335,41 @@ func applyPromptResponses(obj map[string]any, text, strategy string) bool {
 	}
 	obj["instructions"] = cur + "\n\n" + text
 	return true
+}
+
+// ---------- responses 请求体规范化 ----------
+
+// normalizeResponsesInput 给 responses 请求体 input 数组里缺 type 的消息项补上 type。
+//
+// 上游按判别字段逐项校验 input，缺 type 的消息项会被判成无法识别的输入，
+// 整条请求回 400（实测 commandcode 的报错是 MissingParameter `input.type`）。
+// 而 OpenAI 对 EasyInputMessage 的 type 是可选的，所以客户端省略 type 并不算写错 ——
+// 这正是实际踩到的坑：ZCode 把 assistant 历史写成
+// {"role":"assistant","content":[{"type":"output_text",...}]}，第一轮只有 system+user
+// 时上游照收，第二轮带上 assistant 历史就整条被拒。
+//
+// 只补 type，内容片段与其他字段一律不动（实测补完即被上游接受，且 system/user 项
+// 一并补 type 也照收）。input 直接是字符串、或项本身没有 role 时无从判断，保持原样。
+func normalizeResponsesInput(obj map[string]any) bool {
+	input, ok := obj["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	changed := false
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue // input 允许整体是字符串
+		}
+		if _, has := item["type"]; has {
+			continue // 客户端本来就写对了
+		}
+		if _, has := item["role"]; !has {
+			continue // 既没有 type 也没有 role，猜不出它是什么
+		}
+		item["type"] = "message"
+		changed = true
+	}
+	return changed
 }

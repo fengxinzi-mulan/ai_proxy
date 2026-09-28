@@ -280,6 +280,7 @@ export const MODIFICATION_LABELS: Record<string, string> = {
   prompt_append: '追加提示词',
   prompt_replace: '替换提示词',
   prompt_prepend_user: '前置提示词',
+  responses_input_type: '补齐 input.type',
 }
 
 export function modificationLabel(key: string): string {

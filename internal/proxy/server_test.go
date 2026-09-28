@@ -757,3 +757,107 @@ func TestForwardGeminiFromPath(t *testing.T) {
 		t.Errorf("改写清单错误: %v", entry.Modifications)
 	}
 }
+
+// ---------- responses input 规范化端到端 ----------
+
+// TestResponsesInputTypeFixEndToEnd 覆盖真实客户端载荷（assistant 历史项缺 type）
+// 经代理后能否被上游按合规结构收到。缺 type 时上游会整条请求回 400。
+func TestResponsesInputTypeFixEndToEnd(t *testing.T) {
+	var mu sync.Mutex
+	var gotPath string
+	var received map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		gotPath = r.URL.Path
+		received = body
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatResponses)
+
+	// ZCode 在 responses 格式下真实发出的形状：assistant 项与 system/user 项都没有 type。
+	body := `{"model":"m","input":[` +
+		`{"role":"user","content":[{"type":"input_text","text":"看图"}]},` +
+		`{"role":"assistant","content":[{"type":"output_text","text":"我这就读图"}]},` +
+		`{"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"ok"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	mu.Lock()
+	path, got := gotPath, received
+	mu.Unlock()
+	if path != "/v1/responses" {
+		t.Errorf("上游收到的路径错误: %s", path)
+	}
+	items, ok := got["input"].([]any)
+	if !ok || len(items) != 4 {
+		t.Fatalf("input 结构被破坏: %v", got["input"])
+	}
+	for i := range 2 {
+		if item := items[i].(map[string]any); item["type"] != "message" {
+			t.Errorf("input[%d] 缺 type=message: %v", i, item)
+		}
+	}
+	if items[1].(map[string]any)["content"].([]any)[0].(map[string]any)["type"] != "output_text" {
+		t.Error("assistant 项的内容片段不该被改动")
+	}
+	if items[2].(map[string]any)["type"] != "function_call" {
+		t.Error("已有 type 的工具项不该被改写")
+	}
+
+	entry := lastLog(t, st)
+	if len(entry.Modifications) != 1 || entry.Modifications[0] != "responses_input_type" {
+		t.Errorf("改写清单错误: %v", entry.Modifications)
+	}
+	// 落库的原文应保留改写前的样子，方便核查这次补 type 到底改了哪。
+	if !strings.Contains(entry.ReqBodyOriginal, `"role":"assistant","content":[{"type":"output_text"`) {
+		t.Errorf("未保留改写前的原文: %s", entry.ReqBodyOriginal)
+	}
+	if strings.Contains(entry.ReqBodyOriginal, `"type":"message"`) {
+		t.Errorf("原文里不该出现补出来的 type: %s", entry.ReqBodyOriginal)
+	}
+}
+
+// TestResponsesInputTypeAlreadyPresentEndToEnd 覆盖客户端本来就写对的情况：
+// 不该改动字节，也不该留下改写标记。
+func TestResponsesInputTypeAlreadyPresentEndToEnd(t *testing.T) {
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"status":"completed"}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatResponses)
+
+	body := `{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if gotBody != body {
+		t.Errorf("已合规的请求体应原样转发\n发出: %s\n收到: %s", body, gotBody)
+	}
+	if entry := lastLog(t, st); len(entry.Modifications) != 0 {
+		t.Errorf("不该留下改写标记: %v", entry.Modifications)
+	}
+}

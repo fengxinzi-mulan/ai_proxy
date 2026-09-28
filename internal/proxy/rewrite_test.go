@@ -524,3 +524,137 @@ func TestBuildUpstreamHeadersStripsProxyAccessKey(t *testing.T) {
 		t.Errorf("未配置访问密钥时应原样透传，实际 %q", v)
 	}
 }
+
+// ---------- responses input 规范化 ----------
+
+func responsesProvider() model.Provider {
+	p := baseProvider()
+	p.APIFormat = model.FormatResponses
+	return p
+}
+
+// responsesInput 取出改写后请求体的 input 数组。
+func responsesInput(t *testing.T, out []byte) []any {
+	t.Helper()
+	items, ok := decode(t, out)["input"].([]any)
+	if !ok {
+		t.Fatalf("改写结果没有 input 数组: %s", out)
+	}
+	return items
+}
+
+func TestResponsesInputTypeAddedForRoleItems(t *testing.T) {
+	// 这就是实际踩到的载荷：assistant 项缺 type，system 项也缺。
+	body := []byte(`{"model":"m","input":[` +
+		`{"role":"system","content":"你是助手"},` +
+		`{"role":"user","content":[{"type":"input_text","text":"看图"}]},` +
+		`{"role":"assistant","content":[{"type":"output_text","text":"我这就读图"}]},` +
+		`{"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"ok"}]}`)
+
+	out, mods := rewriteRequestBody(responsesProvider(), model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "responses_input_type" {
+		t.Fatalf("应记录 responses_input_type 改动，实际 %v", mods)
+	}
+
+	items := responsesInput(t, out)
+	for i := range 3 {
+		item := items[i].(map[string]any)
+		if item["type"] != "message" {
+			t.Errorf("input[%d] 应补上 type=message，实际 %v", i, item["type"])
+		}
+	}
+	// 内容片段与其他字段一律不动。
+	if items[1].(map[string]any)["content"].([]any)[0].(map[string]any)["type"] != "input_text" {
+		t.Error("内容片段不该被改动")
+	}
+	if items[2].(map[string]any)["content"].([]any)[0].(map[string]any)["type"] != "output_text" {
+		t.Error("assistant 项的内容片段应保持 output_text")
+	}
+	// 本来就带 type 的项不该被覆盖。
+	if items[3].(map[string]any)["type"] != "function_call" || items[4].(map[string]any)["type"] != "function_call_output" {
+		t.Error("已有 type 的项被改动了")
+	}
+}
+
+func TestResponsesInputTypeAlreadyPresentIsNoop(t *testing.T) {
+	body := []byte(`{"model":"m","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},` +
+		`{"type":"function_call","call_id":"c1","name":"read","arguments":"{}"}]}`)
+
+	out, mods := rewriteRequestBody(responsesProvider(), model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("客户端已写对时不该记录改动，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
+	}
+}
+
+func TestResponsesInputSkipsUnclassifiableItems(t *testing.T) {
+	// input 允许整体是字符串；项也可能既没有 type 也没有 role。
+	plain := []byte(`{"model":"m","input":"hi"}`)
+	out, mods := rewriteRequestBody(responsesProvider(), model.DefaultSettings(), plain, modelNameFromBody(plain))
+	if len(mods) != 0 || string(out) != string(plain) {
+		t.Errorf("input 为字符串时不该改动，mods=%v body=%s", mods, out)
+	}
+
+	mixed := []byte(`{"model":"m","input":[{"foo":"bar"}]}`)
+	out, mods = rewriteRequestBody(responsesProvider(), model.DefaultSettings(), mixed, modelNameFromBody(mixed))
+	if len(mods) != 0 {
+		t.Errorf("既无 type 也无 role 的项不该猜着改，实际 %v", mods)
+	}
+	if item := responsesInput(t, out)[0].(map[string]any); item["type"] != nil {
+		t.Errorf("不该给无从判断的项补 type，实际 %v", item["type"])
+	}
+}
+
+func TestResponsesInputMalformedBodyIsPassedThrough(t *testing.T) {
+	body := []byte(`{"model":"m","input":[`)
+	out, mods := rewriteRequestBody(responsesProvider(), model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("坏 JSON 不该记录改动，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("坏 JSON 应原样透传")
+	}
+}
+
+func TestResponsesInputFixAlsoCoversInjectedItem(t *testing.T) {
+	// 前置提示词注入出来的 user 项同样会被补齐，最终 body 一律合规。
+	st := promptSettings("前置说明", model.StrategyPrependUser)
+	body := []byte(`{"model":"m","input":[{"role":"user","content":"hi"}]}`)
+
+	out, mods := rewriteRequestBody(responsesProvider(), st, body, modelNameFromBody(body))
+	if len(mods) != 2 || mods[0] != "prompt_prepend_user" || mods[1] != "responses_input_type" {
+		t.Fatalf("应同时记录提示词与规范化两项改动，实际 %v", mods)
+	}
+	items := responsesInput(t, out)
+	if len(items) != 2 {
+		t.Fatalf("应多出一条前置 user 项，实际 %d 条", len(items))
+	}
+	for i, raw := range items {
+		if item := raw.(map[string]any); item["type"] != "message" {
+			t.Errorf("input[%d] 应补上 type=message，实际 %v", i, item["type"])
+		}
+	}
+	if items[0].(map[string]any)["content"] != "前置说明" {
+		t.Errorf("前置项的 content 不正确: %v", items[0])
+	}
+}
+
+func TestResponsesInputFixIsResponsesOnly(t *testing.T) {
+	// 其他格式的 body 结构完全不同，绝不能顺手改。
+	body := []byte(`{"model":"m","messages":[{"role":"assistant","content":"hi"}]}`)
+	for _, format := range []model.APIFormat{model.FormatOpenAI, model.FormatAnthropic, model.FormatGemini} {
+		p := baseProvider()
+		p.APIFormat = format
+		out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+		if len(mods) != 0 {
+			t.Errorf("%s 不该被 responses 规范化碰到，实际 %v", format, mods)
+		}
+		if string(out) != string(body) {
+			t.Errorf("%s 的请求体不该被改动", format)
+		}
+	}
+}
