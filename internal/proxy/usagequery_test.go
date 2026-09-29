@@ -519,17 +519,20 @@ func TestUsageTemplatesRegistered(t *testing.T) {
 	if len(list) == 0 {
 		t.Fatal("模板注册表为空")
 	}
-	found := false
+	seen := map[string]bool{}
 	for _, tpl := range list {
 		if tpl.ID == "" || tpl.Name == "" {
 			t.Fatalf("模板元数据不完整: %+v", tpl)
 		}
-		if tpl.ID == "commandcode" {
-			found = true
+		if seen[tpl.ID] {
+			t.Fatalf("模板 id 重复: %s", tpl.ID)
 		}
+		seen[tpl.ID] = true
 	}
-	if !found {
-		t.Fatal("缺少 commandcode 模板")
+	for _, want := range []string{"commandcode", "deepseek", "opencode"} {
+		if !seen[want] {
+			t.Errorf("缺少 %s 模板", want)
+		}
 	}
 }
 
@@ -587,4 +590,308 @@ func hasWarning(warnings []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// ---------- DeepSeek 模板 ----------
+//
+// 响应体照抄官方文档示例（api-docs.deepseek.com/zh-cn/api/get-user-balance）。
+// 这是公开接口，但仍照抄原文而不自编结构：字段名（下划线风格）与字符串金额都是接口的一部分。
+
+const dsBalanceFixture = `{"is_available":true,"balance_infos":[
+	{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"}]}`
+
+// simpleUsageMock 是一个「只回一个固定响应」的假上游，用于 deepseek / opencode 这类单接口模板。
+type simpleUsageMock struct {
+	path   string
+	status int
+	body   string
+
+	mu     sync.Mutex
+	calls  []ccCall
+	prefix string // 收到的路径前缀，用于断言推导出来的地址
+}
+
+func (m *simpleUsageMock) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.calls = append(m.calls, ccCall{path: r.URL.Path, auth: r.Header.Get("Authorization"), query: r.URL.Query()})
+		m.mu.Unlock()
+
+		if r.URL.Path != m.path {
+			http.NotFound(w, r)
+			return
+		}
+		status := m.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			io.WriteString(w, m.body)
+			return
+		}
+		io.WriteString(w, `{"error":"boom"}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func (m *simpleUsageMock) callCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.calls)
+}
+
+func (m *simpleUsageMock) authHeader() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.calls) == 0 {
+		return ""
+	}
+	return m.calls[0].auth
+}
+
+// addTemplateProvider 建一个指定模板的供应商。baseURL 原样传入，由各模板自行推导。
+func addTemplateProvider(t *testing.T, st *store.Store, baseURL, template string) model.Provider {
+	t.Helper()
+	p := model.Provider{
+		Name:       "tpl-" + template,
+		Enabled:    true,
+		BaseURL:    baseURL,
+		APIFormat:  model.FormatOpenAI,
+		Keys:       []model.APIKey{{ID: "k1", Key: "sk-test", Enabled: true}},
+		UsageQuery: model.UsageQueryConfig{Template: template},
+	}
+	created, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+	return created
+}
+
+func TestQueryUsageDeepSeek(t *testing.T) {
+	mock := &simpleUsageMock{path: dsPathBalance, body: dsBalanceFixture}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	// BaseURL 带 /v1，模板应剥掉它再拼 /user/balance。
+	prov := addTemplateProvider(t, st, upstream.URL+"/v1", "deepseek")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if !snap.OK {
+		t.Fatalf("查询应成功，error=%q warnings=%v", snap.Error, snap.Warnings)
+	}
+	if snap.TemplateName != "DeepSeek" {
+		t.Errorf("模板名不正确: %q", snap.TemplateName)
+	}
+	if snap.Status != "可用" {
+		t.Errorf("is_available=true 时应为「可用」，实际 %q", snap.Status)
+	}
+	if len(snap.Balances) != 3 {
+		t.Fatalf("应有三条余额（总/充值/赠金），实际 %+v", snap.Balances)
+	}
+	// 金额与币种都要对：人民币余额不能被当成美元。
+	byLabel := map[string]model.UsageBalance{}
+	for _, b := range snap.Balances {
+		byLabel[b.Label] = b
+	}
+	total := byLabel["总余额"]
+	if total.Amount != 110 || total.Currency != "CNY" {
+		t.Errorf("总余额应为 110 CNY，实际 %+v", total)
+	}
+	// 总余额是「汇总余额」，它已经包含充值与赠金。界面据此判断不该再加一遍分项，
+	// 所以这个标记是必填的 —— 丢了它「剩余额度」就会变成两倍。
+	if !total.Total {
+		t.Error("总余额应标记为汇总余额（total=true）")
+	}
+	if b := byLabel["充值余额"]; b.Amount != 100 || b.Total {
+		t.Errorf("充值余额应为 100 且非汇总，实际 %+v", b)
+	}
+	if b := byLabel["赠金余额"]; b.Amount != 10 || b.Total {
+		t.Errorf("赠金余额应为 10 且非汇总，实际 %+v", b)
+	}
+	// 样本本身自洽：总余额 = 充值 + 赠金。
+	if total.Amount != byLabel["充值余额"].Amount+byLabel["赠金余额"].Amount {
+		t.Errorf("样本应满足 total = topped_up + granted")
+	}
+	if got := mock.authHeader(); got != "Bearer sk-test" {
+		t.Errorf("鉴权头不正确: %q", got)
+	}
+}
+
+func TestQueryUsageDeepSeekUnauthorized(t *testing.T) {
+	mock := &simpleUsageMock{path: dsPathBalance, status: http.StatusUnauthorized, body: "{}"}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	prov := addTemplateProvider(t, st, upstream.URL+"/v1", "deepseek")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if snap.Error == "" {
+		t.Fatal("401 时应给出整体失败原因")
+	}
+	if snap.OK {
+		t.Error("鉴权失败时不该判为成功")
+	}
+}
+
+// 金额读不出来时绝不能回落成 0。
+func TestQueryUsageDeepSeekSchemaDriftIsNotZero(t *testing.T) {
+	mock := &simpleUsageMock{
+		path: dsPathBalance,
+		body: `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"","granted_balance":"","topped_up_balance":""}]}`,
+	}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	prov := addTemplateProvider(t, st, upstream.URL+"/v1", "deepseek")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if len(snap.Balances) != 0 {
+		t.Errorf("空金额不该被解析成 0 额度，实际 %+v", snap.Balances)
+	}
+	if snap.OK {
+		t.Error("读不到任何金额时不该判为成功")
+	}
+}
+
+// ---------- OpenCode 模板 ----------
+//
+// 字段名照抄 openusage 文档对 GET https://opencode.ai/zen/go/v1/usage 的描述：
+// usage.{rolling,weekly,monthly}，各含 percent 与 resetsAt。
+
+const ocUsageFixture = `{"usage":{
+	"rolling":{"percent":1,"resetsAt":"2026-06-06T11:36:00Z"},
+	"weekly":{"percent":29.7,"resetsAt":"2026-06-11T10:15:00Z"},
+	"monthly":{"percent":25,"resetsAt":"2026-07-02T10:15:00Z"}},"plan":"go"}`
+
+func TestQueryUsageOpenCode(t *testing.T) {
+	mock := &simpleUsageMock{path: "/zen/go/v1/usage", body: ocUsageFixture}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	// BaseURL 填到 /zen/v1（常见写法），模板应改用站点根 + 绝对路径。
+	prov := addTemplateProvider(t, st, upstream.URL+"/zen/v1", "opencode")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if !snap.OK {
+		t.Fatalf("查询应成功，error=%q warnings=%v", snap.Error, snap.Warnings)
+	}
+	if len(snap.Windows) != 3 {
+		t.Fatalf("应有三个窗口（5 小时/每周/本月），实际 %+v", snap.Windows)
+	}
+	byLabel := map[string]model.UsageWindow{}
+	for _, w := range snap.Windows {
+		byLabel[w.Label] = w
+	}
+	if w := byLabel["5 小时"]; w.Percent != 1 {
+		t.Errorf("5 小时窗口百分比应为 1，实际 %v", w.Percent)
+	}
+	if w := byLabel["每周"]; w.Percent != 29.7 {
+		t.Errorf("每周窗口百分比应为 29.7，实际 %v", w.Percent)
+	}
+	if w := byLabel["本月"]; w.Percent != 25 {
+		t.Errorf("本月窗口百分比应为 25，实际 %v", w.Percent)
+	}
+	// 上游只给百分比，没有金额，Cap 必须保持 0 而不是编一个数。
+	for _, w := range snap.Windows {
+		if w.Cap != 0 || w.Used != 0 {
+			t.Errorf("%s 窗口不该有金额，实际 used=%v cap=%v", w.Label, w.Used, w.Cap)
+		}
+		if w.Hint == "" {
+			t.Errorf("%s 窗口应说明百分比没有金额口径", w.Label)
+		}
+	}
+	if w := byLabel["5 小时"]; w.ResetAt == nil {
+		t.Error("应解析出重置时间")
+	}
+	if snap.PlanName == "" {
+		t.Error("应给出计划名")
+	}
+	if got := mock.authHeader(); got != "Bearer sk-test" {
+		t.Errorf("鉴权头不正确: %q", got)
+	}
+}
+
+// BaseURL 换成 /zen/go/v1 也应能命中同一个绝对路径（推导基准不同但 origin 相同）。
+func TestQueryUsageOpenCodeAlternateBaseURL(t *testing.T) {
+	mock := &simpleUsageMock{path: "/zen/go/v1/usage", body: ocUsageFixture}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	prov := addTemplateProvider(t, st, upstream.URL+"/zen/go/v1", "opencode")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if !snap.OK || len(snap.Windows) != 3 {
+		t.Fatalf("另一种 BaseURL 写法也应命中，ok=%v windows=%+v warnings=%v", snap.OK, snap.Windows, snap.Warnings)
+	}
+}
+
+// resetsAt 用 epoch 秒也应能解析。
+func TestQueryUsageOpenCodeEpochReset(t *testing.T) {
+	body := `{"usage":{"rolling":{"percent":5,"resetsAt":1780000000}}}`
+	mock := &simpleUsageMock{path: "/zen/go/v1/usage", body: body}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	prov := addTemplateProvider(t, st, upstream.URL+"/zen/v1", "opencode")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if len(snap.Windows) != 1 {
+		t.Fatalf("应只有一个窗口，实际 %+v", snap.Windows)
+	}
+	if snap.Windows[0].ResetAt == nil {
+		t.Error("epoch 秒形式的 resetsAt 应被解析")
+	}
+}
+
+// 未订阅 Go（上游 403）时给出可操作的原因，而不是静默成功。
+func TestQueryUsageOpenCodeNotSubscribed(t *testing.T) {
+	mock := &simpleUsageMock{path: "/zen/go/v1/usage", status: http.StatusForbidden, body: "{}"}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	prov := addTemplateProvider(t, st, upstream.URL+"/zen/v1", "opencode")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if snap.Error == "" {
+		t.Fatal("403 时应给出失败原因")
+	}
+	if !strings.Contains(snap.Error, "Go") {
+		t.Errorf("失败原因应提到 Go 订阅，实际 %q", snap.Error)
+	}
+}
+
+// 没有任何窗口时不要把「空」当成「成功」。
+func TestQueryUsageOpenCodeEmptyUsage(t *testing.T) {
+	mock := &simpleUsageMock{path: "/zen/go/v1/usage", body: `{"usage":{}}`}
+	upstream := mock.start(t)
+
+	srv, st := newTestServer(t)
+	prov := addTemplateProvider(t, st, upstream.URL+"/zen/v1", "opencode")
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if snap.OK {
+		t.Error("没有任何窗口时不该判为成功")
+	}
+	if len(snap.Windows) != 0 {
+		t.Errorf("不该有窗口，实际 %+v", snap.Windows)
+	}
+}
+
+// deriveUsageBaseURL + originOf 的组合：把常见 BaseURL 收敛到同一个站点根。
+func TestOriginOf(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://opencode.ai/zen/v1", "https://opencode.ai"},
+		{"https://opencode.ai/zen/go/v1", "https://opencode.ai"},
+		{"https://api.deepseek.com/v1", "https://api.deepseek.com"},
+		{"://bad", ""},
+	}
+	for _, c := range cases {
+		if got := originOf(c.in); got != c.want {
+			t.Errorf("originOf(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
 }

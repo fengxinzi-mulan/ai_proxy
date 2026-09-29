@@ -12,7 +12,7 @@ import (
 )
 
 const logColumns = `id, ts_start, ts_end, provider_id, provider_name, upstream_url, proxy_used,
-	method, path, model, model_response, api_format, stream, reasoning_effort, client_ip,
+	method, path, model, model_response, model_mapped, api_format, stream, reasoning_effort, client_ip,
 	request_modified, response_modified, modifications,
 	http_status, success, error_msg, cancelled,
 	prompt_tokens, cached_tokens, cache_write_tokens, completion_tokens, reasoning_tokens,
@@ -29,15 +29,15 @@ func (s *Store) InsertLog(l *model.RequestLog) (int64, error) {
 	}
 	res, err := s.db.Exec(`INSERT INTO request_logs (
 		ts_start, ts_end, provider_id, provider_name, upstream_url, proxy_used,
-		method, path, model, model_response, api_format, stream, reasoning_effort, client_ip,
+		method, path, model, model_response, model_mapped, api_format, stream, reasoning_effort, client_ip,
 		request_modified, response_modified, modifications,
 		http_status, success, error_msg, cancelled,
 		prompt_tokens, cached_tokens, cache_write_tokens, completion_tokens, reasoning_tokens,
 		total_tokens, tokens_estimated, ttft_ms, total_ms, tps,
 		req_headers, req_body, req_body_original, resp_body
-	) VALUES (?,?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)`,
+	) VALUES (?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)`,
 		tsToDB(l.TSStart), tsToDB(l.TSEnd), l.ProviderID, l.ProviderName, l.UpstreamURL, l.ProxyUsed,
-		l.Method, l.Path, l.Model, l.ModelResponse, l.APIFormat, boolToInt(l.Stream), l.ReasoningEffort, l.ClientIP,
+		l.Method, l.Path, l.Model, l.ModelResponse, l.ModelMapped, l.APIFormat, boolToInt(l.Stream), l.ReasoningEffort, l.ClientIP,
 		boolToInt(l.RequestModified), boolToInt(l.ResponseModified), string(mods),
 		l.HTTPStatus, boolToInt(l.Success), l.ErrorMsg, boolToInt(l.Cancelled),
 		l.PromptTokens, l.CachedTokens, l.CacheWriteTokens, l.CompletionTokens, l.ReasoningTokens,
@@ -71,7 +71,7 @@ func (s *Store) ListLogs(q model.LogQuery) ([]model.RequestLog, int64, error) {
 
 	// 列表不返回报文正文，正文只在详情接口按需读取。
 	listCols := `id, ts_start, ts_end, provider_id, provider_name, upstream_url, proxy_used,
-		method, path, model, model_response, api_format, stream, reasoning_effort, client_ip,
+		method, path, model, model_response, model_mapped, api_format, stream, reasoning_effort, client_ip,
 		request_modified, response_modified, modifications,
 		http_status, success, error_msg, cancelled,
 		prompt_tokens, cached_tokens, cache_write_tokens, completion_tokens, reasoning_tokens,
@@ -196,9 +196,9 @@ func buildLogFilter(q model.LogQuery) (string, []any) {
 	if q.Keyword != "" {
 		// 关键字只搜轻量列，避免全表扫描大报文。
 		conds = append(conds,
-			"(model LIKE ? OR model_response LIKE ? OR path LIKE ? OR error_msg LIKE ? OR provider_name LIKE ?)")
+			"(model LIKE ? OR model_response LIKE ? OR model_mapped LIKE ? OR path LIKE ? OR error_msg LIKE ? OR provider_name LIKE ?)")
 		kw := "%" + q.Keyword + "%"
-		args = append(args, kw, kw, kw, kw, kw)
+		args = append(args, kw, kw, kw, kw, kw, kw)
 	}
 	if len(conds) == 0 {
 		return "", nil
@@ -216,7 +216,7 @@ func scanLog(sc rowScanner) (model.RequestLog, error) {
 	)
 	err := sc.Scan(
 		&l.ID, &tsStart, &tsEnd, &l.ProviderID, &l.ProviderName, &l.UpstreamURL, &l.ProxyUsed,
-		&l.Method, &l.Path, &l.Model, &l.ModelResponse, &l.APIFormat, &stream, &l.ReasoningEffort, &l.ClientIP,
+		&l.Method, &l.Path, &l.Model, &l.ModelResponse, &l.ModelMapped, &l.APIFormat, &stream, &l.ReasoningEffort, &l.ClientIP,
 		&reqMod, &respMod, &mods,
 		&l.HTTPStatus, &success, &l.ErrorMsg, &cancelled,
 		&l.PromptTokens, &l.CachedTokens, &l.CacheWriteTokens, &l.CompletionTokens, &l.ReasoningTokens,

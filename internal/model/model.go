@@ -5,7 +5,10 @@
 // 便于前端直接消费。
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // APIFormat 标识上游供应商使用的协议格式。
 //
@@ -107,6 +110,16 @@ type PromptConfig struct {
 	Strategy string `json:"strategy"`
 }
 
+// ModelMapping 是一条模型名改写规则：客户端请求的模型名与 From 完全相等时，
+// 实际发给上游的模型名改成 To。
+//
+// 只做精确匹配，不做前缀/正则匹配 —— 模型名是上游用来选模型和计费的关键字段，
+// 模糊匹配一旦误命中，请求就会被送到一个完全不相干的模型上，而且很难从日志里看出来。
+type ModelMapping struct {
+	From string `json:"from"` // 客户端请求的模型名
+	To   string `json:"to"`   // 实际发给上游的模型名
+}
+
 // CustomUsageMapping 用于 apiFormat=custom 时告诉程序去哪儿取用量。
 // 值是简化版 JSON 路径，支持 a.b.c 形式；* 表示数组通配。
 type CustomUsageMapping struct {
@@ -166,6 +179,9 @@ type Provider struct {
 	Prompt      PromptConfig `json:"prompt"`
 	PromptRules []PromptRule `json:"promptRules"`
 
+	// 模型映射（可选）。只做精确匹配，未命中的请求原样透传。
+	ModelMap []ModelMapping `json:"modelMap"`
+
 	// usage 注入
 	UsageInjectMode string `json:"usageInjectMode"` // inherit | on | off
 	StripUsageChunk bool   `json:"stripUsageChunk"`
@@ -208,6 +224,31 @@ func (p Provider) AuthHeaderFor() (string, string) {
 	return DefaultAuthForFormat(p.APIFormat)
 }
 
+// MapModel 按模型映射把请求模型名改写成目标模型名，返回改写结果与是否命中。
+//
+// 逐条按顺序比较，命中第一条即返回；两侧都去掉首尾空白后比较，
+// 这样用户在表单里粘贴带空格的名字不会造成「看起来一样却不匹配」。
+// 未命中时返回原值与 false，调用方据此保持请求原样透传。
+func (p Provider) MapModel(name string) (string, bool) {
+	if len(p.ModelMap) == 0 {
+		return name, false
+	}
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return name, false
+	}
+	for _, m := range p.ModelMap {
+		to := strings.TrimSpace(m.To)
+		if to == "" {
+			continue
+		}
+		if strings.TrimSpace(m.From) == trimmed {
+			return to, true
+		}
+	}
+	return name, false
+}
+
 // ApplyDefaults 补齐空字段，保证从数据库或 API 读入的对象始终可用。
 func (p *Provider) ApplyDefaults() {
 	if p.APIFormat == "" {
@@ -233,6 +274,9 @@ func (p *Provider) ApplyDefaults() {
 	}
 	if p.PromptRules == nil {
 		p.PromptRules = []PromptRule{}
+	}
+	if p.ModelMap == nil {
+		p.ModelMap = []ModelMapping{}
 	}
 	// TimeoutSeconds / ConnectTimeoutSeconds 为 0 表示「继承全局默认」，
 	// 只有负数才视为非法值。
@@ -360,8 +404,11 @@ type RequestLog struct {
 	// Model 是客户端请求的模型名，ModelResponse 是上游响应里回显的模型名。
 	Model         string `json:"model"`
 	ModelResponse string `json:"modelResponse"`
-	APIFormat     string `json:"apiFormat"`
-	Stream        bool   `json:"stream"`
+	// ModelMapped 是「模型映射」命中后实际发给上游的模型名；未命中为空。
+	// 有它才能把「客户端要的模型」和「上游看到的模型」对上号。
+	ModelMapped string `json:"modelMapped"`
+	APIFormat   string `json:"apiFormat"`
+	Stream      bool   `json:"stream"`
 	// ReasoningEffort 是请求中的推理强度设置原文（如 "high"、"4096"）。
 	ReasoningEffort string `json:"reasoningEffort"`
 	ClientIP        string `json:"clientIp"`

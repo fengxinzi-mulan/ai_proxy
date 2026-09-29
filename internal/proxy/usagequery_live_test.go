@@ -74,3 +74,93 @@ func TestLiveCommandCodeUsage(t *testing.T) {
 		t.Errorf("有 %d 段未读到，请对照 raw 检查上游是否改了结构", len(snap.Warnings))
 	}
 }
+
+// DeepSeek 与 OpenCode 的实查。
+//
+//	DeepSeek:  DEEPSEEK_API_KEY=sk-xxx go test ./internal/proxy -run LiveDeepSeek -v
+//	OpenCode:  OPENCODE_API_KEY=sk-xxx go test ./internal/proxy -run LiveOpenCode -v
+//
+// 两个都只发 GET，不消耗额度；密钥只从环境变量读。
+func TestLiveDeepSeekUsage(t *testing.T) {
+	key := os.Getenv("DEEPSEEK_API_KEY")
+	if key == "" {
+		t.Skip("未设置 DEEPSEEK_API_KEY，跳过实查")
+	}
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("打开测试数据库失败: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := NewServer(st, hub.New(), quietLogger())
+
+	prov := model.Provider{
+		Name:       "deepseek",
+		Enabled:    true,
+		BaseURL:    "https://api.deepseek.com/v1",
+		APIFormat:  model.FormatOpenAI,
+		Keys:       []model.APIKey{{ID: "k1", Key: key, Enabled: true}},
+		UsageQuery: model.UsageQueryConfig{Template: "deepseek"},
+	}
+	settings, _ := st.GetSettings()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	snap := srv.QueryUsage(ctx, prov, settings)
+
+	if snap.Error != "" {
+		t.Fatalf("整体失败: %s", snap.Error)
+	}
+	for _, w := range snap.Warnings {
+		t.Logf("降级：%s", w)
+	}
+	t.Logf("状态=%s", snap.Status)
+	for _, b := range snap.Balances {
+		t.Logf("余额 %s = %.4f %s", b.Label, b.Amount, b.Currency)
+	}
+	if !snap.OK {
+		t.Fatalf("未读到余额，warnings=%v", snap.Warnings)
+	}
+}
+
+func TestLiveOpenCodeUsage(t *testing.T) {
+	key := os.Getenv("OPENCODE_API_KEY")
+	if key == "" {
+		t.Skip("未设置 OPENCODE_API_KEY，跳过实查")
+	}
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("打开测试数据库失败: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := NewServer(st, hub.New(), quietLogger())
+
+	prov := model.Provider{
+		Name:       "opencode",
+		Enabled:    true,
+		BaseURL:    "https://opencode.ai/zen/v1",
+		APIFormat:  model.FormatOpenAI,
+		Keys:       []model.APIKey{{ID: "k1", Key: key, Enabled: true}},
+		UsageQuery: model.UsageQueryConfig{Template: "opencode"},
+	}
+	settings, _ := st.GetSettings()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	snap := srv.QueryUsage(ctx, prov, settings)
+
+	if snap.Error != "" {
+		t.Fatalf("整体失败: %s（若为 401/403，说明该账号未订阅 OpenCode Go）", snap.Error)
+	}
+	for _, w := range snap.Warnings {
+		t.Logf("降级：%s", w)
+	}
+	t.Logf("计划=%s", snap.PlanName)
+	for _, w := range snap.Windows {
+		t.Logf("窗口 %s = %.1f%% 重置=%v", w.Label, w.Percent, w.ResetAt)
+	}
+	if !snap.OK {
+		t.Fatalf("未读到窗口，warnings=%v", snap.Warnings)
+	}
+}

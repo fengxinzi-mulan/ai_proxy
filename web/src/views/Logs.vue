@@ -226,8 +226,16 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
     key: 'model',
     width: 256,
     ellipsis: { tooltip: true },
-    render: (r) =>
-      h('span', { class: 'mono' }, r.model || r.modelResponse || '—'),
+    // 命中模型映射时渲染成「请求模型 → 上游模型」，一眼看出这条请求改写过模型。
+    render: (r) => {
+      const base = r.model || r.modelResponse || '—'
+      if (!r.modelMapped) return h('span', { class: 'mono' }, base)
+      return h('span', { class: 'mono' }, [
+        base,
+        h('span', { style: 'opacity:.5' }, ' → '),
+        h('span', { style: 'opacity:.75' }, r.modelMapped),
+      ])
+    },
   },
   {
     title: '状态',

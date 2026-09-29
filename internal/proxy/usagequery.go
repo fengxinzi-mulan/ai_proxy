@@ -32,7 +32,10 @@ import (
 // 模板不需要知道代理怎么走、密钥怎么轮询、超时是多少。
 type usageClient struct {
 	baseURL string
-	get     func(ctx context.Context, path string, query url.Values) (int, []byte, error)
+	// origin 是 scheme://host 形式的站点根，供「额度接口固定在站点根某个绝对路径下」的模板使用
+	// （例如 OpenCode 的额度接口固定挂在 /zen/go/v1/usage，与 BaseURL 推导出来的路径基准无关）。
+	origin string
+	get    func(ctx context.Context, path string, query url.Values) (int, []byte, error)
 }
 
 // usageTemplate 描述一种「向上游查询套餐余量」的协议实现。
@@ -44,7 +47,11 @@ type usageTemplate struct {
 	fetch func(ctx context.Context, cli *usageClient) (*model.UsageSnapshot, error)
 }
 
-var usageTemplateRegistry = []usageTemplate{commandCodeTemplate()}
+var usageTemplateRegistry = []usageTemplate{
+	commandCodeTemplate(),
+	deepSeekTemplate(),
+	openCodeTemplate(),
+}
 
 // UsageTemplates 返回内置用量查询模板的元数据，供管理界面下拉框使用。
 func UsageTemplates() []model.UsageTemplateInfo {
@@ -132,8 +139,16 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 	)
 	cli := &usageClient{
 		baseURL: base,
+		origin:  originOf(base),
 		get: func(ctx context.Context, path string, query url.Values) (int, []byte, error) {
-			target := strings.TrimRight(base, "/") + path
+			// path 以 http:// 或 https:// 开头时视为完整地址（模板用 cli.origin 自行拼绝对路径），
+			// 否则拼到推导出来的 base 上。
+			var target string
+			if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+				target = path
+			} else {
+				target = strings.TrimRight(base, "/") + path
+			}
 			if len(query) > 0 {
 				target += "?" + query.Encode()
 			}
@@ -236,6 +251,15 @@ func deriveUsageBaseURL(prov model.Provider) (string, error) {
 		}
 	}
 	return origin + strings.TrimRight(path, "/"), nil
+}
+
+// originOf 取出 URL 的 scheme://host（站点根），解析失败返回空串。
+func originOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // ---------- commandcode 模板 ----------
@@ -636,4 +660,290 @@ func ccTime(s string) *time.Time {
 		return nil
 	}
 	return &t
+}
+
+// ---------- DeepSeek 模板 ----------
+
+// DeepSeek 的查询余额接口。这是官方公开文档里的接口，与其它模板的「未公开接口」性质不同：
+// https://api-docs.deepseek.com/zh-cn/api/get-user-balance
+//
+// 生成接口挂在 /v1 下，而这个接口挂在站点根（/user/balance），
+// 所以 deriveUsageBaseURL 剥掉 /v1 后拼上它即可。
+const dsPathBalance = "/user/balance"
+
+func deepSeekTemplate() usageTemplate {
+	return usageTemplate{
+		info: model.UsageTemplateInfo{
+			ID:          "deepseek",
+			Name:        "DeepSeek",
+			Description: "官方 /user/balance，读取总余额、充值余额与赠金余额（含币种）",
+		},
+		fetch: fetchDeepSeekUsage,
+	}
+}
+
+// dsBalanceInfo 是 DeepSeek 返回的一条币种余额。金额字段是字符串（如 "110.00"），
+// 所以用字符串接、再解析成 float，避免直接把 JSON 数字塞进 float 时因格式差异失败。
+type dsBalanceInfo struct {
+	Currency        string `json:"currency"`
+	TotalBalance    string `json:"total_balance"`
+	GrantedBalance  string `json:"granted_balance"`
+	ToppedUpBalance string `json:"topped_up_balance"`
+}
+
+func fetchDeepSeekUsage(ctx context.Context, cli *usageClient) (*model.UsageSnapshot, error) {
+	snap := &model.UsageSnapshot{}
+
+	status, body, err := cli.get(ctx, dsPathBalance, nil)
+	if err != nil {
+		return nil, fmt.Errorf("无法连接 DeepSeek: %w", err)
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return nil, fmt.Errorf("密钥被拒绝（HTTP %d），请检查该供应商的密钥是否有效", status)
+	case status < 200 || status >= 300:
+		snap.Warnings = append(snap.Warnings,
+			fmt.Sprintf("余额接口不可用（/user/balance 返回 HTTP %d）", status))
+		return snap, nil
+	}
+
+	parsed, parseErr := parseDeepSeekBalance(body)
+	if parseErr != nil {
+		snap.Warnings = append(snap.Warnings, "余额结构无法识别："+parseErr.Error())
+		return snap, nil
+	}
+	snap.OK = true
+	snap.Balances = parsed.balances
+	snap.Status = parsed.status
+	return snap, nil
+}
+
+type dsBalance struct {
+	balances []model.UsageBalance
+	status   string
+}
+
+// parseDeepSeekBalance 解析官方响应：
+//
+//	{"is_available":true,"balance_infos":[
+//	  {"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"}]}
+//
+// balance_infos 是一个数组（可能同时有 CNY 与 USD），每一项拆成「总余额 / 充值余额 / 赠金余额」
+// 三条，币种跟着每条走 —— 否则人民币余额会被按美元格式化显示。
+// 金额是字符串，解析失败的那一条直接跳过（绝不回落成 0）。
+func parseDeepSeekBalance(body []byte) (dsBalance, error) {
+	var root struct {
+		IsAvailable  *bool           `json:"is_available"`
+		BalanceInfos []dsBalanceInfo `json:"balance_infos"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil {
+		return dsBalance{}, errors.New("响应不是合法的 JSON")
+	}
+	if len(root.BalanceInfos) == 0 {
+		return dsBalance{}, errors.New("没有 balance_infos 字段")
+	}
+
+	var out dsBalance
+	if root.IsAvailable != nil {
+		if *root.IsAvailable {
+			out.status = "可用"
+		} else {
+			out.status = "余额不足"
+		}
+	}
+	for _, info := range root.BalanceInfos {
+		currency := strings.ToUpper(strings.TrimSpace(info.Currency))
+		for _, item := range []struct {
+			label string
+			raw   string
+			total bool
+		}{
+			// total_balance 是「总的可用余额，包括赠金和充值余额」，也就是真正的剩余额度；
+			// 下面两条是它的组成。标记 Total 让界面拿它当剩余额度，而不是把三项相加。
+			{"总余额", info.TotalBalance, true},
+			{"充值余额", info.ToppedUpBalance, false},
+			{"赠金余额", info.GrantedBalance, false},
+		} {
+			v, ok := parseMoneyString(item.raw)
+			if !ok {
+				continue
+			}
+			out.balances = append(out.balances, model.UsageBalance{
+				Label:    item.label,
+				Amount:   v,
+				Currency: currency,
+				Total:    item.total,
+			})
+		}
+	}
+	if len(out.balances) == 0 {
+		return out, errors.New("balance_infos 里没有可解析的金额")
+	}
+	return out, nil
+}
+
+// ---------- OpenCode 模板 ----------
+
+// OpenCode Go 的用量接口。它是订阅制（Go 计划）的配额窗口，返回的是一个百分比，
+// 不是金额 —— 所以这个模板只填三根窗口条，不像 commandcode 那样有余额与周期花费。
+//
+// 接口固定在站点根的 /zen/go/v1/usage 下；用户填的 BaseURL 可能是 https://opencode.ai/zen/v1
+// 也可能是 https://opencode.ai/zen/go/v1，剥 /v1 后推导出来的路径基准并不一致，所以这里
+// 用 cli.origin 拼绝对路径，两种配置都能命中。
+const ocUsagePath = "/zen/go/v1/usage"
+
+func openCodeTemplate() usageTemplate {
+	return usageTemplate{
+		info: model.UsageTemplateInfo{
+			ID:          "opencode",
+			Name:        "OpenCode Go",
+			Description: "读取 Go 订阅的 5 小时/每周/每月配额百分比与重置时间（需已订阅 Go）",
+		},
+		fetch: fetchOpenCodeUsage,
+	}
+}
+
+// ocWindow 是一个配额窗口。上游只保证有 percent 与 resetsAt，两个都用指针/原始值接以容忍缺失。
+type ocWindow struct {
+	Percent  *float64        `json:"percent"`
+	ResetAt  json.RawMessage `json:"resetsAt"`
+	ResetSec *float64        `json:"resetInSec"`
+}
+
+func fetchOpenCodeUsage(ctx context.Context, cli *usageClient) (*model.UsageSnapshot, error) {
+	snap := &model.UsageSnapshot{}
+
+	if cli.origin == "" {
+		return nil, errors.New("无法从 BaseURL 推导 OpenCode 站点根地址，请在「用量」页手填查询地址")
+	}
+	status, body, err := cli.get(ctx, cli.origin+ocUsagePath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("无法连接 OpenCode: %w", err)
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return nil, fmt.Errorf("密钥被拒绝或该账号未订阅 OpenCode Go（HTTP %d）", status)
+	case status < 200 || status >= 300:
+		snap.Warnings = append(snap.Warnings,
+			fmt.Sprintf("用量接口不可用（/zen/go/v1/usage 返回 HTTP %d）；该接口只对已订阅 Go 的账号开放", status))
+		return snap, nil
+	}
+
+	parsed, parseErr := parseOpenCodeUsage(body)
+	if parseErr != nil {
+		snap.Warnings = append(snap.Warnings, "用量结构无法识别："+parseErr.Error())
+		return snap, nil
+	}
+	if len(parsed.windows) == 0 {
+		snap.Warnings = append(snap.Warnings,
+			"上游没有返回任何配额窗口；该账号可能未订阅 OpenCode Go，或接口结构已变更")
+		return snap, nil
+	}
+	snap.OK = true
+	snap.Windows = parsed.windows
+	snap.PlanName = parsed.plan
+	return snap, nil
+}
+
+type ocUsage struct {
+	windows []model.UsageWindow
+	plan    string
+}
+
+// parseOpenCodeUsage 解析 {"usage":{"rolling":{...},"weekly":{...},"monthly":{...}},"plan":"..."}。
+//
+// 上游只给 percent（0-100），不给金额，所以 Used/Cap 一律留 0，只把 percent 转进去，
+// 并写明这个百分比没有金额口径 —— 编一个美元数出来比留空更糟。
+func parseOpenCodeUsage(body []byte) (ocUsage, error) {
+	var root struct {
+		Plan  string `json:"plan"`
+		Usage *struct {
+			Rolling *ocWindow `json:"rolling"`
+			FiveH   *ocWindow `json:"fiveHour"`
+			Weekly  *ocWindow `json:"weekly"`
+			Monthly *ocWindow `json:"monthly"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil {
+		return ocUsage{}, errors.New("响应不是合法的 JSON")
+	}
+	if root.Usage == nil {
+		return ocUsage{}, errors.New("没有 usage 字段")
+	}
+
+	var out ocUsage
+	out.plan = strings.TrimSpace(root.Plan)
+	if out.plan != "" && !strings.EqualFold(out.plan, "go") {
+		out.plan = "OpenCode " + out.plan
+	}
+	rolling := root.Usage.Rolling
+	if rolling == nil {
+		rolling = root.Usage.FiveH // 少数实现把它叫 fiveHour
+	}
+	for _, w := range []struct {
+		label string
+		node  *ocWindow
+	}{
+		{"5 小时", rolling},
+		{"每周", root.Usage.Weekly},
+		{"本月", root.Usage.Monthly},
+	} {
+		if w.node == nil || w.node.Percent == nil {
+			continue
+		}
+		item := model.UsageWindow{
+			Label:   w.label,
+			Percent: *w.node.Percent,
+			ResetAt: ocResetTime(w.node.ResetAt, w.node.ResetSec),
+			Hint:    "上游只返回用量百分比，没有金额口径，因此不显示金额",
+		}
+		out.windows = append(out.windows, item)
+	}
+	return out, nil
+}
+
+// ocResetTime 解析重置时间。上游可能给 ISO8601 串、epoch 秒或 epoch 毫秒，
+// 也可能只给「还有多少秒」。都试一遍，解析不出来就留空（不影响百分比）。
+func ocResetTime(raw json.RawMessage, resetSec *float64) *time.Time {
+	if len(raw) > 0 {
+		s := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+		if s != "" && s != "null" {
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				return &t
+			}
+			if f, err := strconv.ParseFloat(s, 64); err == nil && f > 0 {
+				return epochToTime(f)
+			}
+		}
+	}
+	if resetSec != nil && *resetSec > 0 {
+		t := time.Now().Add(time.Duration(*resetSec) * time.Second).UTC()
+		return &t
+	}
+	return nil
+}
+
+// epochToTime 把 epoch 时间戳转成时间。大于 1e11 视为毫秒，否则视为秒 ——
+// 秒级时间戳要到公元 5138 年才会超过这个量级，是一个安全的判别点。
+func epochToTime(v float64) *time.Time {
+	var t time.Time
+	if v > 1e11 {
+		t = time.UnixMilli(int64(v)).UTC()
+	} else {
+		t = time.Unix(int64(v), 0).UTC()
+	}
+	return &t
+}
+
+// parseMoneyString 解析 DeepSeek 那种字符串金额，空串或非数字返回 false。
+func parseMoneyString(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }

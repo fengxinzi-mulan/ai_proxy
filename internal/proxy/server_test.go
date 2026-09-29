@@ -861,3 +861,123 @@ func TestResponsesInputTypeAlreadyPresentEndToEnd(t *testing.T) {
 		t.Errorf("不该留下改写标记: %v", entry.Modifications)
 	}
 }
+
+// ---------- 模型映射（端到端） ----------
+
+// addProviderWithMap 建一个配了模型映射的生效供应商。
+func addProviderWithMap(t *testing.T, st *store.Store, baseURL string, format model.APIFormat, from, to string) model.Provider {
+	t.Helper()
+	p := model.Provider{
+		Name:        "mapped",
+		DisplayName: "映射上游",
+		Enabled:     true,
+		BaseURL:     baseURL,
+		APIFormat:   format,
+		Keys:        []model.APIKey{{ID: "k1", Key: "sk-test", Enabled: true}},
+		ModelMap:    []model.ModelMapping{{From: from, To: to}},
+	}
+	created, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+	return created
+}
+
+func TestForwardModelMappingRewritesBodyAndLogs(t *testing.T) {
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"model":"up-model","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProviderWithMap(t, st, upstream.URL, model.FormatOpenAI, "req-model", "up-model")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"req-model","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(gotBody, `"model":"up-model"`) {
+		t.Errorf("上游应收到改写后的模型名，实际请求体: %s", gotBody)
+	}
+
+	entry := lastLog(t, st)
+	if entry.Model != "req-model" {
+		t.Errorf("日志里的请求模型应是客户端原名，实际 %q", entry.Model)
+	}
+	if entry.ModelMapped != "up-model" {
+		t.Errorf("日志应记下实际发给上游的模型名，实际 %q", entry.ModelMapped)
+	}
+	if !entry.RequestModified {
+		t.Error("模型映射属于请求体改写，应标记 requestModified")
+	}
+}
+
+// Gemini 的模型名在 URL 路径上而不是请求体里，必须改路径。
+func TestForwardModelMappingRewritesGeminiPath(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProviderWithMap(t, st, upstream.URL, model.FormatGemini, "req-gemini", "up-gemini")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/req-gemini:generateContent",
+		strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(gotPath, "/models/up-gemini:generateContent") {
+		t.Errorf("Gemini 路径里的模型名应被改写，实际上游收到: %s", gotPath)
+	}
+
+	entry := lastLog(t, st)
+	if entry.Model != "req-gemini" || entry.ModelMapped != "up-gemini" {
+		t.Errorf("日志模型字段不正确: model=%q mapped=%q", entry.Model, entry.ModelMapped)
+	}
+}
+
+// 未命中映射时必须是完全透明的：请求体一个字节都不变，日志里也没有 mapping 痕迹。
+func TestForwardModelMappingMissIsTransparent(t *testing.T) {
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"model":"other-model","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProviderWithMap(t, st, upstream.URL, model.FormatOpenAI, "req-model", "up-model")
+
+	body := `{"model":"other-model","stream":false,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if gotBody != body {
+		t.Errorf("未命中映射时请求体必须原样转发\n发出: %s\n收到: %s", body, gotBody)
+	}
+	entry := lastLog(t, st)
+	if entry.ModelMapped != "" {
+		t.Errorf("未命中映射时不该记上游模型名，实际 %q", entry.ModelMapped)
+	}
+}

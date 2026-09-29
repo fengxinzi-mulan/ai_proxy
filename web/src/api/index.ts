@@ -103,8 +103,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ ...provider, probeModel: probeModel ?? '' }),
     }),
-  fetchProviderModels: (id: number) =>
-    request<{ models: string[] }>(`/api/providers/${id}/models`, { method: 'POST' }),
+  /** 拉取上游模型列表。与 testProvider 一样可带上尚未保存的配置。 */
+  fetchProviderModels: (id: number, provider?: Partial<Provider>) =>
+    request<{ models: string[] }>(`/api/providers/${id}/models`, {
+      method: 'POST',
+      body: JSON.stringify(provider ?? {}),
+    }),
 
   /**
    * 查询套餐余量。与 testProvider 一样可带上尚未保存的配置，
@@ -135,7 +139,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ confirm: true }),
     }),
-  distinctModels: () => request<string[]>('/api/models'),
+  /** 日志里出现过的模型名。providerId 可限定到某个供应商（模型映射的候选项）。 */
+  distinctModels: (providerId?: number) =>
+    request<string[]>('/api/models' + (providerId ? `?providerId=${providerId}` : '')),
 
   overview: (range: string) =>
     request<{ stats: OverviewStats; liveCount: number; activeProvider?: Provider }>(

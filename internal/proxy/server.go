@@ -110,6 +110,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 而 Gemini 这两项都不在请求体里（模型在路径上，流式靠 :streamGenerateContent / alt=sse）。
 	in.model = modelNameForRequest(prov.APIFormat, in.clientPath, reqBody)
 	in.wantStream = requestWantsStream(prov.APIFormat, in.clientPath, r.URL.RawQuery, reqBody)
+
+	// 模型映射：把客户端请求的模型名换成目标模型名。非 Gemini 的格式模型名在请求体里，
+	// 由 rewriteRequestBody 改写；Gemini 的模型名在 URL 路径上，必须在拼上游地址之前
+	// 就把路径里的那一段换掉，所以在这里单独处理。
+	if mapped, ok := prov.MapModel(in.model); ok {
+		in.modelMapped = mapped
+		if prov.APIFormat == model.FormatGemini {
+			in.upstreamPath = replaceGeminiModelInPath(in.upstreamPath, in.model, mapped)
+		}
+	}
+
 	in.outBody, in.modifications = rewriteRequestBody(prov, settings, reqBody, in.model)
 
 	s.forward(w, r, in)
@@ -117,14 +128,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // forwardInput 汇总一次转发的输入，避免 forward 参数过长。
 type forwardInput struct {
-	start         time.Time
-	settings      model.Settings
-	provider      model.Provider
-	method        string
-	clientPath    string
-	clientIP      string
-	upstreamPath  string
-	model         string // 请求模型：Gemini 在 URL 路径里，其余格式在请求体里
+	start        time.Time
+	settings     model.Settings
+	provider     model.Provider
+	method       string
+	clientPath   string
+	clientIP     string
+	upstreamPath string
+	model        string // 请求模型：Gemini 在 URL 路径里，其余格式在请求体里
+	// modelMapped 是模型映射命中后实际发给上游的模型名；未命中为空。
+	modelMapped   string
 	wantStream    bool   // 客户端是否要求流式响应
 	reqBody       []byte // 客户端原始请求体
 	outBody       []byte // 改写后实际发出的请求体
@@ -390,6 +403,7 @@ func (s *Server) record(in forwardInput, res logResult) {
 		Method:          in.method,
 		Path:            in.clientPath,
 		Model:           in.model,
+		ModelMapped:     in.modelMapped,
 		ModelResponse:   res.model,
 		APIFormat:       string(in.provider.APIFormat),
 		Stream:          in.wantStream,
@@ -887,6 +901,30 @@ func geminiModelFromPath(path string) string {
 		return ""
 	}
 	return model
+}
+
+// replaceGeminiModelInPath 把路径里 /models/<from> 的模型段换成 to。
+//
+// 定位规则与 geminiModelFromPath 完全一致（最后一个 /models/，取到冒号为止），
+// 只在确实解析出与 from 相同的模型名时才替换，否则原样返回 —— 路径结构一旦不符合
+// 预期，宁可让模型映射对这条请求失效，也不要乱改路径。
+func replaceGeminiModelInPath(path, from, to string) string {
+	const marker = "/models/"
+	idx := strings.LastIndex(path, marker)
+	if idx < 0 {
+		return path
+	}
+	start := idx + len(marker)
+	rest := path[start:]
+	end := strings.IndexByte(rest, ':')
+	if end <= 0 {
+		return path
+	}
+	model := rest[:end]
+	if model != from || strings.Contains(model, "/") {
+		return path
+	}
+	return path[:start] + to + rest[end:]
 }
 
 // requestWantsStream 判断客户端是否要求流式响应。

@@ -173,6 +173,22 @@ export function formatUSD(v: number | null | undefined): string {
 }
 
 /**
+ * 按币种格式化金额。DeepSeek 的余额会返回人民币，直接套 formatUSD 会把 ¥110
+ * 显示成 $110 —— 币种跟着每个余额走，这里才认得出该用哪个符号。
+ * 未知币种用「代码 + 空格」前缀，至少不会张冠李戴；数字精度规则与 formatUSD 一致。
+ */
+export function formatMoney(v: number | null | undefined, currency?: string | null): string {
+  if (v === null || v === undefined) return '—'
+  const code = (currency || 'USD').toUpperCase()
+  const sign = code === 'USD' ? '$' : code === 'CNY' ? '¥' : `${code} `
+  const abs = Math.abs(v)
+  if (abs === 0) return `${sign}0`
+  if (abs < 0.01) return `${sign}${v.toFixed(4)}`
+  if (abs < 1000) return `${sign}${v.toFixed(2)}`
+  return `${sign}${v.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+}
+
+/**
  * 缓存命中率（百分比）：命中缓存的输入量 ÷ 输入总量。
  *
  * 输入总量本身已包含缓存部分（各家的原始口径已在服务端统一），
@@ -277,6 +293,7 @@ export const OUTCOME_LABELS: Record<LogOutcome, string> = {
 /** 改写标记的可读名称。 */
 export const MODIFICATION_LABELS: Record<string, string> = {
   usage_inject: '注入 include_usage',
+  model_map: '模型映射',
   prompt_append: '追加提示词',
   prompt_replace: '替换提示词',
   prompt_prepend_user: '前置提示词',

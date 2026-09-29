@@ -119,6 +119,9 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
                 <NDescriptionsItem label="请求模型">
                   <span class="mono">{{ log.model || '—' }}</span>
                 </NDescriptionsItem>
+                <NDescriptionsItem v-if="log.modelMapped" label="上游模型">
+                  <span class="mono">{{ log.modelMapped }}</span>
+                </NDescriptionsItem>
                 <NDescriptionsItem label="响应模型">
                   <span class="mono">{{ log.modelResponse || '—' }}</span>
                 </NDescriptionsItem>

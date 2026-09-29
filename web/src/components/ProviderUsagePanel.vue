@@ -20,6 +20,7 @@ import {
 import type { UsageSnapshot, UsageStat, UsageWindow } from '@/types'
 import {
   formatCompact,
+  formatMoney,
   formatNumber,
   formatPercent,
   formatRelative,
@@ -43,18 +44,40 @@ const props = withDefaults(
 
 const emit = defineEmits<{ query: [] }>()
 
-/** 剩余额度合计。上游把额度拆成月度/充值/赠送三份，加总才是可用余额。 */
+/**
+ * 剩余额度。
+ *
+ * 上游给的额度有两种形态，必须区分开：
+ *   - 只给分项（commandcode 的月度/充值/赠送），可用余额 = 分项之和；
+ *   - 给的项里有「汇总余额」（DeepSeek 的 total_balance 已经包含赠金与充值），
+ *     这时直接用它，再把分项加一遍会把钱算成两倍。
+ *
+ * 多个币种（例如 DeepSeek 同时给 CNY 与 USD）不做合计，留空只列明细 ——
+ * 把人民币和美元加到一起没有意义。
+ */
 const remaining = computed(() => {
   const balances = props.snapshot?.balances ?? []
   if (!balances.length) return null
-  return balances.reduce((sum, b) => sum + (b.amount || 0), 0)
+  const totals = balances.filter((b) => b.total)
+  const chosen = totals.length ? totals : balances
+  const currencies = new Set(chosen.map((b) => (b.currency || 'USD').toUpperCase()))
+  if (currencies.size > 1) return null
+  const currency = [...currencies][0]
+  const amount = chosen.reduce((sum, b) => sum + (b.amount || 0), 0)
+  return { amount, currency }
 })
 
 const windows = computed(() => props.snapshot?.windows ?? [])
 
-/** 余额明细一行，用于悬浮提示与完整态。 */
+/** 明细行：有「汇总余额」时它就是上面那个大数字，明细里不再重复列它。 */
+const breakdown = computed(() => {
+  const balances = props.snapshot?.balances ?? []
+  return balances.some((b) => b.total) ? balances.filter((b) => !b.total) : balances
+})
+
+/** 余额明细一行，用于悬浮提示与完整态。币种跟着每一条走。 */
 const balanceDetail = computed(() =>
-  (props.snapshot?.balances ?? []).map((b) => `${b.label} ${formatUSD(b.amount)}`).join(' · '),
+  breakdown.value.map((b) => `${b.label} ${formatMoney(b.amount, b.currency)}`).join(' · '),
 )
 
 /** 把不同单位的统计值格式化成一致口径。token 走短格式：动辄十位数的
@@ -92,12 +115,20 @@ const periodRange = computed(() => {
   return `${from} · 至 ${to}`
 })
 
-/** 窗口的悬浮提示：用量、上限、重置时间，以及推导来源（如果有）。 */
+/** 窗口的悬浮提示：用量、上限、重置时间，以及推导来源（如果有）。
+    上游只给百分比时不显示金额（cap 为 0），免得出现「$0 / $0」。 */
 function windowTip(w: UsageWindow): string {
-  const parts = [`${formatUSD(w.used)} / ${formatUSD(w.cap)}`]
+  const parts: string[] = []
+  if (w.cap > 0) parts.push(`${formatUSD(w.used)} / ${formatUSD(w.cap)}`)
+  else parts.push(`已用 ${formatPercent(w.percent)}`)
   if (w.resetAt) parts.push(`重置于 ${formatUntil(w.resetAt)}`)
   if (w.hint) parts.push(w.hint)
   return parts.join(' · ')
+}
+
+/** 窗口是否只有百分比（上游没给金额上限）。 */
+function percentOnly(w: UsageWindow): boolean {
+  return !(w.cap > 0)
 }
 
 /** 进度条填充宽度。超过 100% 时钉在满格，避免视觉上溢出。 */
@@ -146,8 +177,8 @@ const hasData = computed(() => {
             </span>
           </div>
 
-          <div class="c-hero">
-            <span class="c-amount">{{ remaining === null ? '—' : formatUSD(remaining) }}</span>
+          <div v-if="remaining" class="c-hero">
+            <span class="c-amount">{{ formatMoney(remaining.amount, remaining.currency) }}</span>
             <NTooltip v-if="balanceDetail" trigger="hover" placement="top">
               <template #trigger>
                 <span class="c-amount-label">剩余额度</span>
@@ -157,7 +188,11 @@ const hasData = computed(() => {
             <span v-else class="c-amount-label">剩余额度</span>
           </div>
 
-          <div v-if="windows.length" class="c-windows">
+          <div
+            v-if="windows.length"
+            class="c-windows"
+            :style="{ gridTemplateColumns: `repeat(${Math.min(windows.length, 3)}, minmax(0, 1fr))` }"
+          >
             <NTooltip v-for="w in windows" :key="w.label" trigger="hover" placement="top">
               <template #trigger>
                 <div class="c-window">
@@ -206,17 +241,17 @@ const hasData = computed(() => {
             </span>
           </div>
 
-          <div v-if="remaining !== null" class="f-balance">
-            <span class="f-amount">{{ formatUSD(remaining) }}</span>
+          <div v-if="remaining || breakdown.length" class="f-balance">
+            <span v-if="remaining" class="f-amount">{{ formatMoney(remaining.amount, remaining.currency) }}</span>
             <span class="muted small">剩余额度</span>
-            <span v-if="snapshot!.balances.length" class="f-parts">
+            <span v-if="breakdown.length" class="f-parts">
               <span
-                v-for="b in snapshot!.balances"
+                v-for="b in breakdown"
                 :key="b.label"
                 class="small"
                 :class="{ dim: !b.amount }"
               >
-                {{ b.label }} {{ formatUSD(b.amount) }}
+                {{ b.label }} {{ formatMoney(b.amount, b.currency) }}
               </span>
             </span>
           </div>
@@ -234,7 +269,10 @@ const hasData = computed(() => {
                   </NTag>
                 </span>
                 <span class="f-window-nums mono">
-                  {{ formatUSD(w.used) }} / {{ formatUSD(w.cap) }}
+                  <template v-if="!percentOnly(w)">
+                    {{ formatUSD(w.used) }} / {{ formatUSD(w.cap) }}
+                  </template>
+                  <template v-else>已用</template>
                   <span class="f-window-pct" :style="{ color: quotaColor(w.percent) }">
                     {{ formatPercent(w.percent) }}
                   </span>

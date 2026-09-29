@@ -189,6 +189,17 @@ var migrations = []migration{
 			)`,
 		},
 	},
+	{
+		// 供应商的模型映射（请求模型名 → 上游模型名），以及日志里记下这次实际发出去的模型名。
+		//
+		// model_mapped 单独一列而不是塞进 modifications：它是可以按值筛/搜的字符串，
+		// 塞进 JSON 数组里就只能扫全表了。
+		version: 4,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN model_map_json TEXT NOT NULL DEFAULT '[]'`,
+			`ALTER TABLE request_logs ADD COLUMN model_mapped TEXT NOT NULL DEFAULT ''`,
+		},
+	},
 }
 
 func (s *Store) migrate() error {

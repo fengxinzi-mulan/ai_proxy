@@ -658,3 +658,152 @@ func TestResponsesInputFixIsResponsesOnly(t *testing.T) {
 		}
 	}
 }
+
+// ---------- 模型映射 ----------
+
+// mappedProvider 返回一个配了模型映射的供应商。注意关掉 usage 注入，
+// 免得 stream_options 也留下改写标记，把断言搅浑。
+func mappedProvider(format model.APIFormat, from, to string) model.Provider {
+	p := model.Provider{ID: 1, DisplayName: "映射测试", APIFormat: format}
+	p.UsageInjectMode = "off"
+	p.ModelMap = []model.ModelMapping{{From: from, To: to}}
+	p.ApplyDefaults()
+	return p
+}
+
+func TestRewriteAppliesModelMapping(t *testing.T) {
+	st := model.DefaultSettings()
+	body := []byte(`{"model":"claude-3-5-sonnet","messages":[]}`)
+	p := mappedProvider(model.FormatOpenAI, "claude-3-5-sonnet", "anthropic/claude-3.5")
+
+	out, mods := rewriteRequestBody(p, st, body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "model_map" {
+		t.Fatalf("应记录 model_map 改动，实际 %v", mods)
+	}
+	if got := decode(t, out)["model"]; got != "anthropic/claude-3.5" {
+		t.Errorf("model 应被改写成目标模型，实际 %v", got)
+	}
+}
+
+func TestRewriteModelMappingNoMatchPassesThrough(t *testing.T) {
+	st := model.DefaultSettings()
+	body := []byte(`{"model":"gpt-4o","messages":[]}`)
+	// 只映射 claude，请求的是 gpt-4o
+	p := mappedProvider(model.FormatOpenAI, "claude-3-5-sonnet", "anthropic/claude-3.5")
+
+	out, mods := rewriteRequestBody(p, st, body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("未命中映射时不该有任何改写，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未命中映射必须原样透传字节")
+	}
+}
+
+func TestRewriteModelMappingAcrossFormats(t *testing.T) {
+	st := model.DefaultSettings()
+	// 请求体里带 model 的几种格式都应被改写（Gemini 的 model 在 URL 上，不在此列）。
+	for _, tc := range []struct {
+		format model.APIFormat
+		body   string
+	}{
+		{model.FormatOpenAI, `{"model":"req-model","messages":[]}`},
+		{model.FormatResponses, `{"model":"req-model","input":"hi"}`},
+		{model.FormatAnthropic, `{"model":"req-model","messages":[]}`},
+	} {
+		p := mappedProvider(tc.format, "req-model", "up-model")
+		out, mods := rewriteRequestBody(p, st, []byte(tc.body), "req-model")
+		found := false
+		for _, m := range mods {
+			if m == "model_map" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s 应记录 model_map 改动，实际 %v", tc.format, mods)
+			continue
+		}
+		if got := decode(t, out)["model"]; got != "up-model" {
+			t.Errorf("%s 的 model 应被改写，实际 %v", tc.format, got)
+		}
+	}
+}
+
+// 没有 model 字段的请求（例如拉模型列表）不该被无中生有地塞一个 model 进去。
+func TestRewriteModelMappingSkipsBodyWithoutModel(t *testing.T) {
+	st := model.DefaultSettings()
+	body := []byte(`{"query":"hi"}`)
+	p := mappedProvider(model.FormatOpenAI, "req-model", "up-model")
+
+	out, mods := rewriteRequestBody(p, st, body, "req-model")
+	for _, m := range mods {
+		if m == "model_map" {
+			t.Fatal("请求体没有 model 字段时不该报告模型映射")
+		}
+	}
+	if got := decode(t, out)["model"]; got != nil {
+		t.Errorf("不该给请求体塞入 model 字段，实际 %v", got)
+	}
+}
+
+// 提示词规则可以按「上游真名」写：客户端名没命中时，用目标模型名再匹配一次。
+func TestRewritePromptRuleMatchesMappedModelName(t *testing.T) {
+	st := model.DefaultSettings()
+	st.GlobalPrompt.Enabled = false
+	body := []byte(`{"model":"req-model","messages":[{"role":"user","content":"hi"}]}`)
+	p := mappedProvider(model.FormatOpenAI, "req-model", "up-model")
+	p.PromptMode = model.ModeCustom
+	p.PromptRules = []model.PromptRule{{
+		ID: "r1", Enabled: true, ModelPattern: "^up-model$", Text: "上游模型专用提示", Strategy: model.StrategyAppend,
+	}}
+
+	out, mods := rewriteRequestBody(p, st, body, "req-model")
+	var sawMap, sawPrompt bool
+	for _, m := range mods {
+		if m == "model_map" {
+			sawMap = true
+		}
+		if m == "prompt_append" {
+			sawPrompt = true
+		}
+	}
+	if !sawMap || !sawPrompt {
+		t.Fatalf("应同时命中映射与按目标模型名的提示词规则，实际 %v", mods)
+	}
+	obj := decode(t, out)
+	if obj["model"] != "up-model" {
+		t.Errorf("model 应被改写，实际 %v", obj["model"])
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("应追加一条 system 消息，实际 %v", msgs)
+	}
+}
+
+// MapModel 的行为：只做精确匹配，去空白，未命中返回原值。
+func TestProviderMapModel(t *testing.T) {
+	p := model.Provider{ModelMap: []model.ModelMapping{
+		{From: "", To: "ignored"},      // 空 from 无效
+		{From: "a", To: ""},            // 空 to 无效
+		{From: " claude ", To: " c3 "}, // 两侧去空白
+		{From: "claude", To: "second"}, // 不会命中：上一条已经匹配
+		{From: "exact", To: "target"},
+	}}
+	cases := []struct {
+		in     string
+		want   string
+		mapped bool
+	}{
+		{"claude", "c3", true},
+		{"  claude  ", "c3", true},
+		{"exact", "target", true},
+		{"claudex", "claudex", false}, // 不做前缀匹配
+		{"", "", false},
+	}
+	for _, c := range cases {
+		got, ok := p.MapModel(c.in)
+		if got != c.want || ok != c.mapped {
+			t.Errorf("MapModel(%q) = (%q,%v)，期望 (%q,%v)", c.in, got, ok, c.want, c.mapped)
+		}
+	}
+}

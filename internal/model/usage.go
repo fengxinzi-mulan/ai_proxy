@@ -53,10 +53,19 @@ type UsageSnapshot struct {
 	UsedURLs []string `json:"usedUrls"`
 }
 
-// UsageBalance 是一项额度余额。金额单位统一按上游给的记账单位（这些平台都是美元）。
+// UsageBalance 是一项额度余额。
+//
+// 金额单位按上游给的记账单位。多数平台是美元，但 DeepSeek 这类会给人民币，
+// 所以币种跟着每个余额走，而不是全局假设成美元 —— 否则 ¥110 会被显示成 $110。
 type UsageBalance struct {
-	Label  string  `json:"label"` // 月度额度 / 充值额度 / 赠送额度
+	Label  string  `json:"label"` // 月度额度 / 充值额度 / 赠金余额
 	Amount float64 `json:"amount"`
+	// Currency 是 ISO 币种代码（USD / CNY）；上游只给一个币种时照抄，取不到留空。
+	Currency string `json:"currency,omitempty"`
+	// Total 标记这一项是「汇总余额」，它本身已经包含了下面的分项
+	// （DeepSeek 的 total_balance = 充值余额 + 赠金余额）。界面算「剩余额度」时
+	// 要用它而不是把分项再加一遍，否则会把钱算成两倍。
+	Total bool `json:"total,omitempty"`
 	// Hint 用于补充说明，例如「包含订阅额度，每周期重置」
 	Hint string `json:"hint,omitempty"`
 }

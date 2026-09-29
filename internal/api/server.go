@@ -388,11 +388,28 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	// 与 /test、/usage 一致：允许带上「待保存」的配置，这样在编辑模型映射时改完 BaseURL
+	// 或密钥后，不用先保存就能拉一份模型列表来选。
+	var override *model.Provider
+	var body struct {
+		model.Provider
+	}
+	if s.decodeOptional(w, r, &body) && body.BaseURL != "" {
+		candidate := body.Provider
+		candidate.ID = prov.ID
+		candidate.ApplyDefaults()
+		override = &candidate
+	}
+	target := prov
+	if override != nil {
+		target = *override
+	}
+
 	settings, _ := s.store.GetSettings()
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	models, err := s.proxy.ListUpstreamModels(ctx, prov, settings)
+	models, err := s.proxy.ListUpstreamModels(ctx, target, settings)
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -523,7 +540,13 @@ func (s *Server) handleClearLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDistinctModels(w http.ResponseWriter, r *http.Request) {
-	models, err := s.store.DistinctModels(300)
+	// providerId 可选：模型映射的下拉框只想要该供应商自己的历史模型，
+	// 日志页的筛选下拉不传，看的仍是全部。
+	var providerID int64
+	if v := r.URL.Query().Get("providerId"); v != "" {
+		providerID, _ = strconv.ParseInt(v, 10, 64)
+	}
+	models, err := s.store.DistinctModels(300, providerID)
 	if err != nil {
 		s.fail(w, err)
 		return

@@ -67,6 +67,12 @@ export interface CustomUsageMapping {
   model: string
 }
 
+/** 一条模型映射：客户端请求的模型名与 from 完全相等时，实际发给上游的模型改成 to。 */
+export interface ModelMapping {
+  from: string
+  to: string
+}
+
 /** 套餐余量查询配置。template 为空表示该供应商不启用用量查询。 */
 export interface UsageQueryConfig {
   template: string
@@ -79,6 +85,10 @@ export interface UsageQueryConfig {
 export interface UsageBalance {
   label: string
   amount: number
+  /** ISO 币种代码（USD / CNY）；上游没给时为空。 */
+  currency?: string
+  /** 是否是「汇总余额」，它本身已包含下面的分项；算剩余额度时不能与分项相加。 */
+  total?: boolean
   hint?: string
 }
 
@@ -166,6 +176,9 @@ export interface Provider {
   prompt: PromptConfig
   promptRules: PromptRule[]
 
+  /** 模型映射（只做精确匹配，未命中的请求原样透传）。 */
+  modelMap: ModelMapping[]
+
   usageInjectMode: 'inherit' | 'on' | 'off'
   stripUsageChunk: boolean
 
@@ -211,6 +224,8 @@ export interface RequestLog {
   path: string
   model: string
   modelResponse: string
+  /** 「模型映射」命中后实际发给上游的模型名；未命中为空。 */
+  modelMapped: string
   apiFormat: string
   stream: boolean
   reasoningEffort: string

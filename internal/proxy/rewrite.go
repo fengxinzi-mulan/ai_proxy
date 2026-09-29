@@ -21,10 +21,16 @@ import (
 //
 // modelName 由调用方解析后传入，用于匹配「按模型正则」的提示词规则：Gemini 的模型名
 // 不在请求体里，只有调用方（能看到 URL 路径）解析得出来。
+//
+// 模型映射直接由 modelName 现算：命中时请求体里的 model 会被替换成目标模型名 ——
+// 这是唯一会改变「这次请求打的是哪个上游模型」的改动项。
+// （Gemini 的模型名在 URL 路径上而不是请求体里，路径那一段的替换由调用方负责。）
 func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, modelName string) ([]byte, []string) {
 	if len(rawBody) == 0 {
 		return rawBody, nil
 	}
+
+	mappedModel, mapped := prov.MapModel(modelName)
 
 	// stream_options 是 OpenAI chat/completions 特有的字段，
 	// 其余格式（anthropic / gemini / responses）要么本来就返回用量，
@@ -34,8 +40,8 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 	// 这个字段，所以客户端省略不算写错。这是合规性修正，不设开关：客户端本来就
 	// 带 type 时它是空操作，不会留下改写标记。
 	wantResponsesFix := prov.APIFormat == model.FormatResponses
-	promptText, promptStrategy, hasPrompt := resolvePrompt(prov, st, modelName)
-	if !wantUsageInject && !hasPrompt && !wantResponsesFix {
+	promptText, promptStrategy, hasPrompt := resolvePromptForModel(prov, st, modelName, mappedModel, mapped)
+	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped {
 		return rawBody, nil
 	}
 
@@ -48,6 +54,12 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 	if wantUsageInject {
 		if injectIncludeUsage(obj) {
 			mods = append(mods, "usage_inject")
+		}
+	}
+	// 模型映射排在提示词之前：先确定这次请求到底打的是哪个模型，再往里注入内容。
+	if mapped {
+		if applyModelMapping(obj, mappedModel) {
+			mods = append(mods, "model_map")
 		}
 	}
 	if hasPrompt {
@@ -104,6 +116,19 @@ func injectIncludeUsage(obj map[string]any) bool {
 	return true
 }
 
+// applyModelMapping 把请求体顶层的 model 字段改写成目标模型名，返回是否真的改动了。
+//
+// 只在顶层确实有一个非空的字符串 model 键时才动：拉模型列表这类没有 model 的请求
+// 不该被无中生有地塞一个字段进去。
+func applyModelMapping(obj map[string]any, mappedModel string) bool {
+	cur, ok := obj["model"].(string)
+	if !ok || cur == "" || cur == mappedModel {
+		return false
+	}
+	obj["model"] = mappedModel
+	return true
+}
+
 // modelNameFromBody 从请求体里读取模型名，用于匹配提示词规则。
 func modelNameFromBody(body []byte) string {
 	var probe struct {
@@ -136,6 +161,21 @@ func compilePattern(pattern string) *regexp.Regexp {
 	// 缓存里也存 nil，避免每次都重复尝试编译一个坏正则。
 	regexCache[pattern] = re
 	return re
+}
+
+// resolvePromptForModel 决定本次请求使用哪段提示词。
+//
+// 提示词规则里的模型名默认拿「客户端请求的模型名」去匹配 —— 用户写规则时看到的就是
+// 客户端用的名字。但当这次请求被模型映射改写成了另一个上游模型时，按上游真名写的规则
+// 也该能生效，所以在客户端名没命中规则时，再用目标模型名补匹配一次。
+func resolvePromptForModel(prov model.Provider, st model.Settings, modelName, mappedModel string, mapped bool) (string, string, bool) {
+	if text, strategy, ok := resolvePrompt(prov, st, modelName); ok {
+		return text, strategy, true
+	}
+	if mapped && mappedModel != modelName {
+		return resolvePrompt(prov, st, mappedModel)
+	}
+	return "", "", false
 }
 
 // resolvePrompt 按优先级决定本次请求使用的提示词：

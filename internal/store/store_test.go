@@ -656,12 +656,21 @@ func TestStatsAggregation(t *testing.T) {
 		}
 	}
 
-	models, err := st.DistinctModels(10)
+	models, err := st.DistinctModels(10, 0)
 	if err != nil {
 		t.Fatalf("查询模型列表失败: %v", err)
 	}
 	if len(models) != 2 {
 		t.Errorf("应有 2 个不同模型，实际 %+v", models)
+	}
+
+	// 按供应商过滤：只应看到该供应商用过的模型。
+	scoped, err := st.DistinctModels(10, 1)
+	if err != nil {
+		t.Fatalf("按供应商查询模型列表失败: %v", err)
+	}
+	if len(scoped) != 1 {
+		t.Errorf("供应商 1 应只有 1 个模型，实际 %+v", scoped)
 	}
 }
 
@@ -693,4 +702,49 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// 模型映射要能完整往返：这是纯配置，存不住就等于功能不存在。
+func TestProviderModelMapRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+	p := newProvider("map")
+	p.ModelMap = []model.ModelMapping{
+		{From: "claude-3-5-sonnet", To: "anthropic/claude-3.5"},
+		{From: "gpt-4o", To: "openai/gpt-4o-2024-11-20"},
+	}
+	created, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+	got, err := st.GetProvider(created.ID)
+	if err != nil {
+		t.Fatalf("读取供应商失败: %v", err)
+	}
+	if len(got.ModelMap) != 2 || got.ModelMap[0].From != "claude-3-5-sonnet" || got.ModelMap[1].To != "openai/gpt-4o-2024-11-20" {
+		t.Fatalf("模型映射未正确往返: %+v", got.ModelMap)
+	}
+
+	// 通过 MapModel 验证行为（而不是只看字段），确保存下来之后真的能用。
+	if to, ok := got.MapModel("gpt-4o"); !ok || to != "openai/gpt-4o-2024-11-20" {
+		t.Errorf("存库后 MapModel 应命中, 实际 (%q,%v)", to, ok)
+	}
+
+	// 改成一条，再清空。
+	got.ModelMap = []model.ModelMapping{{From: "a", To: "b"}}
+	updated, err := st.UpdateProvider(got)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if len(updated.ModelMap) != 1 || updated.ModelMap[0].To != "b" {
+		t.Fatalf("更新模型映射未生效: %+v", updated.ModelMap)
+	}
+
+	updated.ModelMap = nil
+	cleared, err := st.UpdateProvider(updated)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if len(cleared.ModelMap) != 0 {
+		t.Fatalf("清空模型映射未生效: %+v", cleared.ModelMap)
+	}
 }

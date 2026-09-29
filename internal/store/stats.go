@@ -190,12 +190,23 @@ func (s *Store) ByProvider(from, to time.Time, limit int) ([]model.ProviderStats
 }
 
 // DistinctModels 返回日志中出现过的模型名，供前端筛选下拉框使用。
-func (s *Store) DistinctModels(limit int) ([]string, error) {
+//
+// providerID 大于 0 时只统计该供应商的请求，用于「模型映射」的下拉框 —— 那里只关心
+// 这个上游自己用过的模型名。传 0 表示全部（日志页的筛选下拉）。
+func (s *Store) DistinctModels(limit int, providerID int64) ([]string, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.Query(
-		`SELECT model FROM request_logs WHERE model != '' GROUP BY model ORDER BY MAX(id) DESC LIMIT ?`, limit)
+	query := `SELECT model FROM request_logs WHERE model != ''`
+	args := []any{}
+	if providerID > 0 {
+		query += ` AND provider_id = ?`
+		args = append(args, providerID)
+	}
+	query += ` GROUP BY model ORDER BY MAX(id) DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("查询模型列表失败: %w", err)
 	}

@@ -28,7 +28,7 @@ import {
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import ProviderUsagePanel from '@/components/ProviderUsagePanel.vue'
-import type { APIFormat, CustomUsageMapping, ProbeResult, Provider } from '@/types'
+import type { APIFormat, CustomUsageMapping, ModelMapping, ProbeResult, Provider } from '@/types'
 import { API_FORMAT_LABELS, PROMPT_STRATEGY_LABELS } from '@/types'
 import { formatDuration } from '@/utils/format'
 
@@ -84,6 +84,7 @@ function blank(): Provider {
     promptMode: 'inherit',
     prompt: { enabled: true, text: '', strategy: 'append' },
     promptRules: [],
+    modelMap: [],
     usageInjectMode: 'inherit',
     stripUsageChunk: false,
     customUsage: null,
@@ -100,6 +101,8 @@ const testing = ref(false)
 const probeModel = ref('')
 const probeResult = ref<ProbeResult | null>(null)
 const fetchedModels = ref<string[]>([])
+const mapModels = ref<string[]>([])
+const loadingMapModels = ref(false)
 const baseURLManuallyEdited = ref(false)
 const activeTab = ref('basic')
 
@@ -154,6 +157,7 @@ watch(
     customUsage.value = { ...emptyCustomUsage(), ...(form.customUsage ?? {}) }
     probeResult.value = null
     fetchedModels.value = []
+    mapModels.value = []
     baseURLManuallyEdited.value = Boolean(form.baseUrl)
     activeTab.value = 'basic'
   },
@@ -198,6 +202,10 @@ function collect(): ProviderPayload {
   return {
     ...rest,
     extraHeaders,
+    // 只提交填写完整的映射行：空行（用户点了「添加」还没填）不该落库。
+    modelMap: form.modelMap
+      .map((m) => ({ from: m.from.trim(), to: m.to.trim() }))
+      .filter((m) => m.from && m.to),
     tags: tagText.value
       .split(',')
       .map((t) => t.trim())
@@ -280,6 +288,54 @@ async function fetchModels() {
     message.error(e instanceof Error ? e.message : String(e))
   } finally {
     testing.value = false
+  }
+}
+
+// ---------- 模型映射 ----------
+
+/** 模型映射的下拉候选项：上游拉到的模型 + 该供应商历史日志里出现过的模型。 */
+const mapModelOptions = computed(() => {
+  const set = new Set<string>([...mapModels.value, ...fetchedModels.value])
+  for (const m of form.modelMap) {
+    if (m.from) set.add(m.from)
+    if (m.to) set.add(m.to)
+  }
+  return [...set].sort().map((m) => ({ label: m, value: m }))
+})
+
+function addMapping() {
+  form.modelMap.push({ from: '', to: '' })
+}
+
+function removeMapping(idx: number) {
+  form.modelMap.splice(idx, 1)
+}
+
+/**
+ * 拉取候选项：上游模型列表 + 该供应商用过的模型名。
+ *
+ * 两个来源都要：上游列表是「可以映射到什么」，历史模型是「这个供应商实际在用哪些名字」。
+ * 带上尚未保存的配置，改完 BaseURL 不用先存就能拉。
+ */
+async function loadMapModels() {
+  if (!isEdit.value) {
+    message.info('请先保存供应商后再拉取模型列表')
+    return
+  }
+  loadingMapModels.value = true
+  try {
+    const [upstream, used] = await Promise.all([
+      api.fetchProviderModels(form.id, collect()).catch(() => ({ models: [] as string[] })),
+      api.distinctModels(form.id).catch(() => [] as string[]),
+    ])
+    mapModels.value = [...new Set([...(upstream.models ?? []), ...used])].sort()
+    if (mapModels.value.length) {
+      message.success(`已加载 ${mapModels.value.length} 个候选模型`)
+    } else {
+      message.warning('没有取到候选模型，可直接手动输入')
+    }
+  } finally {
+    loadingMapModels.value = false
   }
 }
 
@@ -410,6 +466,50 @@ function remove() {
               </div>
             </div>
           </NAlert>
+        </NTabPane>
+
+        <NTabPane name="mapping" tab="模型映射">
+          <NAlert type="info" :bordered="false" style="margin-bottom: 12px; font-size: 12px">
+            客户端请求的模型名与左侧<strong>完全相等</strong>时，实际发给上游的模型名换成右侧。
+            只做精确匹配，不做前缀/通配；没有命中的请求原样透传。留空即不使用。
+          </NAlert>
+
+          <NSpace align="center" style="margin-bottom: 10px">
+            <NButton size="small" :loading="loadingMapModels" @click="loadMapModels">
+              拉取候选模型
+            </NButton>
+            <span class="muted">候选 = 上游模型列表 + 该供应商历史请求用过的模型名</span>
+          </NSpace>
+
+          <div v-for="(m, idx) in form.modelMap" :key="idx" class="map-row">
+            <NSelect
+              v-model:value="m.from"
+              class="map-select"
+              :options="mapModelOptions"
+              :consistent-menu-width="false"
+              :menu-props="{ style: { minWidth: '340px' } }"
+              filterable
+              tag
+              clearable
+              placeholder="请求模型（可下拉选或直接输入）"
+            />
+            <span class="map-arrow">→</span>
+            <NSelect
+              v-model:value="m.to"
+              class="map-select"
+              :options="mapModelOptions"
+              :consistent-menu-width="false"
+              :menu-props="{ style: { minWidth: '340px' } }"
+              filterable
+              tag
+              clearable
+              placeholder="目标模型"
+            />
+            <NButton size="small" quaternary type="error" @click="removeMapping(idx)">删除</NButton>
+          </div>
+          <NButton size="small" dashed block style="margin-top: 6px" @click="addMapping">
+            + 添加映射
+          </NButton>
         </NTabPane>
 
         <NTabPane name="auth" tab="认证">
@@ -774,6 +874,25 @@ function remove() {
   border-radius: 8px;
   padding: 10px;
   margin-bottom: 8px;
+}
+
+/* 用普通 flex 行而不是 NSpace：NSpace 会给每个子项包一层不带 flex 的 div，
+   里面 NSelect 的 flex:1 撑不开，下拉框会缩到只够显示 placeholder 的宽度。 */
+.map-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+/* 两个下拉框等分整行宽度，长模型名才显示得下。 */
+.map-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.map-arrow {
+  opacity: 0.5;
 }
 
 .muted {
