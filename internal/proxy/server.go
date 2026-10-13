@@ -238,29 +238,55 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	capture := newCapture(in.settings.StoreBodies, in.settings.MaxBodyBytes)
 
 	buf := make([]byte, copyBufferSize)
-	flusher, canFlush := w.(http.Flusher)
+	controller := http.NewResponseController(w)
 
 	var (
-		ttft       time.Duration
-		ttftSeen   bool
-		events     int
-		writeErr   error
-		respModded bool
+		ttft              time.Duration
+		ttftSeen          bool
+		events            int
+		writeErr          error
+		respModded        bool
+		terminalDelivered bool
 	)
+	flush := func() {
+		if writeErr != nil {
+			return
+		}
+		if err := controller.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			writeErr = err
+		}
+	}
+	readFailure := func(err error) {
+		if !errors.Is(err, io.EOF) {
+			res.errMsg = "读取上游响应失败: " + err.Error()
+			if errors.Is(err, context.DeadlineExceeded) {
+				res.errMsg = "读取上游响应超时: " + err.Error()
+			}
+		}
+	}
 
 	if an.Streaming() && !compressed {
 		framer := newSSEFramer(func(raw []byte, event, data string) {
-			if writeErr != nil {
+			if writeErr != nil || terminalDelivered {
+				return
+			}
+			if err := r.Context().Err(); err != nil {
+				writeErr = err
 				return
 			}
 			// 「剥离 usage 块」只影响回传给客户端的字节；统计该看的一个都不能少，
 			// 否则开了这个开关用量就退化成估算值了。
 			if prov.StripUsageChunk && an.IsUsageOnlyChunk(event, data) {
 				respModded = true
-			} else if _, err := w.Write(raw); err != nil {
-				writeErr = err
-				return
 			} else {
+				n, err := w.Write(raw)
+				if err == nil && n != len(raw) {
+					err = io.ErrShortWrite
+				}
+				if err != nil {
+					writeErr = err
+					return
+				}
 				capture.add(raw)
 			}
 			an.OnEvent(event, data)
@@ -273,41 +299,44 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 			if events++; events%8 == 0 {
 				s.live.UpdateTokens(liveID, an.EstimateOutputTokens())
 			}
-			if canFlush {
-				flusher.Flush()
+			flush()
+			if writeErr == nil && prov.APIFormat == model.FormatResponses && an.StreamFinished() {
+				terminalDelivered = true
 			}
 		})
 
-		if canFlush {
-			flusher.Flush() // 立刻把响应头推给客户端，让客户端能尽早开始计时
-		}
-		for {
+		flush() // 立刻把响应头推给客户端，让客户端能尽早开始计时
+		for writeErr == nil {
 			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
 				framer.Feed(buf[:n])
-				if writeErr != nil {
+				if writeErr != nil || terminalDelivered {
 					break
 				}
 			}
 			if readErr != nil {
-				if !errors.Is(readErr, io.EOF) {
-					res.errMsg = "读取上游响应失败: " + readErr.Error()
-				}
+				readFailure(readErr)
 				break
 			}
 		}
-		framer.Flush()
-		if canFlush {
-			flusher.Flush()
+		if !terminalDelivered {
+			framer.Flush()
+			flush()
+		}
+		if terminalDelivered {
+			// Responses 的终止事件后不再等 EOF，避免客户端正常收尾取消覆盖结果。
+			resp.Body.Close()
 		}
 	} else {
-		if canFlush {
-			flusher.Flush()
-		}
-		for {
+		flush()
+		for writeErr == nil {
 			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
-				if _, err := w.Write(buf[:n]); err != nil {
+				written, err := w.Write(buf[:n])
+				if err == nil && written != n {
+					err = io.ErrShortWrite
+				}
+				if err != nil {
 					writeErr = err
 					break
 				}
@@ -317,15 +346,11 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 				}
 			}
 			if readErr != nil {
-				if !errors.Is(readErr, io.EOF) {
-					res.errMsg = "读取上游响应失败: " + readErr.Error()
-				}
+				readFailure(readErr)
 				break
 			}
 		}
-		if canFlush {
-			flusher.Flush()
-		}
+		flush()
 	}
 
 	an.Finish()
@@ -349,6 +374,13 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	res.contentSeen = an.HasContent()
 	res.streaming = an.Streaming()
 	res.streamFinished = an.StreamFinished()
+	if prov.APIFormat == model.FormatResponses {
+		res.responseStatus = an.FinishReason()
+		res.terminalDelivered = terminalDelivered
+		if res.streaming && !compressed && !res.streamFinished && res.analyzerErr == "" {
+			res.analyzerErr = "流式响应未正常结束（上游提前关闭连接）"
+		}
+	}
 
 	if writeErr != nil {
 		if isClientGone(r, writeErr) {
@@ -359,7 +391,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		}
 		return res
 	}
-	if isClientGone(r, nil) {
+	if !terminalDelivered && isClientGone(r, nil) {
 		res.cancelled = true
 		if res.errMsg == "" {
 			res.errMsg = "客户端已断开连接"
@@ -370,22 +402,24 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 
 // logResult 汇总一次转发结束时才知道的指标。
 type logResult struct {
-	status           int
-	errMsg           string
-	cancelled        bool
-	upstream         string
-	proxyDesc        string
-	headers          http.Header
-	usage            Usage
-	model            string
-	ttftMs           int64
-	appliedTTFT      bool
-	respBody         string
-	responseModified bool
-	analyzerErr      string
-	contentSeen      bool
-	streaming        bool
-	streamFinished   bool
+	status            int
+	errMsg            string
+	cancelled         bool
+	upstream          string
+	proxyDesc         string
+	headers           http.Header
+	usage             Usage
+	model             string
+	ttftMs            int64
+	appliedTTFT       bool
+	respBody          string
+	responseModified  bool
+	analyzerErr       string
+	contentSeen       bool
+	streaming         bool
+	streamFinished    bool
+	responseStatus    string
+	terminalDelivered bool
 }
 
 // record 把结果落库并广播给管理界面。
@@ -438,6 +472,7 @@ func (s *Server) record(in forwardInput, res logResult) {
 	// TPS 只在流式响应下计算。非流式响应拿不到逐 token 的到达时刻，
 	// 用「输出量 ÷ 总耗时」得到的是延迟的倒数而不是生成速度，
 	// 一个 4ms 返回的短响应会算出几千 TPS，把平均值完全带偏，反而失去参考价值。
+	// 流式响应也可能量不出速度（上游整流下发），那种情况由 computeTPS 判为 0。
 	if res.streaming {
 		entry.TPS = computeTPS(res.usage.CompletionTokens, entry.TTFTMs, entry.TotalMs)
 	}
@@ -465,6 +500,11 @@ func (s *Server) record(in forwardInput, res logResult) {
 		s.logger.Error("写入请求日志失败", "err", err)
 	}
 	entry.ID = id
+	if in.provider.APIFormat == model.FormatResponses {
+		s.logger.Debug("Responses 转发结束", "request_id", entry.ID, "response_status", res.responseStatus,
+			"terminal_delivered", res.terminalDelivered, "http_status", res.status,
+			"success", entry.Success, "cancelled", entry.Cancelled, "error", entry.ErrorMsg)
+	}
 
 	s.hub.Broadcast("log", entry)
 }
@@ -962,20 +1002,49 @@ func geminiWantsStream(path, rawQuery string) bool {
 	return strings.EqualFold(q.Get("alt"), "sse")
 }
 
+// maxPlausibleTPS 是单条流式响应可以采信的输出速度上限（token/秒）。
+//
+// 超过它的数不算「很快」，而是根本没量到吐字速度：上游把整流攒齐后一次性下发时，
+// 「总耗时 - 首 token」会塌成几毫秒，58 个 token 就能算出 19000 t/s。
+// 2026-10-13 实测 opencode zen 对「reasoning_tokens=0 的小 tool_calls 响应」就是这样
+// （响应体里 35~66 个 SSE 事件全部挤在首内容事件之后的 3~78ms 内到达，
+// 同一时段的正常流式行窗口是 448~1312ms），commandcode 等其它上游也偶发。
+//
+// 取值依据是全库分桶：生成窗口 ≥3 秒的行速度最高 393.6 t/s，而整流下发行的最低值是
+// 591.8 t/s，500 落在两者之间。将来接入 Groq、Cerebras 这类单流上千 tok/s 的推理服务，
+// 需要把这个上限调高。
+const maxPlausibleTPS = 500
+
 // computeTPS 计算生成速度，即每秒输出 token 数。
 //
 // 分母是「总耗时 - 首 token 等待」，反映模型真正的吐字速度，
-// 而不是把排队与预填充的时间也算进去。ttftMs 为 0 时（拿不到首 token 时刻）
-// 退化为用总耗时做分母。
+// 而不是把排队与预填充的时间也算进去。
+//
+// 三种算不出速度的情况一律返回 0，与「非流式不计算 TPS」一样按不可测处理：
+// 界面显示为 —，聚合统计也因为只取 tps > 0 而不会把它算进平均值。
+//   - 拿不到首 token 时刻（ttftMs <= 0）：流式但没识别出内容，退回用总耗时做分母，
+//     得到的是吞吐而非吐字速度；这种值也要守住可信上限。
+//   - 首 token 与响应结束落在同一毫秒：整条流是一次性到的，量不出速度。
+//   - 算出来的速度超过可信上限（见 maxPlausibleTPS）。
 func computeTPS(completionTokens int, ttftMs, totalMs int64) float64 {
 	if completionTokens <= 0 || totalMs <= 0 {
 		return 0
 	}
-	denom := totalMs - ttftMs
-	if ttftMs <= 0 || denom <= 0 {
-		denom = totalMs
+
+	var tps float64
+	if ttftMs <= 0 {
+		tps = float64(completionTokens) / (float64(totalMs) / 1000)
+	} else {
+		denom := totalMs - ttftMs
+		if denom <= 0 {
+			return 0
+		}
+		tps = float64(completionTokens) / (float64(denom) / 1000)
 	}
-	return float64(completionTokens) / (float64(denom) / 1000)
+	if tps > maxPlausibleTPS {
+		return 0
+	}
+	return tps
 }
 
 // isSuccess 判定一次请求是否算成功。
@@ -992,11 +1061,8 @@ func isSuccess(res logResult, errMsg string) bool {
 
 // isClientGone 判断错误是否来自客户端断开。
 func isClientGone(r *http.Request, err error) bool {
-	if errors.Is(err, context.Canceled) {
-		return true
+	if r != nil {
+		return errors.Is(r.Context().Err(), context.Canceled)
 	}
-	if r != nil && r.Context().Err() != nil {
-		return true
-	}
-	return false
+	return errors.Is(err, context.Canceled)
 }

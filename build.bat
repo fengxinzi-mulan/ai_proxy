@@ -18,11 +18,40 @@ cd /d "%~dp0"
 set "SYS=%SystemRoot%\System32"
 
 echo [1/3] Checking toolchain...
-"%SYS%\where.exe" go >nul 2>nul || (echo   ERROR: "go" not found in PATH. & goto :fail)
 "%SYS%\where.exe" npm >nul 2>nul || (echo   ERROR: "npm" not found in PATH. & goto :fail)
 
+REM Use a specific Go from the version directory rather than PATH's "go". The
+REM PATH shim (g keeps one at ...\g\go) points at whichever version was last
+REM selected -- 1.19 on this machine -- and the machine-wide GOROOT points at
+REM the same old tree, so a bare "go build" compiles against the wrong standard
+REM library. Both are overridden here; setlocal drops them when the script ends.
+set "GO_HOME=D:\Program Files\g\versions\1.25.4"
+if not exist "%GO_HOME%\bin\go.exe" set "GO_HOME="
+if not defined GO_HOME (
+  REM Not there any more: take the newest version g has installed.
+  for /f "delims=" %%d in ('dir /b /ad /o-n "D:\Program Files\g\versions" 2^>nul') do (
+    if not defined GO_HOME set "GO_HOME=D:\Program Files\g\versions\%%d"
+  )
+)
+if not defined GO_HOME (
+  echo   ERROR: no Go found under "D:\Program Files\g\versions".
+  goto :fail
+)
+set "GOROOT=%GO_HOME%"
+set "GO=%GO_HOME%\bin\go.exe"
+set "PATH=%GO_HOME%\bin;%PATH%"
+
 REM This project needs Go 1.25+ (modernc.org/sqlite requires it).
-for /f "tokens=3" %%v in ('go version') do echo   go %%v
+set "GO_VER="
+for /f "tokens=3" %%v in ('"%GO%" version') do set "GO_VER=%%v"
+set "GO_MAJOR=0"
+set "GO_MINOR=0"
+for /f "tokens=1,2 delims=." %%a in ("%GO_VER:go=%") do (set "GO_MAJOR=%%a" & set "GO_MINOR=%%b")
+echo   go %GO_VER%   (%GO_HOME%)
+if %GO_MAJOR% LSS 2 if %GO_MINOR% LSS 25 (
+  echo   ERROR: Go 1.25+ is required, found %GO_VER%.
+  goto :fail
+)
 for /f %%v in ('node --version') do echo   node %%v
 
 REM Stopping a running instance first is the safe move: on Windows the linker often
@@ -47,7 +76,7 @@ popd
 
 echo.
 echo [3/3] Building backend...
-go build -o ai_proxy.exe .
+"%GO%" build -o ai_proxy.exe .
 if errorlevel 1 (
   echo.
   if "%RUNNING%"=="1" (

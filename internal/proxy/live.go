@@ -64,7 +64,11 @@ func (r *LiveRegistry) UpdateTokens(id string, tokens int) {
 	elapsed := now.Sub(e.ttftAt).Seconds()
 	if elapsed > 0 {
 		// 用整体均值而不是瞬时差分：瞬时值抖动太大，界面上跳得没法看。
-		e.tps = float64(tokens) / elapsed
+		// 超过可信上限的值说明这一批是上游整流下发的，不更新（保留上一次的值），
+		// 否则实时监控页会闪出上万 t/s。口径与落库 TPS 保持一致，见 maxPlausibleTPS。
+		if rate := float64(tokens) / elapsed; rate <= maxPlausibleTPS {
+			e.tps = rate
+		}
 	}
 	e.tokens = tokens
 	e.lastAt = now

@@ -66,11 +66,17 @@ build.bat
 `make release` / `build.bat` 会先构建前端（`web/dist`），再把它嵌进 Go 二进制，
 产出 `ai_proxy.exe`（约 18 MB）。
 
-也可以分两步手动执行：
+两个脚本都不依赖 PATH 上的 `go`：它们直接调用版本目录里的高版本
+`D:\Program Files\g\versions\1.25.4\bin\go.exe`，并把 `GOROOT` 指到同一目录
+（只在脚本内生效）。这是必要的 —— `g` 的 `...\g\go` 指针和机器级 `GOROOT`
+可能停在旧版本（本机是 1.19），直接用 PATH 上的 `go` 会拿错标准库。
+想换版本就改脚本里的 `GO_HOME`（Makefile 里是 `GO_DIR`）。
+
+也可以分两步手动执行（同样要用上面那个 go，或自行 export 匹配的 `GOROOT`）：
 
 ```bash
 cd web && npm install && npm run build && cd ..
-go build -o ai_proxy.exe .
+"D:\Program Files\g\versions\1.25.4\bin\go.exe" build -o ai_proxy.exe .
 ```
 
 > 程序正在运行时也可以重新构建（Windows 允许替换已映射的可执行文件），

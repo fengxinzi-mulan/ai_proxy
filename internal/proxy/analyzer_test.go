@@ -286,6 +286,56 @@ func TestAnalyzerResponsesStream(t *testing.T) {
 	}
 }
 
+func TestAnalyzerResponsesOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		detail string
+		reason string
+	}{
+		{"completed", `"error":null`, ""},
+		{"failed", `"error":{"message":"overloaded"}`, "overloaded"},
+		{"failed", `"error":null`, "Responses"},
+		{"incomplete", `"incomplete_details":{"reason":"max_output_tokens"}`, "max_output_tokens"},
+		{"incomplete", `"incomplete_details":null`, "Responses"},
+	} {
+		for _, streaming := range []bool{true, false} {
+			name := tc.status + "/json"
+			contentType := "application/json"
+			if streaming {
+				name = tc.status + "/sse"
+				contentType = "text/event-stream"
+			}
+			t.Run(name+"/"+tc.reason, func(t *testing.T) {
+				a := newAnalyzer(model.FormatResponses, nil, contentType)
+				body := `{"status":"` + tc.status + `","usage":{"input_tokens":30,"output_tokens":7},` + tc.detail + `}`
+				if streaming {
+					feedSSE(a, "data: {\"type\":\"response."+tc.status+"\",\"response\":"+body+"}\n\n")
+				} else {
+					a.Feed([]byte(body))
+					a.Finish()
+				}
+				if a.FinishReason() != tc.status || !a.StreamFinished() {
+					t.Fatalf("missing terminal status: %q", a.FinishReason())
+				}
+				if tc.reason == "" && a.ErrMsg() != "" || tc.reason != "" && !strings.Contains(a.ErrMsg(), tc.reason) {
+					t.Fatalf("wrong error: %q", a.ErrMsg())
+				}
+				if usage := a.Result(); !usage.Found || usage.PromptTokens != 30 || usage.CompletionTokens != 7 {
+					t.Fatalf("usage was lost: %+v", usage)
+				}
+			})
+		}
+	}
+}
+
+func TestAnalyzerResponsesEventNamePrecedence(t *testing.T) {
+	a := newAnalyzer(model.FormatResponses, nil, "text/event-stream")
+	feedSSE(a, "event: response.output_text.delta\ndata: {\"type\":\"response.completed\",\"delta\":\"hi\"}\n\n")
+	if a.StreamFinished() || !a.HasContent() {
+		t.Fatal("JSON type must only be used when event name is absent")
+	}
+}
+
 func TestAnalyzerCustomMapping(t *testing.T) {
 	cu := &model.CustomUsageMapping{
 		PromptTokens:     "meta.in",

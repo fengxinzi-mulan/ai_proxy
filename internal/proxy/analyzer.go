@@ -114,7 +114,9 @@ func (a *analyzer) OnEvent(event string, data string) {
 	}
 	if data == "[DONE]" {
 		a.done = true
-		a.terminal = true
+		if a.format != model.FormatResponses {
+			a.terminal = true
+		}
 		return
 	}
 	obj, err := decodeJSONObject([]byte(data))
@@ -143,11 +145,11 @@ func (a *analyzer) FinishReason() string { return a.finishReason }
 // Done 报告流是否以 [DONE] 正常收尾。
 func (a *analyzer) Done() bool { return a.done }
 
-// StreamFinished 报告是否收到了「本次流正常结束」的终止信号。
+// StreamFinished 报告是否收到了本次流的终止信号；业务是否成功需另看 ErrMsg。
 //
 // 各家格式的终止信号不同：OpenAI 是 [DONE] 或 finish_reason，
 // Anthropic 是 message_stop 或 stop_reason，Gemini 是 finishReason，
-// responses 接口是 response.completed。任一出现即认为流是完整的；
+// responses 接口是 response.completed / failed / incomplete。
 // 一条有内容却始终没有终止信号的流，基本可以判定被中途切断了。
 func (a *analyzer) StreamFinished() bool { return a.terminal }
 
@@ -270,17 +272,20 @@ func (a *analyzer) handleResponses(event string, obj map[string]any) {
 		appendTextValue(obj["output"], &sb)
 		a.addOutput(sb.String())
 		if fr, ok := getString(obj, "status"); ok && fr != "" {
-			a.finishReason = fr
+			a.setResponsesOutcome(fr, obj)
 		}
 		return
 	}
 
+	if event == "" {
+		event, _ = getString(obj, "type")
+	}
 	switch event {
-	case "response.completed", "response.incomplete":
+	case "response.completed", "response.incomplete", "response.failed":
 		if u := extractUsageFromObject(model.FormatResponses, nil, obj); u.Found {
 			a.usage = u
 		}
-		a.terminal = true
+		a.setResponsesOutcome(strings.TrimPrefix(event, "response."), obj)
 	case "response.output_text.delta", "response.reasoning_summary_text.delta",
 		"response.reasoning_text.delta":
 		if s, ok := getString(obj, "delta"); ok {
@@ -297,11 +302,32 @@ func (a *analyzer) handleResponses(event string, obj map[string]any) {
 		if s, ok := getString(obj, "delta"); ok && s != "" {
 			a.markContent()
 		}
-	case "response.failed":
-		if e := extractError(obj); e != "" {
-			a.errMsg = e
-		}
 	}
+}
+
+func (a *analyzer) setResponsesOutcome(status string, obj map[string]any) {
+	a.finishReason = status
+	switch status {
+	case "completed", "failed", "incomplete":
+		a.terminal = true
+	default:
+		return
+	}
+	if a.errMsg != "" || status == "completed" {
+		return
+	}
+	if status == "failed" {
+		a.errMsg = "Responses 响应失败（上游未提供错误描述）"
+		return
+	}
+	reason, _ := getString(obj, "response.incomplete_details.reason")
+	if reason == "" {
+		reason, _ = getString(obj, "incomplete_details.reason")
+	}
+	if reason == "" {
+		reason = "上游未提供原因"
+	}
+	a.errMsg = "Responses 响应不完整: " + reason
 }
 
 func (a *analyzer) handleAnthropic(event string, obj map[string]any) {

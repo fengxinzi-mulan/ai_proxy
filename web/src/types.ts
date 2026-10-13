@@ -78,7 +78,7 @@ export interface UsageQueryConfig {
   template: string
   /** 留空时由模板从 baseUrl 推导 */
   baseUrl: string
-  /** 定时刷新间隔（秒）。0 = 关闭。只在管理页面打开时生效。 */
+  /** 用量快照的刷新间隔（秒）。0 = 不自动刷新。刷新由服务端按此间隔执行。 */
   autoRefreshSeconds: number
 }
 

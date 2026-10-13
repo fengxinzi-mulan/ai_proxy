@@ -30,6 +30,10 @@ func (s *Server) RefreshUsage(ctx context.Context, prov model.Provider, settings
 	if err := s.store.SaveProviderUsage(snap); err != nil {
 		s.logger.Warn("保存用量快照失败", "provider", prov.Name, "err", err)
 	}
+	// 通知管理界面重拉供应商列表（列表接口自带用量快照）。
+	// 这样定时刷新一落库，打开着的供应商页就跟着更新，不必等它自己的定时器，
+	// 更不必手动点刷新。查询失败也广播：失败信息同样要显示出来。
+	s.hub.Broadcast("providers", nil)
 	return snap
 }
 

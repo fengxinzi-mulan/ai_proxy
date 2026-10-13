@@ -467,6 +467,20 @@ func TestMetrics(t *testing.T) {
 	if got := computeTPS(0, 100, 200); got != 0 {
 		t.Errorf("无输出 token 时 TPS 应为 0，实际 %v", got)
 	}
+	// 上游把整流攒齐后一次性下发时，生成窗口会塌成几毫秒：58 个 token 落在 3ms 里
+	// 能算出 19000 t/s。这不是吐字速度，必须按不可测处理（见 maxPlausibleTPS）。
+	if got := computeTPS(58, 6131, 6134); got != 0 {
+		t.Errorf("生成窗口塌缩时应记为不可测，实际 %v", got)
+	}
+	// 首 token 与响应结束落在同一毫秒（整流下发的极端情形）同样不可测：
+	// 退回用总耗时做分母会算出「延迟的倒数」，看着正常其实不是速度。
+	if got := computeTPS(37, 306, 306); got != 0 {
+		t.Errorf("首 token 与结束同毫秒时应记为不可测，实际 %v", got)
+	}
+	// 正好等于可信上限的速度仍然保留：护栏只拦「超过」的值。
+	if got := computeTPS(500, 0, 1000); got != 500 {
+		t.Errorf("等于上限的速度应保留，实际 %v", got)
+	}
 }
 
 func TestMaskSecret(t *testing.T) {

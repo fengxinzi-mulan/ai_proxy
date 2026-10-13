@@ -189,7 +189,9 @@ func TestForwardStreaming(t *testing.T) {
 		for _, c := range chunks {
 			io.WriteString(w, c)
 			flusher.Flush()
-			time.Sleep(2 * time.Millisecond) // 制造真实的首 token 间隔
+			// 制造真实的首 token 间隔。间隔不能太小：40 个 token 若在几毫秒内发完，
+			// 算出的速度会超过可信上限，被当成上游整流下发判为不可测（见 maxPlausibleTPS）。
+			time.Sleep(30 * time.Millisecond)
 		}
 	}))
 	defer upstream.Close()
@@ -264,9 +266,10 @@ func TestForwardStreamingToolCallsSetTTFT(t *testing.T) {
 			io.WriteString(w, c)
 			flusher.Flush()
 			// 在首个 tool_calls 之后停顿，让总耗时明显大于首 token，
-			// TPS 的分母（total − ttft）才不会是 0。
+			// TPS 的分母（total − ttft）才不会是 0。停顿还得够长（50 个 token / 150ms），
+			// 否则算出的速度会超过可信上限而被判为不可测，见 maxPlausibleTPS。
 			if i == 1 {
-				time.Sleep(40 * time.Millisecond)
+				time.Sleep(150 * time.Millisecond)
 			}
 		}
 	}))
@@ -303,6 +306,60 @@ func TestForwardStreamingToolCallsSetTTFT(t *testing.T) {
 	}
 	if entry.TokensEstimated {
 		t.Error("上游返回了用量，不应标记为估算值")
+	}
+}
+
+// 上游把整条流攒齐后一次性下发时（实测 opencode zen 对「无 reasoning 的小
+// tool_calls 响应」就是这样，35~66 个事件全部挤在 3~78ms 内到达），生成窗口
+// 「总耗时 - 首 token」会塌成几毫秒，用它算出的上万 t/s 是投递假值。
+// 这种响应必须记为不可测（TPS=0，界面显示 —），不能把假值写进库、带偏平均值。
+func TestForwardStreamingBufferedUpstreamRecordsNoTPS(t *testing.T) {
+	var body strings.Builder
+	body.WriteString("data: {\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+	for i := 0; i < 120; i++ {
+		body.WriteString("data: {\"choices\":[{\"delta\":{\"content\":\"字\"}}]}\n\n")
+	}
+	body.WriteString("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	body.WriteString("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":77000,\"completion_tokens\":120,\"total_tokens\":77120}}\n\n")
+	body.WriteString("data: [DONE]\n\n")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// 先静默一段（真实场景里上游在预填充），再把整条流一次写完。
+		time.Sleep(30 * time.Millisecond)
+		io.WriteString(w, body.String())
+		w.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	entry := lastLog(t, st)
+	if !entry.Success {
+		t.Errorf("应记为成功，错误信息: %s", entry.ErrorMsg)
+	}
+	// 首 token 与用量照常记录，只有速度这一项量不出来。
+	if entry.TTFTMs <= 0 {
+		t.Error("整流下发同样要打上首 token 的时间点")
+	}
+	if entry.CompletionTokens != 120 || entry.TokensEstimated {
+		t.Errorf("用量应取上游 usage 的 120，实际 %d（估算=%v）", entry.CompletionTokens, entry.TokensEstimated)
+	}
+	if entry.TPS != 0 {
+		t.Errorf("整流下的响应量不出吐字速度，TPS 应为 0，实际 %v", entry.TPS)
+	}
+	if !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Error("响应体仍应原样转发给客户端")
 	}
 }
 
@@ -697,10 +754,15 @@ func TestForwardGeminiFromPath(t *testing.T) {
 		gotBody = string(b)
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
-		for _, c := range chunks {
+		for i, c := range chunks {
 			io.WriteString(w, c)
 			if flusher != nil {
 				flusher.Flush()
+			}
+			// 两个块之间要有间隔，否则 22 个 token 会落在 1ms 里被算出两万 t/s，
+			// 由可信上限判为不可测（见 maxPlausibleTPS）。
+			if i == 0 {
+				time.Sleep(120 * time.Millisecond)
 			}
 		}
 	}))

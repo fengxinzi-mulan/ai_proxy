@@ -141,8 +141,9 @@ type UsageQueryConfig struct {
 	// BaseURL 留空时由模板从供应商的 BaseURL 推导（例如 commandcode 会去掉 /provider/v1），
 	// 只在推导结果不对时才需要手填。
 	BaseURL string `json:"baseUrl"`
-	// AutoRefreshSeconds 是管理界面的自动刷新间隔，0 表示关闭。
-	// 它只影响前端多久查一次，服务端不按它做任何轮询。
+	// AutoRefreshSeconds 是用量快照的刷新间隔，0 表示不自动刷新。
+	// 刷新由服务端按这个间隔做（见 proxy.UsageRefresher），结果落库后广播给管理界面，
+	// 前端不自己定时查上游 —— 页面关着的时候额度也一直在更新。
 	AutoRefreshSeconds int `json:"autoRefreshSeconds"`
 }
 

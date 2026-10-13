@@ -50,6 +50,10 @@ async function openaiChat(req, res, body) {
   const model = body.model ?? 'mock-model'
   // 模型名带 slow 时切成慢速长响应，用来观察「实时监控」里的进行中请求。
   const slow = String(model).includes('slow')
+  // 模型名带 buffered 时模拟「上游整流下发」：整条流攒齐后一次性写出。
+  // 真实案例见 internal/proxy/server.go 的 maxPlausibleTPS —— 代理量到的生成窗口
+  // 会塌成几毫秒，TPS 必须被判为不可测，而不是算出上万 t/s。
+  const buffered = String(model).includes('buffered')
   const text = slow ? makeText(1).repeat(12) : makeText(1)
   const parts = chunk(text, slow ? 16 : 12)
   const perChunkMs = slow ? 220 : 40
@@ -84,33 +88,52 @@ async function openaiChat(req, res, body) {
     Connection: 'keep-alive',
   })
 
+  const events = []
   // 首个包只有 role，按约定不计入首 token。
-  sse(res, null, { id: 'chatcmpl-mock', model, choices: [{ index: 0, delta: { role: 'assistant' } }] })
-
-  // 模拟首 token 等待。
-  await new Promise((r) => setTimeout(r, 300))
-
+  events.push(
+    `data: ${JSON.stringify({ id: 'chatcmpl-mock', model, choices: [{ index: 0, delta: { role: 'assistant' } }] })}\n\n`,
+  )
   for (const p of parts) {
-    sse(res, null, { id: 'chatcmpl-mock', model, choices: [{ index: 0, delta: { content: p } }] })
-    await new Promise((r) => setTimeout(r, perChunkMs))
+    events.push(
+      `data: ${JSON.stringify({ id: 'chatcmpl-mock', model, choices: [{ index: 0, delta: { content: p } }] })}\n\n`,
+    )
   }
-  sse(res, null, { id: 'chatcmpl-mock', model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
-
+  events.push(
+    `data: ${JSON.stringify({ id: 'chatcmpl-mock', model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`,
+  )
   // 只有客户端开了 include_usage 才会带这个收尾块，与真实 OpenAI 行为一致。
   if (body.stream_options?.include_usage) {
-    sse(res, null, {
-      id: 'chatcmpl-mock',
-      model,
-      choices: [],
-      usage: {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
-        prompt_tokens_details: { cached_tokens: 16 },
-      },
-    })
+    events.push(
+      `data: ${JSON.stringify({
+        id: 'chatcmpl-mock',
+        model,
+        choices: [],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+          prompt_tokens_details: { cached_tokens: 16 },
+        },
+      })}\n\n`,
+    )
   }
-  res.write('data: [DONE]\n\n')
+  events.push('data: [DONE]\n\n')
+
+  if (buffered) {
+    // 先静默（真实场景里是上游在预填充或排队），再把整流一次写完。
+    await new Promise((r) => setTimeout(r, 300))
+    res.write(events.join(''))
+    res.end()
+    return
+  }
+
+  res.write(events[0])
+  // 模拟首 token 等待。
+  await new Promise((r) => setTimeout(r, 300))
+  for (let i = 1; i < events.length; i++) {
+    res.write(events[i])
+    await new Promise((r) => setTimeout(r, perChunkMs))
+  }
   res.end()
 }
 
@@ -218,6 +241,7 @@ const server = createServer(async (req, res) => {
         data: [
           { id: 'mock-model', object: 'model' },
           { id: 'mock-reasoner', object: 'model' },
+          { id: 'mock-buffered-model', object: 'model' },
           { id: 'mock-claude', object: 'model' },
           { id: 'mock-gemini', object: 'model' },
         ],
@@ -249,6 +273,8 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`模拟上游已启动: http://127.0.0.1:${PORT}`)
   console.log('可用路径:')
   console.log('  POST /v1/chat/completions        （stream 字段决定流式与否）')
+  console.log('    模型名带 slow      → 慢速长响应，用来看实时监控')
+  console.log('    模型名带 buffered  → 整流下发，TPS 应被判为不可测')
   console.log('  POST /v1/messages                （Anthropic）')
   console.log('  POST /v1beta/models/X:generateContent  （Gemini，加 ?alt=sse 走流式）')
   console.log('  GET  /v1/models                   （模型列表）')

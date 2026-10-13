@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   NCard,
   NGrid,
@@ -30,8 +30,35 @@ const editorShow = ref(false)
 const editing = ref<Provider | null>(null)
 const busy = ref<number | null>(null)
 
+// 自动重拉间隔。用量快照是服务端按各供应商自己的间隔刷的（最短 1 分钟），
+// 页面比它密一档地重拉列表，新快照落库后最多 30 秒就会出现在卡片上。
+const AUTO_REFRESH_MS = 30_000
+let refreshTimer: number | undefined
+
+/**
+ * 重拉供应商列表（列表接口自带用量快照）。
+ *
+ * 页面在后台时不查，切回前台会立刻补一次（visibilitychange 也走这里）——
+ * 用户切回来看到的必须是刚取到的数，而不是上次离开时那份。
+ */
+async function autoRefresh() {
+  if (document.visibilityState !== 'visible') return
+  try {
+    await store.reloadProviders()
+  } catch {
+    // 后台刷新失败就留着上一次的数据，不弹提示打扰：下个周期会再试。
+  }
+}
+
 onMounted(async () => {
   if (!store.providers.length) await store.reloadProviders()
+  refreshTimer = window.setInterval(() => void autoRefresh(), AUTO_REFRESH_MS)
+  document.addEventListener('visibilitychange', autoRefresh)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer) window.clearInterval(refreshTimer)
+  document.removeEventListener('visibilitychange', autoRefresh)
 })
 
 function openNew() {
@@ -109,7 +136,13 @@ const totalKeys = computed(() =>
         </p>
       </div>
       <NSpace>
-        <NButton :loading="store.loading" @click="store.reloadProviders()">刷新</NButton>
+        <NTooltip>
+          <template #trigger>
+            <NButton :loading="store.loading" @click="store.reloadProviders()">刷新</NButton>
+          </template>
+          用量快照由服务端按各供应商的间隔定时刷新，本页每 30 秒自动重拉一次；
+          这个按钮是立刻重拉一遍。
+        </NTooltip>
         <NButton type="primary" @click="openNew">+ 新增供应商</NButton>
       </NSpace>
     </div>
