@@ -135,7 +135,7 @@ export const api = {
   deleteLogs: (params: Record<string, string | number | undefined>) =>
     request<{ deleted: number }>(`/api/logs${query(params)}`, { method: 'DELETE' }),
   clearLogs: () =>
-    request<{ deleted: number }>('/api/logs/clear', {
+    request<{ deleted: number; reclaimed: number }>('/api/logs/clear', {
       method: 'POST',
       body: JSON.stringify({ confirm: true }),
     }),

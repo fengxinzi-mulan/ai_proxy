@@ -17,6 +17,8 @@ import (
 // Store 聚合所有数据访问方法。
 type Store struct {
 	db *sql.DB
+	// path 是主数据库文件路径，用来报告 VACUUM 前后真实的磁盘占用。
+	path string
 }
 
 // dbTimeLayout 是所有时间列的存储格式。
@@ -66,7 +68,7 @@ func Open(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("连接数据库失败: %w", err)
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, path: filepath.Join(dataDir, "ai_proxy.db")}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -76,6 +78,43 @@ func Open(dataDir string) (*Store, error) {
 
 // Close 关闭数据库。
 func (s *Store) Close() error { return s.db.Close() }
+
+// Vacuum 重建数据库文件，把删除留下的空闲页真正还给文件系统。
+//
+// SQLite 的 DELETE 只把页面挂进 freelist，文件不会自己缩小；清空日志这类一次
+// 释放大量空间的场景必须显式 VACUUM。代价是重建期间独占连接（本包
+// MaxOpenConns=1，期间到达的日志写入会排队等待）。
+//
+// WAL 模式下 VACUUM 的结果先落在 WAL 里，主文件要等 checkpoint 才会被截断，
+// 所以后面必须补一次 TRUNCATE checkpoint：少了它，page_count 已经降下来、
+// 磁盘占用却纹丝不动。返回主文件 + WAL 合计回收的字节数供界面展示。
+func (s *Store) Vacuum() (int64, error) {
+	before := s.diskBytes()
+	if _, err := s.db.Exec(`VACUUM`); err != nil {
+		return 0, fmt.Errorf("回收数据库空间失败: %w", err)
+	}
+	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return 0, fmt.Errorf("回收数据库空间失败: %w", err)
+	}
+	after := s.diskBytes()
+	if after >= before {
+		return 0, nil
+	}
+	return before - after, nil
+}
+
+// diskBytes 是数据库主文件与 WAL 的合计占用；取不到的文件按 0 计。
+//
+// 把 WAL 算进来是因为清空前数据往往还压在 WAL 里，只量主文件会低估释放量。
+func (s *Store) diskBytes() int64 {
+	var total int64
+	for _, p := range []string{s.path, s.path + "-wal"} {
+		if info, err := os.Stat(p); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
 
 // migration 是一次结构变更。版本号单调递增，且一旦发布不可修改。
 type migration struct {

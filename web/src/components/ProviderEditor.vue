@@ -28,7 +28,7 @@ import {
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import ProviderUsagePanel from '@/components/ProviderUsagePanel.vue'
-import type { APIFormat, CustomUsageMapping, ModelMapping, ProbeResult, Provider } from '@/types'
+import type { APIFormat, CustomUsageMapping, ProbeResult, Provider } from '@/types'
 import { API_FORMAT_LABELS, PROMPT_STRATEGY_LABELS } from '@/types'
 import { formatDuration } from '@/utils/format'
 

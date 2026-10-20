@@ -535,8 +535,14 @@ func (s *Server) handleClearLogs(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	// DELETE 只是把页面挂进 freelist，文件不会因此变小，这里顺手重建以真正腾出磁盘。
+	// 回收失败不影响清空结果（数据已经删掉了），记一条日志即可。
+	reclaimed, err := s.store.Vacuum()
+	if err != nil {
+		s.logger.Warn("清空日志后回收空间失败", "err", err)
+	}
 	s.hub.Broadcast("logs-cleared", map[string]any{"deleted": n})
-	s.writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
+	s.writeJSON(w, http.StatusOK, map[string]any{"deleted": n, "reclaimed": reclaimed})
 }
 
 func (s *Server) handleDistinctModels(w http.ResponseWriter, r *http.Request) {

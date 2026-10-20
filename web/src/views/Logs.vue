@@ -24,6 +24,7 @@ import {
   OUTCOME_LABELS,
   cacheHitRateOf,
   cacheRateColor,
+  formatBytes,
   formatCompact,
   formatDuration,
   formatNumber,
@@ -180,7 +181,12 @@ function openDetail(row: RequestLog) {
 async function clearAll() {
   try {
     const res = await api.clearLogs()
-    message.success(`已清空 ${res.deleted} 条记录`)
+    // 后端清空后会顺手 VACUUM，回收量可能为 0（本来就没有空闲页，或回收失败）。
+    message.success(
+      res.reclaimed > 0
+        ? `已清空 ${res.deleted} 条记录，释放 ${formatBytes(res.reclaimed)}`
+        : `已清空 ${res.deleted} 条记录`,
+    )
     page.value = 1
     await load()
   } catch (e) {

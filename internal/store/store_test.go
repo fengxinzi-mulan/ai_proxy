@@ -2,6 +2,7 @@ package store
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -555,6 +556,40 @@ func TestCleanupLogs(t *testing.T) {
 	}
 	if total != 2 {
 		t.Errorf("应保留 2 条，实际 %d", total)
+	}
+}
+
+// TestVacuumReclaimsSpace 覆盖「清空日志后自动回收空间」这条链路。
+//
+// 断言的是磁盘占用（主文件 + WAL）而不是行数：DELETE 只是把页面挂进 freelist，
+// 行数归零但文件不变，只有 VACUUM 会把它们真正还回去 —— 这正是用户点完清空
+// 仍看到 600 MB 的原因。
+func TestVacuumReclaimsSpace(t *testing.T) {
+	st := newTestStore(t)
+	for i := 0; i < 200; i++ {
+		insertLog(t, st, func(l *model.RequestLog) {
+			l.RespBody = strings.Repeat("x", 8*1024)
+		})
+	}
+	before := st.diskBytes()
+
+	if _, err := st.ClearLogs(); err != nil {
+		t.Fatalf("清空日志失败: %v", err)
+	}
+	reclaimed, err := st.Vacuum()
+	if err != nil {
+		t.Fatalf("回收空间失败: %v", err)
+	}
+	if reclaimed <= 0 {
+		t.Errorf("应回收正数字节，实际 %d", reclaimed)
+	}
+
+	after := st.diskBytes()
+	if after >= before {
+		t.Errorf("VACUUM 后占用应下降：%d -> %d", before, after)
+	}
+	if got := before - after; got != reclaimed {
+		t.Errorf("返回的回收量 %d 与磁盘差值 %d 不一致", reclaimed, got)
 	}
 }
 
