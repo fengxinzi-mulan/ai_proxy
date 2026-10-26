@@ -111,12 +111,8 @@ func TestLiveCommandCode15ImagesZeroCooldown(t *testing.T) {
 		}
 
 		turn2Input := append([]any{}, input1...)
-		for _, raw := range output1 {
-			var item any
-			if json.Unmarshal(raw, &item) == nil {
-				turn2Input = append(turn2Input, item)
-			}
-		}
+		// 按真实客户端形态回放：ZCode 不带 reasoning 项。
+		turn2Input = append(turn2Input, replayOutputItems(output1)...)
 		turn2Input = append(turn2Input, contUser(question1))
 		body3 := continuationFullTurn2Body(modelName, session, turn2Input, output2, question2, false)
 		third := sendContinuationRequest(t, client, ts.URL+path, headers, body3)

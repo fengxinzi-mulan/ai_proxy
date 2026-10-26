@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -102,6 +103,50 @@ func contToolSSE(id string, fc map[string]any) string {
 			},
 		}),
 	)
+}
+
+// contItemsSSE 返回带多个 output 项的 completed 事件，用于构造 reasoning /
+// 多工具调用的真实回执。
+func contItemsSSE(id string, items ...any) string {
+	return fmt.Sprintf("event: response.completed\ndata: %s\n\n",
+		contJSONString(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id": id, "status": "completed", "store": true,
+				"output": items,
+			},
+		}),
+	)
+}
+
+// contReasoning 构造上游回执里的 reasoning 项。带 id/status 是为了验证归一化：
+// 客户端回放时不带这两个字段，归一化后必须视为同一条。
+func contReasoning(text string) map[string]any {
+	return map[string]any{
+		"id": "rs_" + text, "type": "reasoning", "status": "completed",
+		"summary": []any{map[string]any{"type": "summary_text", "text": text}},
+	}
+}
+
+// contCall 构造 function_call 项（上游回执形态，带 id/status）。
+func contCall(callID, command string) map[string]any {
+	return map[string]any{
+		"type": "function_call", "call_id": callID, "name": "Bash",
+		"arguments": contJSONString(map[string]any{"command": command}),
+		"id":        "fc_" + callID, "status": "completed",
+	}
+}
+
+// contReplayCall 构造客户端回放的 function_call 项：不带 id/status。
+func contReplayCall(callID, command string) map[string]any {
+	return map[string]any{
+		"type": "function_call", "call_id": callID, "name": "Bash",
+		"arguments": contJSONString(map[string]any{"command": command}),
+	}
+}
+
+func contCallOutput(callID, output string) map[string]any {
+	return map[string]any{"type": "function_call_output", "call_id": callID, "output": output}
 }
 
 func contFailedSSE(id, msg string) string {
@@ -285,8 +330,208 @@ func TestContinuationToolRound(t *testing.T) {
 	}
 }
 
-// ---------- 隔离 ----------
+// 真实 ZCode 客户端回放历史时不带回上一轮的 reasoning 项，偶尔还丢一个
+// 没执行的 function_call。链前缀必须容忍这种缺项，否则这两类轮次全部失配。
+func TestContinuationReplayDropsOutputItems(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		n := len(bodies)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n {
+		case 1:
+			io.WriteString(w, contItemsSSE("resp_drop1",
+				contReasoning("先看看目录"),
+				contCall("call_1", "ls"),
+				contCall("call_2", "pwd"),
+			))
+		default:
+			io.WriteString(w, contItemsSSE(fmt.Sprintf("resp_drop%d", n), contAssistant("OK")))
+		}
+	}))
+	defer upstream.Close()
 
+	srv, st := newTestServer(t)
+	newContinuationProvider(t, st, upstream.URL, model.ContinuationOn)
+
+	const session = "replay-drop"
+	u1 := contUser("第一轮")
+	if rec := postContinuation(t, srv, contBody(true, u1), session); rec.Code != http.StatusOK {
+		t.Fatalf("第一轮应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if log := lastLog(t, st); log.ContinuationMode != "seed" {
+		t.Fatalf("第一轮应 seed，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+
+	// ZCode 形态：不回放 reasoning，也不回放没执行的 call_1；只回放 call_2 与工具结果。
+	turn2 := []any{u1, contReplayCall("call_2", "pwd"), contCallOutput("call_2", "/tmp")}
+	postContinuation(t, srv, contBody(true, turn2...), session)
+	log := lastLog(t, st)
+	if log.ContinuationMode != "continued" {
+		t.Fatalf("丢掉 reasoning 与未执行的 fc 后应继续续传，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+
+	mu.Lock()
+	last := parseContBody(t, bodies[len(bodies)-1])
+	mu.Unlock()
+	if got := contInput(t, last); len(got) != 1 {
+		t.Fatalf("续传轮应只发 1 项增量，实际 %d: %s", len(got), contJSONString(got))
+	}
+	if last["previous_response_id"] != "resp_drop1" {
+		t.Errorf("应引用第一轮的 response id，实际 %v", last["previous_response_id"])
+	}
+}
+
+// output 段被客户端全部丢弃时也要能续传：链的 input 段仍然对得上，
+// 丢掉的多半是上游已经存过的内容。
+func TestContinuationReplayDropsWholeOutput(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		n := len(bodies)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n {
+		case 1:
+			io.WriteString(w, contItemsSSE("resp_whole1", contReasoning("想一想"), contAssistant("第 1 轮回答")))
+		default:
+			io.WriteString(w, contItemsSSE(fmt.Sprintf("resp_whole%d", n), contAssistant("OK")))
+		}
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	newContinuationProvider(t, st, upstream.URL, model.ContinuationOn)
+
+	const session = "replay-whole"
+	u1 := contUser("第一轮")
+	postContinuation(t, srv, contBody(true, u1), session)
+
+	// 不回放任何 output 项，直接接着历史往下说。
+	turn2 := []any{u1, contUser("第二轮")}
+	postContinuation(t, srv, contBody(true, turn2...), session)
+	log := lastLog(t, st)
+	if log.ContinuationMode != "continued" {
+		t.Fatalf("output 段全丢时仍应续传，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+	mu.Lock()
+	last := parseContBody(t, bodies[len(bodies)-1])
+	mu.Unlock()
+	if got := contInput(t, last); len(got) != 1 {
+		t.Fatalf("增量应只剩新的一轮用户消息，实际 %d 项", len(got))
+	}
+}
+
+// 历史被真正改写（input 段不一致）时必须放弃续传，否则会给上游送去错位的上下文。
+func TestContinuationReplayRewritesHistory(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, contItemsSSE("resp_rw", contAssistant("OK")))
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	newContinuationProvider(t, st, upstream.URL, model.ContinuationOn)
+
+	const session = "replay-rewrite"
+	postContinuation(t, srv, contBody(true, contUser("原始问题")), session)
+	postContinuation(t, srv, contBody(true, contUser("另一条完全不同的问题"), contUser("追问")), session)
+	log := lastLog(t, st)
+	if log.ContinuationMode != "seed" || log.ContinuationReason != "prefix-mismatch" {
+		t.Fatalf("input 段改写后应判 prefix-mismatch，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+}
+
+// ZCode 的并行 subagent 共用会话头但各自维护独立历史。
+// 单一槽位会让它们互相覆盖，表现为 continued 与 prefix-mismatch 反复抖动；
+// 多条分支链 + 最长前缀匹配才能各自接回自己的分支。
+func TestContinuationParallelBranchesDoNotEvict(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		n := len(bodies)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, contSSE(fmt.Sprintf("resp_%d", n), fmt.Sprintf("OK%d", n)))
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	newContinuationProvider(t, st, upstream.URL, model.ContinuationOn)
+
+	const session = "multi-branch"
+	root := contUser("root")
+
+	// 发一次并返回上游给的 assistant 文本，供下一轮原样回放。
+	answerOf := func(body string) string {
+		t.Helper()
+		rec := postContinuation(t, srv, body, session)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("应 200，实际 %d: %s", rec.Code, rec.Body.String())
+		}
+		m := regexp.MustCompile(`"delta":"([^"]+)"`).FindStringSubmatch(rec.Body.String())
+		if len(m) < 2 {
+			t.Fatalf("响应里没有 delta: %s", rec.Body.String())
+		}
+		return m[1]
+	}
+
+	// 两个分支共享同一段开头（system + root），之后各走各的。
+	branchA1 := []any{contUser("system-A"), root, contUser("A step 1")}
+	branchB1 := []any{contUser("system-B"), root, contUser("B step 1")}
+
+	// 分支 A 建链。
+	aAnswer1 := answerOf(contBody(true, branchA1...))
+	if log := lastLog(t, st); log.ContinuationMode != "seed" {
+		t.Fatalf("A1 应 seed，实际 %q", log.ContinuationMode)
+	}
+
+	// 分支 B 前缀不匹配，应自建一条链，而不是挤掉 A 的链。
+	bAnswer1 := answerOf(contBody(true, branchB1...))
+	if log := lastLog(t, st); log.ContinuationMode != "seed" || log.ContinuationReason != "prefix-mismatch" {
+		t.Fatalf("B1 应 seed/prefix-mismatch，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+
+	aHistory := append(append([]any{}, branchA1...), contAssistant(aAnswer1))
+	bHistory := append(append([]any{}, branchB1...), contAssistant(bAnswer1))
+
+	// 两个分支交替推进 3 轮，每轮都必须续上自己那条链。
+	for round := 2; round <= 4; round++ {
+		aInput := append(append([]any{}, aHistory...), contUser(fmt.Sprintf("A step %d", round)))
+		aAnswer := answerOf(contBody(true, aInput...))
+		if log := lastLog(t, st); log.ContinuationMode != "continued" {
+			t.Errorf("A%d 应 continued，实际 %s/%s", round, log.ContinuationMode, log.ContinuationReason)
+		}
+		aHistory = append(append([]any{}, aInput...), contAssistant(aAnswer))
+
+		bInput := append(append([]any{}, bHistory...), contUser(fmt.Sprintf("B step %d", round)))
+		bAnswer := answerOf(contBody(true, bInput...))
+		if log := lastLog(t, st); log.ContinuationMode != "continued" {
+			t.Errorf("B%d 应 continued，实际 %s/%s", round, log.ContinuationMode, log.ContinuationReason)
+		}
+		bHistory = append(append([]any{}, bInput...), contAssistant(bAnswer))
+	}
+
+	// 续传轮只应发增量：最后一条请求的 input 项数应为 1。
+	mu.Lock()
+	last := parseContBody(t, bodies[len(bodies)-1])
+	mu.Unlock()
+	if got := contInput(t, last); len(got) != 1 {
+		t.Errorf("续传轮应只发 1 项增量，实际 %d", len(got))
+	}
+}
+
+// ---------- 隔离 ----------
 func TestContinuationIsolation(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -937,13 +1182,27 @@ func TestContinuationChainKeyAndPrefix(t *testing.T) {
 		}
 	}
 
-	if !continuationIsPrefix([]string{"a", "b", "c"}, []string{"a", "b"}) {
-		t.Error("a,b 应是 a,b,c 的前缀")
+	// 匹配语义：input 段严格相等，output 段允许客户端丢项。
+	chain := &continuationChain{
+		prefix:   []string{"s", "u1", "a1", "r1", "fc1", "fc2"},
+		inputLen: 3,
 	}
-	if continuationIsPrefix([]string{"a", "b"}, []string{"a", "b"}) {
-		t.Error("等长不算前缀（必须至少多一项）")
+	if got := continuationMatch([]string{"s", "u1", "a1", "r1", "fc1", "fc2", "new"}, chain); got != 6 {
+		t.Errorf("完整回放应在 6 处起算增量，实际 %d", got)
 	}
-	if continuationIsPrefix([]string{"a", "x", "c"}, []string{"a", "b"}) {
-		t.Error("不匹配不应算前缀")
+	if got := continuationMatch([]string{"s", "u1", "a1", "fc1", "fc2", "new"}, chain); got != 5 {
+		t.Errorf("丢 reasoning 后仍应续传（增量起点 5），实际 %d", got)
+	}
+	if got := continuationMatch([]string{"s", "u1", "a1", "new"}, chain); got != 3 {
+		t.Errorf("output 段全丢时增量起点应为 input 段末尾 3，实际 %d", got)
+	}
+	if got := continuationMatch([]string{"s", "u1", "x1", "new"}, chain); got != -1 {
+		t.Errorf("input 段不一致不应续传，实际 %d", got)
+	}
+	if got := continuationMatch([]string{"s", "u1", "a1", "r1", "fc1", "fc2"}, chain); got != -1 {
+		t.Errorf("没有新增内容不应续传（避免空增量），实际 %d", got)
+	}
+	if got := continuationMatch([]string{"s", "u1", "a1"}, chain); got != -1 {
+		t.Errorf("只回放到 input 段末尾不应续传，实际 %d", got)
 	}
 }

@@ -794,9 +794,9 @@ function remove() {
             :bordered="false"
             style="margin-bottom: 12px; font-size: 12px"
           >
-            只统计「本地历史是否构成上一轮的前缀」和预计可节省的请求字节，<strong>不修改请求、不开启 store</strong>。
+            只统计「本地历史能否接上上一轮的链」和预计可节省的请求字节，<strong>不修改请求、不开启 store</strong>。
             先让真实会话跑一段时间，再看日志里的「续传」列：<code class="mono">dry-hit</code> 比例高才值得开启改写。
-            如果一直是 <code class="mono">dry-miss</code>，通常是客户端每轮重新编码了图片，或历史项没有原样回放。
+            如果一直是 <code class="mono">dry-miss</code>，通常是客户端每轮重新编码了图片，或历史被改写、分支换了线。
           </NAlert>
 
           <NAlert

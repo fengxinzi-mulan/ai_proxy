@@ -42,7 +42,7 @@ const (
 
 type continuationManager struct {
 	mu          sync.Mutex
-	chains      map[string]*continuationChain
+	chains      map[string][]*continuationChain
 	caps        map[string]*continuationCap
 	generations map[string]uint64
 	active      map[string]uint64
@@ -50,11 +50,20 @@ type continuationManager struct {
 	now         func() time.Time
 }
 
+// continuationChain 是一条可续传的分支。
+//
+// 同一会话会同时存在多条分支：ZCode 的并行 subagent 共用会话头，
+// 但各自维护独立历史。如果只留一个槽位，它们会互相覆盖，
+// 表现为 continued 与 prefix-mismatch 反复抖动。
 type continuationChain struct {
 	responseID string
 	prefix     []string
-	expiresAt  time.Time
-	updatedAt  time.Time
+	// inputLen 是 prefix 中属于「本轮请求 input」的项数，其后为 output 段。
+	// 匹配时 input 段逐项严格相等；output 段允许客户端丢项（ZCode 不回放
+	// reasoning，偶尔还丢一个没执行的 function_call）——那部分上游已经存过。
+	inputLen  int
+	expiresAt time.Time
+	updatedAt time.Time
 }
 
 type continuationCap struct {
@@ -71,17 +80,19 @@ type continuationAttempt struct {
 	mode        string
 	reason      string
 	chainKey    string
+	branchKey   string
 	scope       string
 	generation  uint64
 	baseBody    []byte
 	inputHashes []string
+	inputLen    int
 	savedBytes  int64
 	model       string
 }
 
 func newContinuationManager() *continuationManager {
 	return &continuationManager{
-		chains:      map[string]*continuationChain{},
+		chains:      map[string][]*continuationChain{},
 		caps:        map[string]*continuationCap{},
 		generations: map[string]uint64{},
 		active:      map[string]uint64{},
@@ -96,7 +107,7 @@ func continuationSkipped(reason string) *continuationAttempt {
 func (m *continuationManager) reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.chains = map[string]*continuationChain{}
+	m.chains = map[string][]*continuationChain{}
 	m.caps = map[string]*continuationCap{}
 	m.generations = map[string]uint64{}
 	m.active = map[string]uint64{}
@@ -175,6 +186,7 @@ func (m *continuationManager) prepare(in *forwardInput, r *http.Request, key mod
 		scope:       scope,
 		baseBody:    in.outBody,
 		inputHashes: hashes,
+		inputLen:    len(input),
 		model:       modelName,
 	}
 
@@ -190,38 +202,65 @@ func (m *continuationManager) prepare(in *forwardInput, r *http.Request, key mod
 		}
 	}
 
-	chain := m.chains[chainKey]
-	active := m.active[chainKey]
 	now := m.now()
-	prefixOK := chain != nil && continuationIsPrefix(hashes, chain.prefix)
-	useID := prefixOK && chain.expiresAt.After(now) && active == 0 &&
-		(mode == model.ContinuationDryRun || chain.responseID != "")
+	chains := m.chains[chainKey]
+	// 在同会话的多条分支里挑 input 段最长的那条：并行的 subagent 各自维护
+	// 独立历史，最长匹配才能把请求接回它自己那条分支。
+	var chain *continuationChain
+	deltaStart := -1
+	for _, c := range chains {
+		if !c.expiresAt.After(now) {
+			continue
+		}
+		start := continuationMatch(hashes, c)
+		if start < 0 {
+			continue
+		}
+		if chain == nil || c.inputLen > chain.inputLen || (c.inputLen == chain.inputLen && start > deltaStart) {
+			chain = c
+			deltaStart = start
+		}
+	}
+	prefixOK := chain != nil
+	useID := prefixOK && (mode == model.ContinuationDryRun || chain.responseID != "")
 	reason := ""
 	switch {
-	case chain == nil:
+	case len(chains) == 0:
 		reason = "no-chain"
-	case !chain.expiresAt.After(now):
-		reason = "chain-expired"
-	case active != 0:
-		reason = "active-inflight"
 	case !prefixOK:
 		reason = "prefix-mismatch"
+	case !useID:
+		reason = "not-stored"
+	}
+
+	// 分支键用本轮的完整输入指纹：不同分支各自独立占用 active，
+	// 同一条分支上仍然只允许一个在飞请求。
+	branchKey := chainKey + "\x00" + continuationHashString(strings.Join(hashes, ""))
+	if chain != nil {
+		branchKey = chainKey + "\x00" + continuationHashString(strings.Join(chain.prefix, ""))
+	}
+	if active := m.active[branchKey]; active != 0 {
+		// 同一分支已在飞：改为全量，避免两路同时引用同一个 response id。
+		chain = nil
+		useID = false
+		reason = "active-inflight"
 	}
 
 	// 所有请求都拿一个 generation；只有最新完成的才能提交，避免并发分支互相覆盖。
 	m.serial++
 	gen := m.serial
-	m.generations[chainKey] = gen
-	m.active[chainKey] = gen
+	m.generations[branchKey] = gen
+	m.active[branchKey] = gen
 	m.mu.Unlock()
 	attempt.generation = gen
+	attempt.branchKey = branchKey
 
 	if mode == model.ContinuationDryRun {
 		if useID {
-			if delta := continuationDeltaBody(body, input, len(chain.prefix), chain.responseID); delta != nil {
+			if raw := continuationDeltaBody(body, input, deltaStart, chain.responseID); raw != nil {
 				attempt.mode = "dry-hit"
 				attempt.reason = "prefix-match"
-				attempt.savedBytes = int64(len(in.outBody) - len(delta))
+				attempt.savedBytes = int64(len(in.outBody) - len(raw))
 			}
 		} else {
 			attempt.mode = "dry-miss"
@@ -232,7 +271,7 @@ func (m *continuationManager) prepare(in *forwardInput, r *http.Request, key mod
 
 	wire := continuationClone(body)
 	if useID {
-		wire["input"] = input[len(chain.prefix):]
+		wire["input"] = input[deltaStart:]
 		wire["previous_response_id"] = chain.responseID
 		wire["store"] = true
 		attempt.mode = "continued"
@@ -269,11 +308,15 @@ func (m *continuationManager) commit(attempt *continuationAttempt, res logResult
 	if attempt == nil || attempt.chainKey == "" || attempt.generation == 0 {
 		return
 	}
+	branchKey := attempt.branchKey
+	if branchKey == "" {
+		branchKey = attempt.chainKey
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	defer m.releaseLocked(attempt.chainKey, attempt.generation)
+	defer m.releaseLocked(branchKey, attempt.generation)
 
-	if m.generations[attempt.chainKey] != attempt.generation {
+	if m.generations[branchKey] != attempt.generation {
 		return
 	}
 	if res.status != http.StatusOK || res.responseStatus != "completed" || len(res.responseOutput) == 0 {
@@ -298,16 +341,79 @@ func (m *continuationManager) commit(attempt *continuationAttempt, res logResult
 		id = ""
 	}
 	now := m.now()
-	m.chains[attempt.chainKey] = &continuationChain{
+
+	// 覆盖同一分支的旧链（旧链的 input 段是本次 input 段的前缀），其余分支保留。
+	kept := make([]*continuationChain, 0, len(m.chains[attempt.chainKey])+1)
+	for _, c := range m.chains[attempt.chainKey] {
+		if !c.expiresAt.After(now) {
+			continue
+		}
+		// 只比 input 段：客户端回放本来就丢项，拿完整前缀比较判不出「同一分支」，
+		// 会让本分支的旧链一直留着。
+		if continuationInputOverlap(c.prefix, c.inputLen, attempt.inputHashes) {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	kept = append(kept, &continuationChain{
 		responseID: id,
 		prefix:     prefix,
+		inputLen:   attempt.inputLen,
 		expiresAt:  now.Add(continuationTTL),
 		updatedAt:  now,
-	}
+	})
+	m.chains[attempt.chainKey] = kept
 	if attempt.enabled {
 		delete(m.caps, attempt.scope)
 	}
 	m.enforceLimitLocked()
+}
+
+// continuationMatch 判断本轮 input 能否接到链上，返回增量起点，-1 表示接不上。
+//
+// input 段必须逐项相等：这是「同一条历史线」的判据，分支隔离靠它。
+// output 段允许客户端丢项：回放了就消费，没回放就跳过——上一轮的响应整体
+// 已在上游上下文里，少回放几项不改变语义。ZCode 就从不回放 reasoning，
+// 偶尔还丢一个没执行的 function_call，按完整前缀比较会让这些轮次全部失配。
+func continuationMatch(input []string, chain *continuationChain) int {
+	if chain == nil {
+		return -1
+	}
+	il := chain.inputLen
+	if il <= 0 || il > len(chain.prefix) || len(input) <= il {
+		return -1
+	}
+	for i := 0; i < il; i++ {
+		if input[i] != chain.prefix[i] {
+			return -1
+		}
+	}
+	i := il
+	for j := il; j < len(chain.prefix); j++ {
+		if i < len(input) && input[i] == chain.prefix[j] {
+			i++
+		}
+	}
+	if i >= len(input) {
+		return -1 // 没有新内容，发空增量没有意义
+	}
+	return i
+}
+
+// continuationInputOverlap 报告旧链 a 的 input 段是否为新链 input 段（b）的前缀。
+//
+// 只有真前缀才算同一分支的推进：并行分支常常共享开头（同一条 system +
+// 首个用户消息），用「有公共前缀」判断会误删别人的链。
+func continuationInputOverlap(a []string, alen int, b []string) bool {
+	if alen <= 0 || alen > len(a) || alen > len(b) {
+		return false
+	}
+	for i := 0; i < alen; i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *continuationManager) markUnsupported(scope, reason string, ttl time.Duration) {
@@ -319,48 +425,80 @@ func (m *continuationManager) markUnsupported(scope, reason string, ttl time.Dur
 	m.caps[scope] = &continuationCap{state: "unsupported", reason: reason, expiresAt: m.now().Add(ttl)}
 }
 
-// drop 丢弃已经失效的链。下一轮在冷却结束后会重新发一次 store:true 建链，
-// 而不是反复拿着一个坏 id 去撞 400。
-func (m *continuationManager) drop(chainKey string) {
-	if chainKey == "" {
+// drop 丢弃该会话下与本次请求同分支（input 段重叠）的链。下一轮在冷却结束后
+// 会重新发一次 store:true 建链，而不是反复拿着一个坏 id 去撞 400。
+func (m *continuationManager) drop(attempt *continuationAttempt) {
+	if attempt == nil || attempt.chainKey == "" {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.chains, chainKey)
-	delete(m.generations, chainKey)
-	delete(m.active, chainKey)
-}
-
-func (m *continuationManager) releaseLocked(chainKey string, gen uint64) {
-	if chainKey == "" || gen == 0 {
+	if attempt.branchKey != "" {
+		delete(m.generations, attempt.branchKey)
+		delete(m.active, attempt.branchKey)
+	}
+	chains := m.chains[attempt.chainKey]
+	if len(chains) == 0 {
 		return
 	}
-	if m.active[chainKey] == gen {
-		delete(m.active, chainKey)
+	kept := chains[:0]
+	for _, c := range chains {
+		if continuationInputOverlap(c.prefix, c.inputLen, attempt.inputHashes) {
+			continue
+		}
+		kept = append(kept, c)
 	}
-	if m.generations[chainKey] == gen {
-		delete(m.generations, chainKey)
+	if len(kept) == 0 {
+		delete(m.chains, attempt.chainKey)
+		return
+	}
+	m.chains[attempt.chainKey] = kept
+}
+
+func (m *continuationManager) releaseLocked(branchKey string, gen uint64) {
+	if branchKey == "" || gen == 0 {
+		return
+	}
+	if m.active[branchKey] == gen {
+		delete(m.active, branchKey)
+	}
+	if m.generations[branchKey] == gen {
+		delete(m.generations, branchKey)
 	}
 }
 
-// fail 释放一次没有走到 relay 的尝试；否则 active 会永久占住该链，
+// fail 释放一次没有走到 relay 的尝试；否则 active 会永久占住该分支，
 // 后续同会话请求会一直被判为 active-inflight。
 func (m *continuationManager) fail(attempt *continuationAttempt) {
-	if attempt == nil || attempt.chainKey == "" || attempt.generation == 0 {
+	if attempt == nil || attempt.generation == 0 {
+		return
+	}
+	branchKey := attempt.branchKey
+	if branchKey == "" {
+		branchKey = attempt.chainKey
+	}
+	if branchKey == "" {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.releaseLocked(attempt.chainKey, attempt.generation)
+	m.releaseLocked(branchKey, attempt.generation)
 }
 
 func (m *continuationManager) pruneLocked() {
 	now := m.now()
-	for k, c := range m.chains {
-		if !c.expiresAt.After(now) {
-			delete(m.chains, k)
+	for k, chains := range m.chains {
+		kept := chains[:0]
+		for _, c := range chains {
+			if c.expiresAt.After(now) {
+				kept = append(kept, c)
+			}
 		}
+		if len(kept) == 0 {
+			delete(m.chains, k)
+			continue
+		}
+		m.chains[k] = kept
 	}
 	for k, c := range m.caps {
 		if !c.expiresAt.After(now) {
@@ -371,18 +509,40 @@ func (m *continuationManager) pruneLocked() {
 }
 
 func (m *continuationManager) enforceLimitLocked() {
-	if len(m.chains) <= continuationMaxChains {
+	total := 0
+	for _, chains := range m.chains {
+		total += len(chains)
+	}
+	if total <= continuationMaxChains {
 		return
 	}
-	keys := make([]string, 0, len(m.chains))
-	for k := range m.chains {
-		keys = append(keys, k)
+	type ref struct {
+		key   string
+		chain *continuationChain
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		return m.chains[keys[i]].updatedAt.Before(m.chains[keys[j]].updatedAt)
+	all := make([]ref, 0, total)
+	for k, chains := range m.chains {
+		for _, c := range chains {
+			all = append(all, ref{k, c})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].chain.updatedAt.Before(all[j].chain.updatedAt)
 	})
-	for _, k := range keys[:len(keys)-continuationMaxChains] {
-		delete(m.chains, k)
+	drop := total - continuationMaxChains
+	for _, r := range all[:drop] {
+		chains := m.chains[r.key]
+		kept := make([]*continuationChain, 0, len(chains))
+		for _, c := range chains {
+			if c != r.chain {
+				kept = append(kept, c)
+			}
+		}
+		if len(kept) == 0 {
+			delete(m.chains, r.key)
+		} else {
+			m.chains[r.key] = kept
+		}
 	}
 }
 
@@ -453,9 +613,10 @@ func continuationInput(body map[string]any) ([]any, bool) {
 	}
 }
 
-func continuationDeltaBody(body map[string]any, input []any, prefixLen int, id string) []byte {
+// continuationDeltaBody 生成只带增量 input 的预览 body，供 dry-run 统计可省字节。
+func continuationDeltaBody(body map[string]any, input []any, start int, id string) []byte {
 	wire := continuationClone(body)
-	wire["input"] = input[prefixLen:]
+	wire["input"] = input[start:]
 	wire["previous_response_id"] = id
 	wire["store"] = true
 	raw, err := json.Marshal(wire)
@@ -645,18 +806,6 @@ func continuationReasoningText(m map[string]any) string {
 	return ""
 }
 
-func continuationIsPrefix(all, prefix []string) bool {
-	if len(all) <= len(prefix) {
-		return false
-	}
-	for i, h := range prefix {
-		if all[i] != h {
-			return false
-		}
-	}
-	return true
-}
-
 // ---------- 失败回退 ----------
 
 // retryContinuation 在响应头写出之前判断是否需要回退。返回的 resp 已经
@@ -671,14 +820,18 @@ func (s *Server) retryContinuation(resp *http.Response, in *forwardInput, client
 		return resp, nil
 	}
 
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, continuationErrorBody))
-	resp.Body.Close()
-	if readErr != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		resp.ContentLength = int64(len(body))
-		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	// 判断是不是续传错误用不着完整响应体，但错误响应可能很大：超限或读失败
+	// 就不重试，把已读部分和剩余流拼回去原样转发，不能截断上游的报错。
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, continuationErrorBody+1))
+	if readErr != nil || len(raw) > continuationErrorBody {
+		resp.Body = &replayReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(raw), resp.Body),
+			Closer: resp.Body,
+		}
 		return resp, nil
 	}
+	resp.Body.Close()
+	body := raw
 
 	retry, reason := continuationRetryBody(resp.StatusCode, body, attempt.mode)
 	if !retry {
@@ -692,12 +845,23 @@ func (s *Server) retryContinuation(resp *http.Response, in *forwardInput, client
 		"provider", in.provider.DisplayName, "model", attempt.model,
 		"status", resp.StatusCode, "reason", reason, "body", continuationSnippet(body))
 
+	// 续传命中轮失败说明上游接受过 store:true，回退重发时把它补回去，
+	// 这次全量响应也会被保存，下一轮才有链可用。seed 轮失败不补——那多半
+	// 就是 store 本身不被上游接受，补了只会再撞一次。
+	wasContinued := attempt.mode == "continued"
+
 	attempt.enabled = false
 	attempt.dryRun = false
 	attempt.mode = "fallback"
 	attempt.reason = reason
 	attempt.savedBytes = 0
 	in.outBody = attempt.baseBody
+	if wasContinued {
+		if withStore := continuationWithStore(attempt.baseBody); withStore != nil {
+			in.outBody = withStore
+			in.modifications = append(in.modifications, "responses_store_enabled")
+		}
+	}
 	in.modifications = append(in.modifications, "responses_continuation_fallback")
 	ttl := time.Duration(in.provider.ContinuationCooldownSeconds) * time.Second
 	if reason == "invalid-id" {
@@ -707,7 +871,7 @@ func (s *Server) retryContinuation(resp *http.Response, in *forwardInput, client
 		ttl = 0
 	}
 	s.continuation.markUnsupported(attempt.scope, reason, ttl)
-	s.continuation.drop(attempt.chainKey)
+	s.continuation.drop(attempt)
 
 	baseReq, err := buildRequest(ctx, http.MethodPost, target, attempt.baseBody, headers)
 	if err != nil {
@@ -795,4 +959,29 @@ func continuationSnippet(body []byte) string {
 		return s[:300] + "..."
 	}
 	return s
+}
+
+// continuationWithStore 返回把 store 置为 true 的 body；已经是 true 或解析
+// 失败时返回 nil，调用方保持原 body 不变。
+func continuationWithStore(body []byte) []byte {
+	m, err := decodeJSONObject(body)
+	if err != nil || m == nil {
+		return nil
+	}
+	if v, ok := m["store"].(bool); ok && v {
+		return nil
+	}
+	m["store"] = true
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// replayReadCloser 把「已经读出来的前缀」和「还没读的剩余流」拼成一体，
+// 供提前探过头的错误响应原样转发。
+type replayReadCloser struct {
+	io.Reader
+	io.Closer
 }

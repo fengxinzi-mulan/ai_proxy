@@ -25,6 +25,7 @@ import {
   cacheHitRateOf,
   cacheRateColor,
   continuationModeLabel,
+  continuationVerdict,
   formatBytes,
   formatCompact,
   formatDuration,
@@ -348,7 +349,7 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '标记',
     key: 'flags',
-    width: 130,
+    width: 168,
     render: (r) => {
       const tags: ReturnType<typeof h>[] = []
       if (r.stream) tags.push(h(NTag, { size: 'tiny', bordered: false, type: 'info' }, { default: () => '流式' }))
@@ -366,20 +367,33 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
             },
           ),
         )
-      if (!tags.length && r.continuationMode) {
+      // 续传结论独立展示：成功用绿色，失败/回退用红色，建链和跳过用灰色，
+      // 不跟「改写」「流式」挤在同一个判断里，否则命中时会被别的标签盖掉。
+      const verdict = continuationVerdict(
+        r.continuationMode ?? '',
+        r.continuationReason ?? '',
+        r.savedBytes ?? 0,
+      )
+      if (verdict.outcome !== 'none' && verdict.outcome !== 'skipped') {
         tags.push(
           h(
-            NTag,
+            NTooltip,
+            null,
             {
-              size: 'tiny',
-              bordered: false,
-              type: r.continuationMode === 'dry-hit' ? 'success' : 'default',
+              trigger: () =>
+                h(NTag, { size: 'tiny', bordered: false, type: verdict.tagType }, { default: () => verdict.label }),
+              default: () => verdict.detail,
             },
-            { default: () => continuationModeLabel(r.continuationMode) },
           ),
         )
       }
-      if (!tags.length) return h('span', { style: 'opacity:.35' }, '—')
+      if (!tags.length) {
+        if (r.continuationMode) {
+          return h(NTag, { size: 'tiny', bordered: false, type: verdict.tagType },
+            { default: () => verdict.label || continuationModeLabel(r.continuationMode) })
+        }
+        return h('span', { style: 'opacity:.35' }, '—')
+      }
       return h(NSpace, { size: 2 }, { default: () => tags })
     },
   },

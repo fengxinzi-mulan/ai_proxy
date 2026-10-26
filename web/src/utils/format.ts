@@ -328,6 +328,7 @@ export function continuationModeLabel(key: string): string {
 export const CONTINUATION_REASON_LABELS: Record<string, string> = {
   'no-session': '缺少会话标识',
   'no-chain': '没有可用链',
+  'not-stored': '上游未存储',
   'chain-expired': '链已过期',
   'active-inflight': '同会话有请求在飞',
   'prefix-mismatch': '历史前缀不匹配',
@@ -350,6 +351,87 @@ export const CONTINUATION_REASON_LABELS: Record<string, string> = {
 
 export function continuationReasonLabel(key: string): string {
   return CONTINUATION_REASON_LABELS[key] ?? key
+}
+
+/** 续传结果的一句话结论，用于详情页直接判断这一轮有没有真的省下上传。 */
+export type ContinuationOutcome = 'hit' | 'dry-hit' | 'failed' | 'skipped' | 'none'
+
+export interface ContinuationVerdict {
+  outcome: ContinuationOutcome
+  label: string
+  detail: string
+  /** NTag 的 type；none 时仍是合法值，调用处用 outcome 决定是否展示。 */
+  tagType: 'success' | 'warning' | 'error' | 'default'
+}
+
+/**
+ * 把后端记录的 mode/reason 归并成一个明确结论。
+ *
+ * 只有 continued 才是真的续传成功（客户端上传了全量、代理只转发增量）；
+ * seed 表示这一轮发了全量用于建链，本身不算省流量；
+ * fallback/unsupported 表示尝试过但上游没接受。
+ */
+export function continuationVerdict(mode: string, reason: string, savedBytes: number): ContinuationVerdict {
+  switch (mode) {
+    case 'continued':
+      return {
+        outcome: 'hit',
+        label: '续传',
+        detail: savedBytes > 0 ? `只转发了增量，省下 ${savedBytes} 字节` : '本轮走了增量续传',
+        tagType: 'success',
+      }
+    case 'dry-hit':
+      return {
+        outcome: 'dry-hit',
+        label: '诊断命中',
+        detail: savedBytes > 0 ? `若开启改写可省 ${savedBytes} 字节（本轮未改写）` : '历史前缀匹配，可续传',
+        tagType: 'success',
+      }
+    case 'fallback':
+      return {
+        outcome: 'failed',
+        label: '续传失败已回退',
+        detail: `上游拒绝（${continuationReasonLabel(reason)}），本轮改发全量`,
+        tagType: 'error',
+      }
+    case 'unsupported':
+      return {
+        outcome: 'failed',
+        label: '续传不可用',
+        detail: `冷却中：${continuationReasonLabel(reason)}，本轮走全量`,
+        tagType: 'warning',
+      }
+    case 'seed': {
+      // 未命中分三种：历史对不上、压根没有链、链没有可用的 response id。
+      const seedLabel =
+        reason === 'prefix-mismatch' ? '前缀不匹配'
+        : reason === 'no-chain' ? '建链'
+        : reason === 'not-stored' ? '重建链'
+        : '未命中'
+      const seedDetail =
+        reason === 'prefix-mismatch' ? '本地历史与上一轮对不上，本轮改发全量并重建链'
+        : reason === 'no-chain' ? '没有可用链，发送全量并开启存储，下一轮才能续传'
+        : reason === 'not-stored' ? '链已匹配但上一轮响应未被上游存储，本轮发全量重建链'
+        : `未命中续传：${continuationReasonLabel(reason)}`
+      return { outcome: 'skipped', label: seedLabel, detail: seedDetail, tagType: 'default' }
+    }
+    case 'dry-miss':
+      return {
+        outcome: 'skipped',
+        label: '诊断未命中',
+        detail: continuationReasonLabel(reason),
+        tagType: 'default',
+      }
+    case 'skipped':
+      return {
+        outcome: 'skipped',
+        label: '未参与续传',
+        detail: continuationReasonLabel(reason),
+        tagType: 'default',
+      }
+    default:
+      return { outcome: 'none', label: '', detail: '', tagType: 'default' }
+  }
 }
 
 /**

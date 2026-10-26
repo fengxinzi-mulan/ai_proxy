@@ -293,10 +293,11 @@ CONTINUATION_LIVE=1 CONTINUATION_PROXY_LIVE=1 RESPONSES_LIVE_MODEL=grok-4.7 \
 里有三态开关：
 
 - `关闭`（默认）：完全透传。
-- `仅诊断`（dry-run）：只统计本地历史是否构成上一轮的前缀、以及预计能省下多少请求字节；
+- `仅诊断`（dry-run）：只统计本地历史能否接上上一轮的链、以及预计能省下多少请求字节；
   不改请求、不设置 `store`。用真实会话跑一段，看日志里的「续传」列；`dry-hit` 比例高才值得开启。
 - `开启改写`：命中后把全量 `input` 截成增量，补 `store:true` + `previous_response_id`；
-  失败（400/404/409/422/503）自动回退全量；不支持类错误和 response id 失效的冷却时间
+  失败（400/404/409/422/503）自动回退全量，回退重发时若这一轮原本已经命中续传，会补回
+  `store:true`，让这次全量响应也被保存；不支持类错误和 response id 失效的冷却时间
   可在供应商页配置（默认 3600 / 300 秒；填 0 表示不冷却，回退后下一轮立刻重建链）。
 
 约束与后果：
@@ -310,10 +311,15 @@ CONTINUATION_LIVE=1 CONTINUATION_PROXY_LIVE=1 RESPONSES_LIVE_MODEL=grok-4.7 \
   commandcode 网关上的 `deepseek/deepseek-v4.1-flash` 也实测通过（文本、图片、工具轮）；
   该网关偶发 `store` 回显 `false` 或续传 400，代理会回退全量，并按配置的冷却时间
   （默认 5 分钟）重新建链。
-- 前缀必须逐项匹配（去 `id/status`、合并 text 类型、解析工具参数）；历史、模型、账号、
-  工具定义或采样参数任一变化都会退回全量。客户端每轮重新编码图片也会导致不命中。
+- 匹配规则：请求历史部分（`input` 段）必须逐项一致（去 `id/status`、合并 text 类型、解析工具参数），
+  但**上一轮响应的 output 部分允许客户端丢项**——ZCode 回放历史时不带 `reasoning`、偶尔还会丢掉
+  没执行的 `function_call`，这些缺项不影响续传（上游已经保存过）。历史、模型、账号、
+  工具定义或采样参数变化仍会退回全量，客户端每轮重新编码图片也会导致不命中。
 - 标准 Responses 接口在续传时仍按整条链计费，省的是上行请求体积和首 token 等待，不是 token 账单。
-- 日志会记录 `continuation_mode`、`continuation_reason`、`saved_bytes`；详情页「续传」区可直接看。
+- 日志会记录 `continuation_mode`、`continuation_reason`、`saved_bytes`。日志列表的「标记」列用颜色
+  直接区分结果：绿色「续传成功」= 这一轮真的只发了增量；红色「续传失败已回退」/ 黄色「续传不可用」
+  = 尝试过但上游没接受；灰色「本轮建链（全量）」= 发了全量用于建链，本身不省流量。
+  详情页「续传」区给出同样的结论和一句话原因。
 
 ## 代理配置
 

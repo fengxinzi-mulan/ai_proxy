@@ -504,12 +504,8 @@ func continuationTurn1Body(modelName, session string, imgs []continuationImage) 
 
 func continuationFullTurn2Body(modelName, session string, turn1Input []any, output []json.RawMessage, question string, store bool) []byte {
 	input := append([]any{}, turn1Input...)
-	for _, raw := range output {
-		var item any
-		if json.Unmarshal(raw, &item) == nil {
-			input = append(input, item)
-		}
-	}
+	// 按真实客户端形态回放历史：不带 reasoning 项。
+	input = append(input, replayOutputItems(output)...)
 	input = append(input, map[string]any{
 		"type": "message", "role": "user",
 		"content": []any{map[string]any{"type": "input_text", "text": question}},
@@ -566,6 +562,20 @@ func stripReasoningItems(items []json.RawMessage) []json.RawMessage {
 		out = append(out, raw)
 	}
 	return out
+}
+
+// replayOutputItems 把上一轮的 output 项整理成客户端回放形态：ZCode 不回放
+// reasoning 项（偶尔还会丢没执行的 function_call）。live 测试必须按同样的
+// 方式回放，否则测的是「假设客户端完整回放」的理想情况，线上照样失配。
+func replayOutputItems(output []json.RawMessage) []any {
+	items := make([]any, 0, len(output))
+	for _, raw := range stripReasoningItems(output) {
+		var item any
+		if json.Unmarshal(raw, &item) == nil {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 // ---------- 发送与解析 ----------

@@ -22,6 +22,7 @@ import {
   cacheHitRateOf,
   continuationModeLabel,
   continuationReasonLabel,
+  continuationVerdict,
   formatBytes,
   formatDateTime,
   formatDuration,
@@ -67,6 +68,15 @@ const outcome = computed(() => (log.value ? logOutcome(log.value) : 'error'))
 
 /** 该次请求的缓存命中率。输入量为 0 时无意义，调用处会另行处理。 */
 const cacheHitRate = computed(() => cacheHitRateOf(log.value?.cachedTokens ?? 0, log.value?.promptTokens ?? 0))
+
+/** 这一轮续传到底有没有生效，给出一句能直接看的结论。 */
+const contVerdict = computed(() =>
+  continuationVerdict(
+    log.value?.continuationMode ?? '',
+    log.value?.continuationReason ?? '',
+    log.value?.savedBytes ?? 0,
+  ),
+)
 
 function copy(text: string | undefined) {
   if (!text) return
@@ -187,9 +197,15 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
 
               <template v-if="log.continuationMode">
                 <h4 class="section">续传</h4>
+                <div class="cont-verdict">
+                  <NTag :type="contVerdict.tagType" size="small" :bordered="false">{{ contVerdict.label }}</NTag>
+                  <span class="cont-detail">{{ contVerdict.detail }}</span>
+                </div>
                 <NDescriptions :column="3" label-placement="left" bordered size="small">
                   <NDescriptionsItem label="模式">{{ continuationModeLabel(log.continuationMode) }}</NDescriptionsItem>
-                  <NDescriptionsItem label="原因">{{ log.continuationReason ? continuationReasonLabel(log.continuationReason) : '—' }}</NDescriptionsItem>
+                  <NDescriptionsItem label="原因">
+                    {{ log.continuationReason ? continuationReasonLabel(log.continuationReason) : '—' }}
+                  </NDescriptionsItem>
                   <NDescriptionsItem label="节省请求体">{{ formatBytes(log.savedBytes) }}</NDescriptionsItem>
                 </NDescriptions>
               </template>
@@ -255,6 +271,18 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
   font-size: 13px;
   font-weight: 600;
   opacity: 0.8;
+}
+
+.cont-verdict {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.cont-detail {
+  font-size: 12px;
+  opacity: 0.75;
 }
 
 .block-title {
