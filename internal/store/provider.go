@@ -26,7 +26,8 @@ const providerColumns = `id, name, display_name, remark, enabled, active, sort_o
 	keys_json, extra_headers_json,
 	timeout_seconds, connect_timeout_seconds, insecure_skip_tls,
 	proxy_mode, proxy_json, prompt_mode, prompt_json, prompt_rules_json,
-	model_map_json,
+	model_map_json, continuation_mode, continuation_models_json,
+	continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
 	usage_inject_mode, strip_usage_chunk, custom_usage_json, usage_query_json, tags_json,
 	created_at, updated_at`
 
@@ -109,7 +110,7 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		p.DisplayName = p.Name
 	}
 
-	keysJSON, headersJSON, rulesJSON, modelMapJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, usageQueryJSON, err := marshalProviderParts(p)
+	keysJSON, headersJSON, rulesJSON, modelMapJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, usageQueryJSON, contModelsJSON, err := marshalProviderParts(p)
 	if err != nil {
 		return p, err
 	}
@@ -120,16 +121,18 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		keys_json, extra_headers_json,
 		timeout_seconds, connect_timeout_seconds, insecure_skip_tls,
 		proxy_mode, proxy_json, prompt_mode, prompt_json, prompt_rules_json,
-		model_map_json,
+		model_map_json, continuation_mode, continuation_models_json,
+		continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
 		usage_inject_mode, strip_usage_chunk, custom_usage_json, usage_query_json, tags_json,
 		created_at, updated_at
-	) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?, ?,?,?,?,?, ?, ?,?,?,?,?, ?,?)`,
+	) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?)`,
 		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), boolToInt(p.Active), p.SortOrder,
 		p.BaseURL, string(p.APIFormat), p.CustomPath, p.AuthHeader, p.AuthPrefix,
 		keysJSON, headersJSON,
 		p.TimeoutSeconds, p.ConnectTimeoutSeconds, boolToInt(p.InsecureSkipTLS),
 		p.ProxyMode, proxyJSON, p.PromptMode, promptJSON, rulesJSON,
-		modelMapJSON,
+		modelMapJSON, p.ContinuationMode, contModelsJSON,
+		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), customUsageJSON, usageQueryJSON, tagsJSON,
 		tsToDB(p.CreatedAt), tsToDB(p.UpdatedAt),
 	)
@@ -169,7 +172,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 	p.CreatedAt = existing.CreatedAt
 	p.UpdatedAt = time.Now()
 
-	keysJSON, headersJSON, rulesJSON, modelMapJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, usageQueryJSON, err := marshalProviderParts(p)
+	keysJSON, headersJSON, rulesJSON, modelMapJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, usageQueryJSON, contModelsJSON, err := marshalProviderParts(p)
 	if err != nil {
 		return p, err
 	}
@@ -180,7 +183,8 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		keys_json=?, extra_headers_json=?,
 		timeout_seconds=?, connect_timeout_seconds=?, insecure_skip_tls=?,
 		proxy_mode=?, proxy_json=?, prompt_mode=?, prompt_json=?, prompt_rules_json=?,
-		model_map_json=?,
+		model_map_json=?, continuation_mode=?, continuation_models_json=?,
+		continuation_cooldown_seconds=?, continuation_invalid_cooldown_seconds=?,
 		usage_inject_mode=?, strip_usage_chunk=?, custom_usage_json=?, usage_query_json=?, tags_json=?,
 		updated_at=?
 		WHERE id=?`,
@@ -189,7 +193,8 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		keysJSON, headersJSON,
 		p.TimeoutSeconds, p.ConnectTimeoutSeconds, boolToInt(p.InsecureSkipTLS),
 		p.ProxyMode, proxyJSON, p.PromptMode, promptJSON, rulesJSON,
-		modelMapJSON,
+		modelMapJSON, p.ContinuationMode, contModelsJSON,
+		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), customUsageJSON, usageQueryJSON, tagsJSON,
 		tsToDB(p.UpdatedAt), p.ID,
 	)
@@ -268,7 +273,7 @@ func (s *Store) ReorderProviders(ids []int64) error {
 
 // ---------- 序列化辅助 ----------
 
-func marshalProviderParts(p model.Provider) (keys, headers, rules, modelMap, tags, proxy, prompt, customUsage, usageQuery string, err error) {
+func marshalProviderParts(p model.Provider) (keys, headers, rules, modelMap, tags, proxy, prompt, customUsage, usageQuery, contModels string, err error) {
 	marshal := func(v any, what string) (string, error) {
 		b, e := json.Marshal(v)
 		if e != nil {
@@ -286,6 +291,9 @@ func marshalProviderParts(p model.Provider) (keys, headers, rules, modelMap, tag
 		return
 	}
 	if modelMap, err = marshal(p.ModelMap, "模型映射"); err != nil {
+		return
+	}
+	if contModels, err = marshal(p.ContinuationModels, "续传模型范围"); err != nil {
 		return
 	}
 	if tags, err = marshal(p.Tags, "标签"); err != nil {
@@ -322,6 +330,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		enabled, active, insecureTLS, stripUsage int
 		keysJSON, headersJSON, rulesJSON         string
 		modelMapJSON, tagsJSON, proxyJSON        string
+		contModelsJSON                           string
 		promptJSON                               string
 		customUsageJSON, usageQueryJSON          string
 		apiFormat                                string
@@ -333,7 +342,8 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		&keysJSON, &headersJSON,
 		&p.TimeoutSeconds, &p.ConnectTimeoutSeconds, &insecureTLS,
 		&p.ProxyMode, &proxyJSON, &p.PromptMode, &promptJSON, &rulesJSON,
-		&modelMapJSON,
+		&modelMapJSON, &p.ContinuationMode, &contModelsJSON,
+		&p.ContinuationCooldownSeconds, &p.ContinuationInvalidCooldownSeconds,
 		&p.UsageInjectMode, &stripUsage, &customUsageJSON, &usageQueryJSON, &tagsJSON,
 		&createdAt, &updatedAt,
 	)
@@ -361,6 +371,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 	decode(headersJSON, &p.ExtraHeaders)
 	decode(rulesJSON, &p.PromptRules)
 	decode(modelMapJSON, &p.ModelMap)
+	decode(contModelsJSON, &p.ContinuationModels)
 	decode(tagsJSON, &p.Tags)
 	decode(proxyJSON, &p.Proxy)
 	decode(promptJSON, &p.Prompt)

@@ -298,10 +298,58 @@ export const MODIFICATION_LABELS: Record<string, string> = {
   prompt_replace: '替换提示词',
   prompt_prepend_user: '前置提示词',
   responses_input_type: '补齐 input.type',
+  responses_continuation: '增量续传',
+  responses_continuation_seed: '续传建链',
+  responses_continuation_fallback: '续传回退',
+  responses_store_enabled: '开启上游存储',
 }
 
 export function modificationLabel(key: string): string {
   return MODIFICATION_LABELS[key] ?? key
+}
+
+/** 续传模式的可读名称。 */
+export const CONTINUATION_MODE_LABELS: Record<string, string> = {
+  seed: '建链（全量）',
+  continued: '增量续传',
+  fallback: '回退全量',
+  unsupported: '不支持（冷却中）',
+  skipped: '已跳过',
+  'dry-hit': 'dry-run 命中',
+  'dry-miss': 'dry-run 未命中',
+  full: '全量',
+}
+
+export function continuationModeLabel(key: string): string {
+  return CONTINUATION_MODE_LABELS[key] ?? key
+}
+
+/** 续传跳过/回退原因的可读名称。 */
+export const CONTINUATION_REASON_LABELS: Record<string, string> = {
+  'no-session': '缺少会话标识',
+  'no-chain': '没有可用链',
+  'chain-expired': '链已过期',
+  'active-inflight': '同会话有请求在飞',
+  'prefix-mismatch': '历史前缀不匹配',
+  'prefix-match': '前缀匹配',
+  'model-filtered': '模型范围未包含',
+  'client-managed': '客户端自行续传',
+  'input-unsupported': 'input 形态不支持',
+  'input-too-large': 'input 项数过多',
+  'body-too-large': '请求体过大',
+  'parse-error': '请求体解析失败',
+  'empty-body': '空请求体',
+  'no-model': '缺少模型名',
+  zdr: 'ZDR 已跳过',
+  conversation: '使用 conversation',
+  background: 'background 请求',
+  'provider-rejected': '上游拒绝',
+  'invalid-id': 'response id 无效',
+  'network-error': '网络错误',
+}
+
+export function continuationReasonLabel(key: string): string {
+  return CONTINUATION_REASON_LABELS[key] ?? key
 }
 
 /**

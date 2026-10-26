@@ -46,6 +46,29 @@ const (
 	ModeDisable = "disable" // 明确关闭
 )
 
+// Responses 会话续传的三种模式。
+//
+//   - off：完全不处理，保持原生透传。
+//   - dry-run：只统计「本地历史是否构成上一轮的前缀」以及可节省的字节，
+//     不改请求、不设置 store，用于在真实流量上验证客户端回放是否稳定。
+//   - on：命中后把全量 input 截成增量，补 store:true + previous_response_id。
+//
+// 是否真的能用取决于上游模型：只有原生 Responses 且实现 previous_response_id
+// 的模型才有效。flash 一类模型会拒绝 store 并自动回退；deepseek-v4-pro 这类
+// 模型可能返回 200 但静默忽略 previous_response_id，需要用户自行确认。
+const (
+	ContinuationOff    = "off"
+	ContinuationDryRun = "dry-run"
+	ContinuationOn     = "on"
+)
+
+// 续传冷却默认值。0 表示不冷却；provider 里的负值表示「未配置」，
+// ApplyDefaults 会补成这里的默认值。
+const (
+	DefaultContinuationCooldownSeconds        = 3600
+	DefaultContinuationInvalidCooldownSeconds = 300
+)
+
 // 提示词注入策略。
 const (
 	StrategyAppend      = "append"       // 追加到已有 system 之后
@@ -183,6 +206,15 @@ type Provider struct {
 	// 模型映射（可选）。只做精确匹配，未命中的请求原样透传。
 	ModelMap []ModelMapping `json:"modelMap"`
 
+	// Responses 会话续传。默认 off，只有用户显式开启才生效。
+	// ContinuationModels 是可选的模型范围（留空表示全部模型），
+	// 由用户决定在哪些模型上开启，不是程序内置的白名单。
+	ContinuationMode   string   `json:"continuationMode"`
+	ContinuationModels []string `json:"continuationModels"`
+	// 冷却时间（秒）。不支持类错误与 response id 失效分开配置；0 表示不冷却。
+	ContinuationCooldownSeconds        int `json:"continuationCooldownSeconds"`
+	ContinuationInvalidCooldownSeconds int `json:"continuationInvalidCooldownSeconds"`
+
 	// usage 注入
 	UsageInjectMode string `json:"usageInjectMode"` // inherit | on | off
 	StripUsageChunk bool   `json:"stripUsageChunk"`
@@ -278,6 +310,23 @@ func (p *Provider) ApplyDefaults() {
 	}
 	if p.ModelMap == nil {
 		p.ModelMap = []ModelMapping{}
+	}
+	if p.ContinuationMode == "" {
+		p.ContinuationMode = ContinuationOff
+	}
+	switch p.ContinuationMode {
+	case ContinuationOff, ContinuationDryRun, ContinuationOn:
+	default:
+		p.ContinuationMode = ContinuationOff
+	}
+	if p.ContinuationModels == nil {
+		p.ContinuationModels = []string{}
+	}
+	if p.ContinuationCooldownSeconds < 0 {
+		p.ContinuationCooldownSeconds = DefaultContinuationCooldownSeconds
+	}
+	if p.ContinuationInvalidCooldownSeconds < 0 {
+		p.ContinuationInvalidCooldownSeconds = DefaultContinuationInvalidCooldownSeconds
 	}
 	// TimeoutSeconds / ConnectTimeoutSeconds 为 0 表示「继承全局默认」，
 	// 只有负数才视为非法值。
@@ -418,6 +467,11 @@ type RequestLog struct {
 	RequestModified  bool     `json:"requestModified"`
 	ResponseModified bool     `json:"responseModified"`
 	Modifications    []string `json:"modifications"`
+
+	// 续传留痕。off/未命中时为空或 0；dry-run 下 savedBytes 是估算值。
+	ContinuationMode   string `json:"continuationMode"`
+	ContinuationReason string `json:"continuationReason"`
+	SavedBytes         int64  `json:"savedBytes"`
 
 	HTTPStatus int    `json:"httpStatus"`
 	Success    bool   `json:"success"`

@@ -20,6 +20,8 @@ import type { RequestLog } from '@/types'
 import {
   OUTCOME_LABELS,
   cacheHitRateOf,
+  continuationModeLabel,
+  continuationReasonLabel,
   formatBytes,
   formatDateTime,
   formatDuration,
@@ -181,6 +183,15 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
                     {{ modificationLabel(m) }}
                   </NTag>
                 </NSpace>
+              </template>
+
+              <template v-if="log.continuationMode">
+                <h4 class="section">续传</h4>
+                <NDescriptions :column="3" label-placement="left" bordered size="small">
+                  <NDescriptionsItem label="模式">{{ continuationModeLabel(log.continuationMode) }}</NDescriptionsItem>
+                  <NDescriptionsItem label="原因">{{ log.continuationReason ? continuationReasonLabel(log.continuationReason) : '—' }}</NDescriptionsItem>
+                  <NDescriptionsItem label="节省请求体">{{ formatBytes(log.savedBytes) }}</NDescriptionsItem>
+                </NDescriptions>
               </template>
             </NTabPane>
 

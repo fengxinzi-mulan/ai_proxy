@@ -262,6 +262,9 @@ func TestForwardStreamingToolCallsSetTTFT(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
+		// 本地环回太快时首个内容事件可能和请求起点落在同一毫秒，
+		// 被截断成 0ms TTFT；给一点真实延迟让断言稳定。
+		time.Sleep(10 * time.Millisecond)
 		for i, c := range chunks {
 			io.WriteString(w, c)
 			flusher.Flush()

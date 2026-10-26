@@ -239,6 +239,29 @@ var migrations = []migration{
 			`ALTER TABLE request_logs ADD COLUMN model_mapped TEXT NOT NULL DEFAULT ''`,
 		},
 	},
+	{
+		// Responses 会话续传。默认 off，只有用户显式开启才改写请求。
+		//
+		// 续传字段单独成列而不是塞进 modifications：模式、原因和省下的字节数
+		// 都是需要按值排查的运行态事实，尤其是 dry-run 阶段要看真实命中率。
+		version: 5,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN continuation_mode TEXT NOT NULL DEFAULT 'off'`,
+			`ALTER TABLE providers ADD COLUMN continuation_models_json TEXT NOT NULL DEFAULT '[]'`,
+			`ALTER TABLE request_logs ADD COLUMN continuation_mode TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE request_logs ADD COLUMN continuation_reason TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE request_logs ADD COLUMN saved_bytes INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		// 续传失败后的冷却时间（秒），由用户按供应商配置。-1 表示未配置，
+		// 读取时补默认值；0 表示不冷却（回退后下一轮立刻重新建链）。
+		version: 6,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN continuation_cooldown_seconds INTEGER NOT NULL DEFAULT -1`,
+			`ALTER TABLE providers ADD COLUMN continuation_invalid_cooldown_seconds INTEGER NOT NULL DEFAULT -1`,
+		},
+	},
 }
 
 func (s *Store) migrate() error {

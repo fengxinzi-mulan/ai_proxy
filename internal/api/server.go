@@ -272,6 +272,7 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	if updated, err := s.store.GetProvider(created.ID); err == nil {
 		created = updated
 	}
+	s.proxy.ResetContinuation()
 	s.hub.Broadcast("providers", nil)
 	s.writeJSON(w, http.StatusOK, created)
 }
@@ -292,6 +293,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.proxy.ResetContinuation()
 	s.hub.Broadcast("providers", nil)
 	s.writeJSON(w, http.StatusOK, updated)
 }
@@ -305,6 +307,7 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.proxy.ResetContinuation()
 	s.hub.Broadcast("providers", nil)
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -318,6 +321,7 @@ func (s *Server) handleActivateProvider(w http.ResponseWriter, r *http.Request) 
 		s.fail(w, err)
 		return
 	}
+	s.proxy.ResetContinuation()
 	s.hub.Broadcast("providers", nil)
 	list, err := s.store.ListProviders()
 	if err != nil {

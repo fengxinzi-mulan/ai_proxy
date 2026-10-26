@@ -6,6 +6,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,12 +33,13 @@ const copyBufferSize = 32 << 10
 
 // Server 是转发入口，同时对外提供运行时可观测状态。
 type Server struct {
-	store   *store.Store
-	hub     *hub.Hub
-	live    *LiveRegistry
-	clients *clientPool
-	keys    *keyPool
-	logger  *slog.Logger
+	store        *store.Store
+	hub          *hub.Hub
+	live         *LiveRegistry
+	clients      *clientPool
+	keys         *keyPool
+	continuation *continuationManager
+	logger       *slog.Logger
 
 	idSeq atomic.Uint64
 }
@@ -45,13 +47,23 @@ type Server struct {
 // NewServer 构造转发服务。
 func NewServer(st *store.Store, h *hub.Hub, logger *slog.Logger) *Server {
 	return &Server{
-		store:   st,
-		hub:     h,
-		live:    NewLiveRegistry(),
-		clients: newClientPool(),
-		keys:    newKeyPool(),
-		logger:  logger,
+		store:        st,
+		hub:          h,
+		live:         NewLiveRegistry(),
+		clients:      newClientPool(),
+		keys:         newKeyPool(),
+		continuation: newContinuationManager(),
+		logger:       logger,
 	}
+}
+
+// ResetContinuation 清空续传链与冷却状态；供应商配置变化后调用，
+// 让用户改完模型/开关后不必等冷却到期或重启进程。
+func (s *Server) ResetContinuation() {
+	if s == nil || s.continuation == nil {
+		return
+	}
+	s.continuation.reset()
 }
 
 // Live 暴露进行中请求注册表，供管理接口读取。
@@ -142,6 +154,7 @@ type forwardInput struct {
 	reqBody       []byte // 客户端原始请求体
 	outBody       []byte // 改写后实际发出的请求体
 	modifications []string
+	continuation  *continuationAttempt
 }
 
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput) {
@@ -154,6 +167,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput
 	}
 
 	key, _ := s.keys.Pick(prov)
+	// 续传改写必须在选定 key 之后：链按 provider+model+key+session 隔离，
+	// 不同账号的 response id 不能互相引用。
+	in.continuation = s.continuation.prepare(&in, r, key)
 	netcfg := resolveNet(prov, in.settings)
 	client, err := s.clients.client(netcfg)
 	if err != nil {
@@ -188,26 +204,12 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput
 
 	resp, err := client.Do(upReq)
 	if err != nil {
-		cancelled := isClientGone(r, err)
-		status := http.StatusBadGateway
-		msg := "请求上游失败: " + err.Error()
-		if cancelled {
-			status = statusClientClosedRequest
-			msg = "客户端已断开连接"
-		} else if errors.Is(err, context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-			msg = "请求上游超时: " + err.Error()
-		}
-		s.keys.Report(prov.ID, key.ID, 0, err.Error())
-		s.record(in, logResult{
-			status:    status,
-			errMsg:    msg,
-			cancelled: cancelled,
-			upstream:  target,
-			proxyDesc: netcfg.ProxyDesc,
-			headers:   headers,
-		})
-		writeProxyError(w, status, msg)
+		s.failUpstream(w, r, in, prov, key, target, netcfg, headers, err)
+		return
+	}
+	resp, err = s.retryContinuation(resp, &in, client, target, headers, ctx)
+	if err != nil {
+		s.failUpstream(w, r, in, prov, key, target, netcfg, headers, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -223,7 +225,42 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput
 	res.upstream = target
 	res.proxyDesc = netcfg.ProxyDesc
 	res.headers = headers
+	s.continuation.commit(in.continuation, res)
 	s.record(in, res)
+}
+
+// failUpstream 统一处理「还没写出响应头就失败」的情况。
+func (s *Server) failUpstream(w http.ResponseWriter, r *http.Request, in forwardInput,
+	prov model.Provider, key model.APIKey, target string, netcfg resolvedNet,
+	headers http.Header, err error) {
+	if in.continuation != nil {
+		// 没发出去就没有节省，别留下误导性的数字。
+		in.continuation.savedBytes = 0
+		if in.continuation.mode == "continued" || in.continuation.mode == "seed" {
+			in.continuation.reason = "network-error"
+		}
+		s.continuation.fail(in.continuation)
+	}
+	cancelled := isClientGone(r, err)
+	status := http.StatusBadGateway
+	msg := "请求上游失败: " + err.Error()
+	if cancelled {
+		status = statusClientClosedRequest
+		msg = "客户端已断开连接"
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		status = http.StatusGatewayTimeout
+		msg = "请求上游超时: " + err.Error()
+	}
+	s.keys.Report(prov.ID, key.ID, 0, err.Error())
+	s.record(in, logResult{
+		status:    status,
+		errMsg:    msg,
+		cancelled: cancelled,
+		upstream:  target,
+		proxyDesc: netcfg.ProxyDesc,
+		headers:   headers,
+	})
+	writeProxyError(w, status, msg)
 }
 
 // relay 把上游响应原样写给客户端，同时旁路收集统计指标。
@@ -370,6 +407,9 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	}
 	res.usage = usage
 	res.model = an.Model()
+	res.responseID = an.ResponseID()
+	res.responseStore = an.ResponseStore()
+	res.responseOutput = an.ResponseOutput()
 	res.analyzerErr = an.ErrMsg()
 	res.contentSeen = an.HasContent()
 	res.streaming = an.Streaming()
@@ -420,6 +460,9 @@ type logResult struct {
 	streamFinished    bool
 	responseStatus    string
 	terminalDelivered bool
+	responseID        string
+	responseStore     *bool
+	responseOutput    []json.RawMessage
 }
 
 // record 把结果落库并广播给管理界面。
@@ -464,6 +507,11 @@ func (s *Server) record(in forwardInput, res logResult) {
 	}
 	if entry.Modifications == nil {
 		entry.Modifications = []string{}
+	}
+	if in.continuation != nil {
+		entry.ContinuationMode = in.continuation.mode
+		entry.ContinuationReason = in.continuation.reason
+		entry.SavedBytes = in.continuation.savedBytes
 	}
 	// 非流式请求没有「首 token」这个概念，保持 0。
 	if res.appliedTTFT {
@@ -511,6 +559,9 @@ func (s *Server) record(in forwardInput, res logResult) {
 
 // failEarly 处理还没有定位到供应商的失败，同样留下日志。
 func (s *Server) failEarly(w http.ResponseWriter, in forwardInput, status int, msg string) {
+	if in.continuation != nil {
+		s.continuation.fail(in.continuation)
+	}
 	s.logger.Warn("转发被拒绝", "status", status, "msg", msg, "path", in.clientPath)
 	s.record(in, logResult{status: status, errMsg: msg})
 	writeProxyError(w, status, msg)

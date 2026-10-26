@@ -85,6 +85,10 @@ function blank(): Provider {
     prompt: { enabled: true, text: '', strategy: 'append' },
     promptRules: [],
     modelMap: [],
+    continuationMode: 'off',
+    continuationModels: [],
+    continuationCooldownSeconds: 3600,
+    continuationInvalidCooldownSeconds: 300,
     usageInjectMode: 'inherit',
     stripUsageChunk: false,
     customUsage: null,
@@ -201,6 +205,8 @@ function collect(): ProviderPayload {
   void _updatedAt
   return {
     ...rest,
+    continuationCooldownSeconds: form.continuationCooldownSeconds ?? 3600,
+    continuationInvalidCooldownSeconds: form.continuationInvalidCooldownSeconds ?? 300,
     extraHeaders,
     // 只提交填写完整的映射行：空行（用户点了「添加」还没填）不该落库。
     modelMap: form.modelMap
@@ -743,6 +749,73 @@ function remove() {
             开启后，上游返回的「只带 usage、没有内容」的收尾块不会转发给客户端。
             极少数严格校验 <code class="mono">choices</code> 为空的客户端需要它。
             统计不受影响。
+          </NAlert>
+
+          <NDivider title-placement="left" style="font-size: 12px">Responses 会话续传</NDivider>
+          <NForm label-placement="left" label-width="150" size="small">
+            <NFormItem label="续传模式">
+              <NRadioGroup v-model:value="form.continuationMode">
+                <NRadioButton value="off">关闭</NRadioButton>
+                <NRadioButton value="dry-run">仅诊断</NRadioButton>
+                <NRadioButton value="on">开启改写</NRadioButton>
+              </NRadioGroup>
+            </NFormItem>
+            <NFormItem v-if="form.continuationMode !== 'off'" label="模型范围">
+              <NSelect
+                v-model:value="form.continuationModels"
+                multiple
+                tag
+                filterable
+                clearable
+                :options="[]"
+                placeholder="留空=全部模型；输入模型名后回车可添加"
+              />
+            </NFormItem>
+            <NFormItem v-if="form.continuationMode !== 'off'" label="不支持类冷却">
+              <NInputNumber v-model:value="form.continuationCooldownSeconds" :min="0" :step="60" style="width: 160px">
+                <template #suffix>秒</template>
+              </NInputNumber>
+            </NFormItem>
+            <NFormItem v-if="form.continuationMode !== 'off'" label="id 失效冷却">
+              <NInputNumber
+                v-model:value="form.continuationInvalidCooldownSeconds"
+                :min="0"
+                :step="30"
+                style="width: 160px"
+              >
+                <template #suffix>秒</template>
+              </NInputNumber>
+            </NFormItem>
+          </NForm>
+
+          <NAlert
+            v-if="form.continuationMode === 'dry-run'"
+            type="info"
+            :bordered="false"
+            style="margin-bottom: 12px; font-size: 12px"
+          >
+            只统计「本地历史是否构成上一轮的前缀」和预计可节省的请求字节，<strong>不修改请求、不开启 store</strong>。
+            先让真实会话跑一段时间，再看日志里的「续传」列：<code class="mono">dry-hit</code> 比例高才值得开启改写。
+            如果一直是 <code class="mono">dry-miss</code>，通常是客户端每轮重新编码了图片，或历史项没有原样回放。
+          </NAlert>
+
+          <NAlert
+            v-else-if="form.continuationMode === 'on'"
+            type="warning"
+            :bordered="false"
+            style="margin-bottom: 12px; font-size: 12px"
+          >
+            仅对 <code class="mono">openai-responses</code> 格式、路径以 <code class="mono">/responses</code>
+            结尾的请求生效。命中时把全量 <code class="mono">input</code> 截成增量，并补
+            <code class="mono">store:true</code> + <code class="mono">previous_response_id</code>。
+            <br />
+            <strong>后果：</strong>上游会保存整段会话（含图片）；只有原生 Responses 且真正实现
+            <code class="mono">previous_response_id</code> 的模型有效。<code class="mono">flash</code> 一类模型会返回 503
+            并自动回退；<code class="mono">deepseek-v4-pro</code> 这类模型可能返回 200
+            但<strong>静默丢失上下文</strong>。请先用「仅诊断」在真实会话上验证。
+            <br />
+            两个冷却时间填 0 表示<strong>不冷却</strong>：回退后下一轮立刻重新建链，适合测试；
+            但上游持续失败时每轮都会多一次请求。
           </NAlert>
 
           <NForm label-placement="left" label-width="150" size="small">

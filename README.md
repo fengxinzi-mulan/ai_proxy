@@ -10,6 +10,8 @@ HTTP 状态、推理强度等。编译产物是单个可执行文件，管理界
 - **全程记账**：解析 5 种协议格式的用量与性能指标，落 SQLite，带实时推送的管理界面。
 - **自定义提示词**：全局默认 + 按供应商覆盖 + 按模型正则匹配，三种注入方式，改动全程留痕。
 - **模型映射**：按供应商把请求的模型名精确映射成上游模型名，未命中的请求原样透传（见下文）。
+- **Responses 会话续传**：对开启的供应商，把多轮 Responses 请求的全量历史截成增量，配合
+  `store:true` + `previous_response_id` 降低多图会话的首 token 耗时；默认关闭，支持 dry-run 诊断（见下文）。
 - **全局代理**：支持 HTTP / SOCKS5，可按供应商覆盖或直连，支持 no_proxy 例外表。
 - **多供应商**：一个端口挂多个上游，前端切换「当前生效」，也可用路径前缀显式指定。
 - **多密钥轮询**：一个供应商配多个密钥，自动轮询，失败自动进入冷却并避让。
@@ -267,6 +269,8 @@ node scripts/mock-upstream.mjs 9911
 COMMAND_CODE_API_KEY=user_xxx go test ./internal/proxy -run Live -v
 DEEPSEEK_API_KEY=sk-xxx       go test ./internal/proxy -run LiveDeepSeek -v
 OPENCODE_API_KEY=sk-xxx       go test ./internal/proxy -run LiveOpenCode -v
+CONTINUATION_LIVE=1 CONTINUATION_PROXY_LIVE=1 RESPONSES_LIVE_MODEL=grok-4.7 \
+  go test ./internal/proxy -run LiveOpenCodeResponsesContinuation -v
 ```
 
 ## 模型映射
@@ -282,6 +286,34 @@ OPENCODE_API_KEY=sk-xxx       go test ./internal/proxy -run LiveOpenCode -v
 - 命中映射的请求会在日志里同时记下**请求模型**（客户端要的）与**上游模型**（实际发出去的），
   改写标记为「模型映射」；日志列表的模型列显示成 `请求模型 → 上游模型`。
 - Gemini 的模型名在 URL 路径上，映射改的是路径里的模型段；其余格式改的是请求体里的 `model`。
+
+## Responses 会话续传
+
+只对 API 格式为 `openai-responses`、路径以 `/responses` 结尾的请求生效。供应商编辑页的「高级」
+里有三态开关：
+
+- `关闭`（默认）：完全透传。
+- `仅诊断`（dry-run）：只统计本地历史是否构成上一轮的前缀、以及预计能省下多少请求字节；
+  不改请求、不设置 `store`。用真实会话跑一段，看日志里的「续传」列；`dry-hit` 比例高才值得开启。
+- `开启改写`：命中后把全量 `input` 截成增量，补 `store:true` + `previous_response_id`；
+  失败（400/404/409/422/503）自动回退全量；不支持类错误和 response id 失效的冷却时间
+  可在供应商页配置（默认 3600 / 300 秒；填 0 表示不冷却，回退后下一轮立刻重建链）。
+
+约束与后果：
+
+- **上游会保存整段会话（含图片）**。这是 `previous_response_id` 的前提；只在你显式开启的供应商上生效。
+  请求带 `x-cmd-zdr` / `x-zdr` / `x-zero-data-retention` 时自动跳过。
+- **只有原生 Responses 且真正实现 `previous_response_id` 的模型有效**。实测通过：
+  `grok-4.6`、`grok-4.7`、`gpt-5.6-luna`、`gpt-6-luna`；`deepseek-v4.1-flash` 会拒绝
+  `store:true`（自动回退），`deepseek-v4-pro` 可能返回 200 但**静默丢失上下文**。程序不内置
+  白名单，由你在「模型范围」里决定；留空表示全部模型。
+  commandcode 网关上的 `deepseek/deepseek-v4.1-flash` 也实测通过（文本、图片、工具轮）；
+  该网关偶发 `store` 回显 `false` 或续传 400，代理会回退全量，并按配置的冷却时间
+  （默认 5 分钟）重新建链。
+- 前缀必须逐项匹配（去 `id/status`、合并 text 类型、解析工具参数）；历史、模型、账号、
+  工具定义或采样参数任一变化都会退回全量。客户端每轮重新编码图片也会导致不命中。
+- 标准 Responses 接口在续传时仍按整条链计费，省的是上行请求体积和首 token 等待，不是 token 账单。
+- 日志会记录 `continuation_mode`、`continuation_reason`、`saved_bytes`；详情页「续传」区可直接看。
 
 ## 代理配置
 

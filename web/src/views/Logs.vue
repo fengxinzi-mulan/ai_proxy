@@ -24,6 +24,7 @@ import {
   OUTCOME_LABELS,
   cacheHitRateOf,
   cacheRateColor,
+  continuationModeLabel,
   formatBytes,
   formatCompact,
   formatDuration,
@@ -365,6 +366,19 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
             },
           ),
         )
+      if (!tags.length && r.continuationMode) {
+        tags.push(
+          h(
+            NTag,
+            {
+              size: 'tiny',
+              bordered: false,
+              type: r.continuationMode === 'dry-hit' ? 'success' : 'default',
+            },
+            { default: () => continuationModeLabel(r.continuationMode) },
+          ),
+        )
+      }
       if (!tags.length) return h('span', { style: 'opacity:.35' }, '—')
       return h(NSpace, { size: 2 }, { default: () => tags })
     },

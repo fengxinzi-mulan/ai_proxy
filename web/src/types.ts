@@ -179,6 +179,18 @@ export interface Provider {
   /** 模型映射（只做精确匹配，未命中的请求原样透传）。 */
   modelMap: ModelMapping[]
 
+  /**
+   * Responses 会话续传。默认 off。
+   * dry-run 只统计前缀命中与可节省字节，不改请求；on 才会写 store/previous_response_id。
+   */
+  continuationMode: 'off' | 'dry-run' | 'on'
+  /** 可选的模型范围，留空表示全部模型（不是内置白名单）。 */
+  continuationModels: string[]
+  /** 不支持类错误的冷却秒数；0 表示不冷却。 */
+  continuationCooldownSeconds: number
+  /** response id 失效的冷却秒数；0 表示回退后下一轮立刻重新建链。 */
+  continuationInvalidCooldownSeconds: number
+
   usageInjectMode: 'inherit' | 'on' | 'off'
   stripUsageChunk: boolean
 
@@ -233,6 +245,10 @@ export interface RequestLog {
   requestModified: boolean
   responseModified: boolean
   modifications: string[]
+  /** 续传留痕：seed/continued/fallback/unsupported/dry-hit/dry-miss。 */
+  continuationMode: string
+  continuationReason: string
+  savedBytes: number
   httpStatus: number
   success: boolean
   errorMsg: string

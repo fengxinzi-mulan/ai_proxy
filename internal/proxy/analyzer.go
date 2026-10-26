@@ -36,6 +36,12 @@ type analyzer struct {
 	done         bool // 收到 OpenAI 的 [DONE]
 	terminal     bool // 收到任何表示「流正常结束」的终止信号
 
+	// Responses 续传需要的回执字段。只在 response.completed（流式）或
+	// 非流式顶层对象里捕获；是否提交链由调用方判断。
+	responseID     string
+	responseStore  *bool
+	responseOutput []json.RawMessage
+
 	// estTokens 是增量累积的输出 token 估算值。
 	// 增量累加而不是留全文再估算，长响应下内存占用是常数级。
 	estTokens int
@@ -141,6 +147,15 @@ func (a *analyzer) ErrMsg() string { return a.errMsg }
 
 // FinishReason 返回结束原因。
 func (a *analyzer) FinishReason() string { return a.finishReason }
+
+// ResponseID 返回 Responses 回执里的顶层 response id；未拿到时为空。
+func (a *analyzer) ResponseID() string { return a.responseID }
+
+// ResponseStore 返回回执里的 store 字段；上游没返回时为 nil。
+func (a *analyzer) ResponseStore() *bool { return a.responseStore }
+
+// ResponseOutput 返回回执里的完整 output 数组，用于下一轮的前缀校验。
+func (a *analyzer) ResponseOutput() []json.RawMessage { return a.responseOutput }
 
 // Done 报告流是否以 [DONE] 正常收尾。
 func (a *analyzer) Done() bool { return a.done }
@@ -265,6 +280,7 @@ func (a *analyzer) handleOpenAI(obj map[string]any) {
 func (a *analyzer) handleResponses(event string, obj map[string]any) {
 	if !a.streaming {
 		// 非流式响应体：usage 在顶层，正文在 output 数组里。
+		a.captureResponsesObject(obj)
 		if u := extractUsageFromObject(model.FormatResponses, nil, obj); u.Found {
 			a.usage = u
 		}
@@ -282,10 +298,18 @@ func (a *analyzer) handleResponses(event string, obj map[string]any) {
 	}
 	switch event {
 	case "response.completed", "response.incomplete", "response.failed":
+		if response, ok := getMap(obj, "response"); ok {
+			a.captureResponsesObject(response)
+		}
 		if u := extractUsageFromObject(model.FormatResponses, nil, obj); u.Found {
 			a.usage = u
 		}
 		a.setResponsesOutcome(strings.TrimPrefix(event, "response."), obj)
+	case "response.created":
+		// 先记住 id/store；output 通常要到 completed 才有。
+		if response, ok := getMap(obj, "response"); ok {
+			a.captureResponsesObject(response)
+		}
 	case "response.output_text.delta", "response.reasoning_summary_text.delta",
 		"response.reasoning_text.delta":
 		if s, ok := getString(obj, "delta"); ok {
@@ -328,6 +352,33 @@ func (a *analyzer) setResponsesOutcome(status string, obj map[string]any) {
 		reason = "上游未提供原因"
 	}
 	a.errMsg = "Responses 响应不完整: " + reason
+}
+
+// captureResponsesObject 从顶层对象或 response.completed 的 response 对象里
+// 记录续传所需字段。response.created 也会调用，先拿到 id/store；
+// output 以最后一次完整回执为准。
+func (a *analyzer) captureResponsesObject(obj map[string]any) {
+	if id, ok := getString(obj, "id"); ok && id != "" {
+		a.responseID = id
+	}
+	if store, ok := obj["store"].(bool); ok {
+		a.responseStore = &store
+	}
+	raw, ok := obj["output"].([]any)
+	if !ok || len(raw) == 0 {
+		return
+	}
+	out := make([]json.RawMessage, 0, len(raw))
+	for _, item := range raw {
+		b, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
+		out = append(out, b)
+	}
+	if len(out) > 0 {
+		a.responseOutput = out
+	}
 }
 
 func (a *analyzer) handleAnthropic(event string, obj map[string]any) {
