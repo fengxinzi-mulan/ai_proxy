@@ -930,7 +930,8 @@ func TestContinuationNonStreaming(t *testing.T) {
 }
 
 // 供应商明确回 store:false 时不要建链；下一轮重新发 store:true，
-// 否则会拿着一个不可用的 id 去撞 400（commandcode 偶发）。
+// 否则会拿着一个不可用的 id 去撞 400（commandcode 会成片出现）。
+// 这种情况下下一轮的原因要标成「上游未保存」，而不是笼统的 no-chain。
 func TestContinuationExplicitStoreFalseDoesNotCommit(t *testing.T) {
 	var mu sync.Mutex
 	var bodies []string
@@ -956,8 +957,8 @@ func TestContinuationExplicitStoreFalseDoesNotCommit(t *testing.T) {
 	if rec := postContinuation(t, srv, contBody(true, user1), "nostore-session"); rec.Code != http.StatusOK {
 		t.Fatalf("首轮应 200，实际 %d", rec.Code)
 	}
-	if log := lastLog(t, st); log.ContinuationMode != "seed" {
-		t.Fatalf("首轮应记 seed，实际 %q", log.ContinuationMode)
+	if log := lastLog(t, st); log.ContinuationMode != "seed" || log.ContinuationReason != "no-chain" {
+		t.Fatalf("首轮应记 seed/no-chain，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
 	}
 
 	input2 := []any{user1, contAssistant("OK"), contUser("again")}
@@ -976,8 +977,17 @@ func TestContinuationExplicitStoreFalseDoesNotCommit(t *testing.T) {
 	if got := contInput(t, b2); len(got) != 3 {
 		t.Errorf("没有链时应发全量 3 项，实际 %d", len(got))
 	}
-	if log := lastLog(t, st); log.ContinuationMode != "seed" || log.ContinuationReason != "no-chain" {
-		t.Errorf("应记 seed/no-chain，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	if log := lastLog(t, st); log.ContinuationMode != "seed" || log.ContinuationReason != "upstream-not-stored" {
+		t.Errorf("应记 seed/upstream-not-stored，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+
+	// 上游恢复存储：这一轮建链，下一轮回到正常续传，不该再提示未保存。
+	input3 := append(append([]any{}, input2...), contAssistant("OK"), contUser("third"))
+	if rec := postContinuation(t, srv, contBody(true, input3...), "nostore-session"); rec.Code != http.StatusOK {
+		t.Fatalf("第三轮应 200，实际 %d", rec.Code)
+	}
+	if log := lastLog(t, st); log.ContinuationMode != "continued" {
+		t.Errorf("上游恢复存储后应续传，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
 	}
 }
 

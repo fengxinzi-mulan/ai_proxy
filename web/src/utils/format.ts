@@ -329,6 +329,7 @@ export const CONTINUATION_REASON_LABELS: Record<string, string> = {
   'no-session': '缺少会话标识',
   'no-chain': '没有可用链',
   'not-stored': '上游未存储',
+  'upstream-not-stored': '上游未保存上一轮响应',
   'chain-expired': '链已过期',
   'active-inflight': '同会话有请求在飞',
   'prefix-mismatch': '历史前缀不匹配',
@@ -402,15 +403,19 @@ export function continuationVerdict(mode: string, reason: string, savedBytes: nu
         tagType: 'warning',
       }
     case 'seed': {
-      // 未命中分三种：历史对不上、压根没有链、链没有可用的 response id。
+      // 建链轮分几种成因：没有链、上游没存上一轮、历史对不上、链缺可用 id。
+      // 「上游未保存」不是代理的问题，是上游明确回了 store:false，值得单独标出。
       const seedLabel =
         reason === 'prefix-mismatch' ? '前缀不匹配'
         : reason === 'no-chain' ? '建链'
+        : reason === 'upstream-not-stored' ? '上游未保存'
         : reason === 'not-stored' ? '重建链'
         : '未命中'
       const seedDetail =
         reason === 'prefix-mismatch' ? '本地历史与上一轮对不上，本轮改发全量并重建链'
         : reason === 'no-chain' ? '没有可用链，发送全量并开启存储，下一轮才能续传'
+        : reason === 'upstream-not-stored'
+          ? '上一轮响应被上游标记为不存储（store=false），本轮重发全量；这是上游侧行为，代理无法规避'
         : reason === 'not-stored' ? '链已匹配但上一轮响应未被上游存储，本轮发全量重建链'
         : `未命中续传：${continuationReasonLabel(reason)}`
       return { outcome: 'skipped', label: seedLabel, detail: seedDetail, tagType: 'default' }

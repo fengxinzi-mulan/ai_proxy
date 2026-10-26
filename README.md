@@ -309,8 +309,9 @@ CONTINUATION_LIVE=1 CONTINUATION_PROXY_LIVE=1 RESPONSES_LIVE_MODEL=grok-4.7 \
   `store:true`（自动回退），`deepseek-v4-pro` 可能返回 200 但**静默丢失上下文**。程序不内置
   白名单，由你在「模型范围」里决定；留空表示全部模型。
   commandcode 网关上的 `deepseek/deepseek-v4.1-flash` 也实测通过（文本、图片、工具轮）；
-  该网关偶发 `store` 回显 `false` 或续传 400，代理会回退全量，并按配置的冷却时间
-  （默认 5 分钟）重新建链。
+  该网关的 `store` 会成片不可用（同一个会话连续多轮回显 `false`，换会话又正常），
+  这类轮次只能发全量，日志里会标成「上游未保存」；偶发的续传 400 会自动回退，
+  并按配置的冷却时间（默认 5 分钟）重新建链。
 - 匹配规则：请求历史部分（`input` 段）必须逐项一致（去 `id/status`、合并 text 类型、解析工具参数），
   但**上一轮响应的 output 部分允许客户端丢项**——ZCode 回放历史时不带 `reasoning`、偶尔还会丢掉
   没执行的 `function_call`，这些缺项不影响续传（上游已经保存过）。历史、模型、账号、

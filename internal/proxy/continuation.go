@@ -38,6 +38,9 @@ const (
 	continuationMaxItems  = 8192
 	continuationMaxBody   = 64 << 20
 	continuationErrorBody = 1 << 20
+	// continuationStoreMissTTL 是「上游未保存上一轮响应」这一判定的有效期。
+	// 太短会在重启后丢失线索，太长会把很久以前的拒存当成当前原因。
+	continuationStoreMissTTL = 10 * time.Minute
 )
 
 type continuationManager struct {
@@ -46,8 +49,11 @@ type continuationManager struct {
 	caps        map[string]*continuationCap
 	generations map[string]uint64
 	active      map[string]uint64
-	serial      uint64
-	now         func() time.Time
+	// storeMiss 记录各链最近一次「上游明确回 store:false」的时间：下一轮没有
+	// 可用链时，用它把「没建链」和「上游拒存」区分开，日志才看得出是谁的问题。
+	storeMiss map[string]time.Time
+	serial    uint64
+	now       func() time.Time
 }
 
 // continuationChain 是一条可续传的分支。
@@ -96,6 +102,7 @@ func newContinuationManager() *continuationManager {
 		caps:        map[string]*continuationCap{},
 		generations: map[string]uint64{},
 		active:      map[string]uint64{},
+		storeMiss:   map[string]time.Time{},
 		now:         time.Now,
 	}
 }
@@ -111,6 +118,7 @@ func (m *continuationManager) reset() {
 	m.caps = map[string]*continuationCap{}
 	m.generations = map[string]uint64{}
 	m.active = map[string]uint64{}
+	m.storeMiss = map[string]time.Time{}
 }
 
 // prepare 决定本次请求是否续传，并直接改写 in.outBody。
@@ -226,7 +234,13 @@ func (m *continuationManager) prepare(in *forwardInput, r *http.Request, key mod
 	reason := ""
 	switch {
 	case len(chains) == 0:
-		reason = "no-chain"
+		// 没有链有两种成因：本来就没建过（首轮/被清），或上一轮响应被上游
+		// 明确标记为不存储。后者下一轮重试也没用，值得在日志里分开。
+		if miss, ok := m.storeMiss[chainKey]; ok && now.Sub(miss) < continuationStoreMissTTL {
+			reason = "upstream-not-stored"
+		} else {
+			reason = "no-chain"
+		}
 	case !prefixOK:
 		reason = "prefix-mismatch"
 	case !useID:
@@ -326,8 +340,10 @@ func (m *continuationManager) commit(attempt *continuationAttempt, res logResult
 		return
 	}
 	// 供应商明确回 store:false 说明这条响应没有被保存，id 下次多半不可用
-	// （commandcode 偶发这种情况）。不要建链，下一轮重新发一次 store:true。
+	// （commandcode 会成片出现）。不要建链，下一轮重新发一次 store:true，
+	// 同时记下这一事实，让下一轮的 no-chain 能显示成「上游未保存」。
 	if !attempt.dryRun && res.responseStore != nil && !*res.responseStore {
+		m.storeMiss[attempt.chainKey] = m.now()
 		return
 	}
 
@@ -366,6 +382,8 @@ func (m *continuationManager) commit(attempt *continuationAttempt, res logResult
 	if attempt.enabled {
 		delete(m.caps, attempt.scope)
 	}
+	// 这次存上了就不该再提示「上游未保存」。
+	delete(m.storeMiss, attempt.chainKey)
 	m.enforceLimitLocked()
 }
 
@@ -503,6 +521,11 @@ func (m *continuationManager) pruneLocked() {
 	for k, c := range m.caps {
 		if !c.expiresAt.After(now) {
 			delete(m.caps, k)
+		}
+	}
+	for k, ts := range m.storeMiss {
+		if now.Sub(ts) >= continuationStoreMissTTL {
+			delete(m.storeMiss, k)
 		}
 	}
 	m.enforceLimitLocked()
