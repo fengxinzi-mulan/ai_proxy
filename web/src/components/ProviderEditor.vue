@@ -42,6 +42,9 @@ const emit = defineEmits<{
   saved: []
 }>()
 
+/** 抽屉宽度跟随窗口：固定 720px 在窄窗口下会顶满甚至溢出。 */
+const drawerWidth = computed(() => 'min(780px, 94vw)')
+
 const store = useAppStore()
 const message = useMessage()
 const dialog = useDialog()
@@ -419,7 +422,7 @@ function remove() {
 <template>
   <NDrawer
     :show="show"
-    :width="720"
+    :width="drawerWidth"
     placement="right"
     @update:show="emit('update:show', $event)"
   >

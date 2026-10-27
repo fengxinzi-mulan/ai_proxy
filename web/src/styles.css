@@ -1,14 +1,6 @@
-:root {
-  --page-bg: #f5f7fa;
-  --panel-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.06);
-  --radius: 12px;
-  --mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace;
-}
-
-html.dark {
-  --page-bg: #101014;
-  --panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.35);
-}
+/* 全局基础样式：只放 reset、排版与少量通用工具类。
+ * 颜色一律引用 tokens.css 里的变量。
+ */
 
 * {
   box-sizing: border-box;
@@ -22,31 +14,37 @@ body,
 }
 
 body {
-  background: var(--page-bg);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
-    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-  /* 页面切换时不希望出现横向抖动 */
   overflow-x: hidden;
 }
 
-/* 页面最外层容器 */
-.page {
-  /* 底部留一点余量：卡片的投影、描边都画在盒子外面，
-     内容正好顶到滚动容器下沿时这些会被裁掉。 */
-  padding-bottom: 8px;
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 600;
+  color: var(--text);
 }
 
-/* 统一的卡片外观，让各页面的面板观感一致 */
-.panel {
-  border-radius: var(--radius);
-  box-shadow: var(--panel-shadow);
-  background: var(--n-color, #fff);
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+/* 页面最外层容器：底部留余量，避免浮层/描边贴到滚动容器边缘被裁。 */
+.page {
+  padding-bottom: var(--space-2);
 }
 
 .mono {
-  font-family: var(--mono);
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
 }
 
 .num {
@@ -55,9 +53,9 @@ body {
 
 /* 日志报文预览：等宽、可换行、限高 */
 .code-block {
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.6;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-all;
   margin: 0;
@@ -67,23 +65,41 @@ body {
   overflow: auto;
 }
 
-/* 细滚动条，避免在暗色主题下过于突兀 */
+/* 细滚动条 */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.35);
-  border-radius: 4px;
+  background: var(--border-strong);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(128, 128, 128, 0.55);
+  background: var(--text-3);
+  background-clip: padding-box;
 }
 
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-/* 细滚动条，避免在暗色主题下过于突兀 */
+/* 键盘可见焦点：鼠标点击不显示，Tab 导航必须可见 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 尊重系统的减少动效偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

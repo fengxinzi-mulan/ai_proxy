@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v），例如 0.2.1'
+        required: true
+        default: '0.2.0'
+        type: string
+      publish:
+        description: '构建完成后创建 GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = if ("${{ github.ref_type }}" -eq "tag") {
+            "${{ github.ref_name }}".TrimStart('v')
+          } else {
+            "${{ inputs.version }}"
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'version is empty' }
+          "value=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "building version $version"
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm run typecheck
+          npm run build
+
+      - name: Test Go packages
+        run: go test ./...
+
+      - name: Install MinGW (windres)
+        shell: pwsh
+        run: choco install mingw --no-progress -y
+
+      - name: Build Windows resources
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.value }}"
+          $windres = Get-Command windres -ErrorAction SilentlyContinue
+          if (-not $windres) { throw 'windres not found after installing MinGW' }
+          go run ./scripts/gen-icon/main.go
+          go run ./scripts/gen-rc/main.go -version $version
+          Push-Location build/windows
+          & $windres.Source --target=pe-x86-64 -i app.rc -o ../../internal/winres/rsrc_windows_amd64.syso -O coff -c 65001
+          Pop-Location
+
+      - name: Build binaries
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.value }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -trimpath -ldflags "-X ai_proxy/internal/version.Version=$version" -o dist/ai_proxy-server.exe .
+          go build -tags "production desktop" -trimpath -ldflags "-H windowsgui -s -w -X ai_proxy/internal/version.Version=$version" -o dist/ai_proxy-desktop.exe .
+
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          Get-FileHash dist\*.exe -Algorithm SHA256 | ForEach-Object {
+            "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
+          } | Set-Content -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai_proxy-windows-${{ steps.version.outputs.value }}
+          path: |
+            dist/ai_proxy-server.exe
+            dist/ai_proxy-desktop.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag' || inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.value) }}
+          generate_release_notes: true
+          files: |
+            dist/ai_proxy-server.exe
+            dist/ai_proxy-desktop.exe
+            dist/SHA256SUMS.txt

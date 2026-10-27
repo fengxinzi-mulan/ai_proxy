@@ -1,0 +1,119 @@
+/* 设计 token：全站唯一的颜色/间距/字号来源。
+ *
+ * 规则：
+ *  - 组件里只引用变量，不写死色值；图表色走 theme/palette.ts（同一套值）。
+ *  - 亮色用细边框表达层次，不靠阴影；暗色完全不用阴影，只用描边。
+ *  - 字号阶梯固定为 11/12/13/14/16/20/28，不再出现 10px 这类需要眯眼的尺寸。
+ */
+
+:root {
+  color-scheme: light;
+
+  /* 背景与表面 */
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #fafbfc;
+  --surface-hover: #f2f4f7;
+  --surface-active: #eef2f7;
+
+  /* 边框 */
+  --border: #e4e7ec;
+  --border-strong: #d0d5dd;
+
+  /* 文字 */
+  --text: #101828;
+  --text-2: #475467;
+  --text-3: #8a94a6;
+  --text-inverse: #ffffff;
+
+  /* 强调色 */
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-pressed: #1e40af;
+  --accent-soft: #eff4ff;
+  --accent-border: #c7d7fe;
+
+  /* 语义色 */
+  --success: #16a34a;
+  --success-soft: #ecfdf3;
+  --success-border: #abefc6;
+  --warning: #d97706;
+  --warning-soft: #fffaeb;
+  --warning-border: #fedf89;
+  --danger: #dc2626;
+  --danger-soft: #fef3f2;
+  --danger-border: #fecdca;
+  --info: #0e9384;
+  --info-soft: #f0fdf9;
+
+  /* 圆角 */
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 10px;
+
+  /* 间距 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* 字号 */
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 28px;
+
+  /* 阴影：仅用于浮层（下拉、弹窗），普通卡片不用 */
+  --shadow-overlay: 0 8px 24px rgba(16, 24, 40, 0.12), 0 2px 6px rgba(16, 24, 40, 0.06);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --duration: 140ms;
+}
+
+html.dark {
+  color-scheme: dark;
+
+  --bg: #0f1115;
+  --surface: #16191f;
+  --surface-2: #1a1e25;
+  --surface-hover: #1f242c;
+  --surface-active: #242a33;
+
+  --border: #262b33;
+  --border-strong: #343b45;
+
+  --text: #e6e8ec;
+  --text-2: #a4acba;
+  --text-3: #6f7887;
+  --text-inverse: #0f1115;
+
+  --accent: #4f8cff;
+  --accent-hover: #6b9dff;
+  --accent-pressed: #3b7ae8;
+  --accent-soft: #17233a;
+  --accent-border: #24406b;
+
+  --success: #34d399;
+  --success-soft: #10251d;
+  --success-border: #1c4a39;
+  --warning: #fbbf24;
+  --warning-soft: #2a2110;
+  --warning-border: #4d3c14;
+  --danger: #f87171;
+  --danger-soft: #2b1616;
+  --danger-border: #552322;
+  --info: #2dd4bf;
+  --info-soft: #0f2623;
+
+  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.48), 0 2px 6px rgba(0, 0, 0, 0.32);
+}

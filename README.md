@@ -2,7 +2,14 @@
 
 面向 AI 模型供应商的透明代理转发程序。把客户端的 `base_url` 指过来，请求原样转发到上游，
 同时在本地记录每次调用的完整指标：输入 / 缓存 / 输出 token、首 token 耗时、总耗时、TPS、
-HTTP 状态、推理强度等。编译产物是单个可执行文件，管理界面已内嵌其中。
+HTTP 状态、推理强度等。
+
+提供两种形态，共用同一套内核与界面：
+
+- **桌面版**（`ai_proxy-desktop.exe`）：原生窗口，双击即用（Windows）。
+- **服务端版**（`ai_proxy-server.exe`）：命令行启动、监听端口，适合服务器与脚本部署。
+
+两种形态都是单文件，前端资源通过 `go:embed` 内嵌，无需额外部署。
 
 ## 特性
 
@@ -19,7 +26,9 @@ HTTP 状态、推理强度等。编译产物是单个可执行文件，管理界
 
 ## 界面预览
 
-管理界面由程序自己提供，和代理入口共用同一个端口，启动后打开 `http://127.0.0.1:8080/` 即可。
+管理界面由程序自己提供，和代理入口共用同一个端口。桌面版直接开窗显示它；
+服务端版启动后打开 `http://127.0.0.1:8080/` 即可。两种形态看到的是同一套界面。
+
 下面这些截图取自一台本机演示实例（上游指向本地模拟上游），不涉及任何真实账号与密钥。
 
 **仪表盘** —— 请求量、成功率、缓存命中率、token、首 token 耗时与 TPS 的汇总，
@@ -27,8 +36,12 @@ HTTP 状态、推理强度等。编译产物是单个可执行文件，管理界
 
 ![仪表盘](docs/screenshots/dashboard.png)
 
+**暗色主题** —— 亮/暗两套都完整适配（含图表与状态色），也可以跟随系统自动切换。
+
+![仪表盘暗色](docs/screenshots/dashboard-dark.png)
+
 **供应商** —— 一个端口挂多个上游：API 格式、密钥数量、代理方式、自定义标签都摆在卡片上，
-当前生效的那张带绿色描边；配了套餐查询的供应商还会显示剩余额度与各窗口用量。
+当前生效的那张带蓝色左竖条与细描边；配了套餐查询的供应商还会显示剩余额度与各窗口用量。
 
 ![供应商](docs/screenshots/providers.png)
 
@@ -47,7 +60,8 @@ HTTP 状态、推理强度等。编译产物是单个可执行文件，管理界
 ![实时监控](docs/screenshots/live.png)
 
 **设置** —— 监听地址与访问密钥、客户端接入示例、默认超时、日志保留策略；
-另有「全局代理（VPN）」与「全局提示词」两个标签页。
+另有「全局代理（VPN）」「全局提示词」两个标签页。桌面版还会多一个「桌面应用」标签页
+（关闭行为、数据/日志目录、版本号）。
 
 ![设置](docs/screenshots/settings.png)
 
@@ -65,8 +79,26 @@ make release
 build.bat
 ```
 
-`make release` / `build.bat` 会先构建前端（`web/dist`），再把它嵌进 Go 二进制，
-产出 `ai_proxy.exe`（约 18 MB）。
+`make release` / `build.bat` 会先构建前端（`web/dist`），再把它嵌进 Go 二进制。
+`build.bat` 现在产出两份：
+
+| 产物 | 说明 |
+|---|---|
+| `dist\ai_proxy-desktop.exe` | 桌面版，Windows GUI 子系统，带图标与版本信息 |
+| `dist\ai_proxy-server.exe` | 服务端版，控制台子系统，行为与旧版一致 |
+
+`make dist` 等价于 Windows 上的 `build.bat` 双产物构建；`make release` 只产出服务端形态。
+
+桌面版的构建需要多一步 Windows 资源：
+
+```bash
+go run scripts/gen-icon/main.go                  # 生成 build/windows/app.ico
+go run scripts/gen-rc/main.go -version 0.2.0     # 生成 build/windows/app.rc（含版本号）
+cd build/windows && windres --target=pe-x86-64 -i app.rc -o ../../internal/winres/rsrc_windows_amd64.syso -O coff -c 65001
+```
+
+`build.bat` 会自动完成这三步，并自动定位 `windres`（优先 `D:\TDM-GCC-64\bin`）。
+`-c 65001` 不能省：`app.rc` 里的中文是 UTF-8，按默认 ANSI 读会变成 exe 属性里的乱码。
 
 两个脚本都不依赖 PATH 上的 `go`：它们直接调用版本目录里的高版本
 `D:\Program Files\g\versions\1.25.4\bin\go.exe`，并把 `GOROOT` 指到同一目录
@@ -89,7 +121,31 @@ cd web && npm install && npm run build && cd ..
 > 同理，脚本里的外部命令用绝对路径调用 —— 从 Git Bash 启动时 `find` 会解析到 MSYS 的
 > GNU find 而不是 Windows 的。
 
+#### 自动发布
+
+推 `v*` 标签会触发 `.github/workflows/release.yml`，在 `windows-latest` 上构建两个 exe
+并自动创建 GitHub Release：
+
+```bash
+git tag v0.2.1
+git push origin v0.2.1
+```
+
+也可以在 Actions 页面手动运行 `Release` 工作流，填版本号并勾选 `publish` 来发版；
+不勾选时只构建并保留 Actions artifact。Release 附件包含
+`ai_proxy-server.exe`、`ai_proxy-desktop.exe` 与 `SHA256SUMS.txt`。
+
 ### 2. 运行
+
+**桌面版**（推荐）：
+
+```bash
+dist\ai_proxy-desktop.exe
+```
+
+双击即可，不需要命令行参数，也不需要手动打开浏览器。
+
+**服务端版**：
 
 ```bash
 ./ai_proxy.exe
@@ -97,14 +153,42 @@ cd web && npm install && npm run build && cd ..
 
 打开 <http://127.0.0.1:8080/> 进入管理界面。
 
-命令行参数：
+命令行参数（两种形态都接受，桌面版通常不需要）：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `-host` | 设置里的值（127.0.0.1） | 监听地址 |
 | `-port` | 设置里的值（8080） | 监听端口，优先级高于界面设置 |
-| `-data` | `data` | 数据目录，存放 SQLite 数据库 |
+| `-data` | 服务端 `data`；桌面版见下 | 数据目录，存放 SQLite 数据库 |
 | `-debug` | `false` | 输出调试日志 |
+
+#### 桌面版的工作方式
+
+窗口加载的是进程内已经跑起来的本地 HTTP 服务（`http://127.0.0.1:<端口>/`），
+不是另外打包的一套前端。所以**浏览器访问仍然可用**：桌面版运行期间，同机任何程序
+都可以打开同一个地址，也能把它当作代理入口给客户端用。
+
+几个与命令行版不同、需要知道的行为：
+
+| 行为 | 说明 |
+|---|---|
+| 数据目录 | 优先沿用 exe 同目录的 `data\`（若其中已有 `ai_proxy.db`），否则用 `%APPDATA%\ai_proxy`。用 `-data` 可强制指定 |
+| 日志 | 同时写 stdout 与 `<数据目录>\logs\ai_proxy.log`，5 MB 轮转、保留 5 份。GUI 子系统没有控制台，文件日志是排障主入口 |
+| 关闭窗口 | 默认弹三选一：退出 / 托盘运行 / 取消，可勾选记住选择。之后可在「设置 → 桌面应用」修改 |
+| 托盘运行 | 窗口隐藏到系统托盘，**代理继续运行**，客户端连接不中断；双击托盘图标重新打开，右键菜单可退出 |
+| 单实例 | 重复启动只会把已有窗口叫到前台，不会开第二个进程 |
+| 端口占用 | 启动时若端口被占，会询问是否自动换到下一个可用端口；界面上的接入地址始终显示实际端口 |
+| WebView2 | 需要系统安装 Microsoft Edge WebView2 Runtime。Windows 11 与较新的 Windows 10 通常已自带 |
+
+日志里出现 `未检测到 WebView2 Runtime` 时，装一次
+<https://developer.microsoft.com/microsoft-edge/webview2/> 的 Evergreen Runtime 即可。
+
+#### 桌面版的边界
+
+- **暂只支持 Windows**。代码结构已按平台隔离（`internal/desktop` + `desktop_windows.go`），
+  但 Linux 桌面壳尚未实现。Linux 上继续使用服务端版。
+- **不做系统托盘**。「最小化」是隐藏到任务栏，不是收进托盘区。
+- 关闭行为、数据目录、版本号都在「设置 → 桌面应用」里可见可改。
 
 ### 3. 配置供应商
 
@@ -350,16 +434,41 @@ node scripts/mock-upstream.mjs 9911 &
 node scripts/e2e-check.mjs
 ```
 
-前端用 Vite + Vue 3 + TypeScript + Naive UI + ECharts。开发时 Vite 把 `/api` 代理到
-`127.0.0.1:8080`，构建产物由 `go:embed` 打进二进制。
+前端用 Vite + Vue 3 + TypeScript + Naive UI + ECharts，图标用 lucide-vue-next。
+开发时 Vite 把 `/api` 代理到 `127.0.0.1:8080`，构建产物由 `go:embed` 打进二进制。
 
 服务端把「能对应到嵌入文件的路径」返回静态资源，其余路径全部当作转发目标 ——
 所以管理界面与代理入口共用一个端口，且任何上游路径（`/v1/...`、`/v1beta/...`）都无需预先注册。
 
+界面样式遵循两条约定：
+
+- 颜色、间距、字号只从 `web/src/styles/tokens.css` 取，组件里不写死 hex。
+  ECharts 认不了 CSS 变量，序列色另有一份 `web/src/theme/palette.ts`，改色时两处一起改。
+- 卡片统一用 `AppCard`，页面标题统一用 `PageHeader`；不要再各写一份 `box-shadow`。
+
+### 桌面版的开发
+
+```bash
+# 只构建桌面形态（需要先 npm run build 过前端）
+go build -tags "production desktop" -ldflags "-H windowsgui" -o ai_proxy-desktop.exe .
+
+# 调试时保留控制台，方便看日志
+go build -tags "production desktop" -o ai_proxy-desktop-debug.exe .
+```
+
+桌面入口是 `main_desktop.go`（`//go:build desktop && windows`），命令行入口是 `main.go`
+（`//go:build !desktop`），两者共用 `internal/service` 的启动逻辑。
+
+新增桌面能力时注意：`internal/desktop` 里的接口只由桌面入口注册，
+服务端形态根本没有这些路由，所以前端一律先看 `/api/meta` 的 `desktop` 字段再决定是否展示。
+
 ## 目录结构
 
 ```
-main.go                 入口、静态资源与转发的分发、日志清理后台任务
+main.go                 服务端入口（build tag: !desktop）
+main_desktop.go         桌面入口（build tag: desktop && windows）
+desktop_platform_windows.go  单实例互斥量、窗口激活、WebView2 检测、原生弹窗
+desktop_platform_other.go    非 Windows 的桩实现
 console_windows.go      把 Windows 控制台切到 UTF-8，避免中文日志乱码
 internal/
   model/                全局数据结构
@@ -374,14 +483,25 @@ internal/
     live.go               进行中请求注册表
   api/                  管理接口与 SSE 推送
   hub/                  进程内事件广播
+  service/              服务生命周期：先 Listen 再建路由、可 Shutdown、后台任务可等待
+    datadir.go            数据目录解析（桌面版优先沿用 exe 同级 data）
+  desktop/              桌面壳：配置持久化、桌面专属 API、打开目录
+  logging/              文件日志与轮转（桌面版没有控制台，靠它排障）
+  version/              构建版本号（-ldflags 注入）
+  winres/               Windows 图标与版本信息（.syso，仅桌面入口引用）
 web/                    前端源码（构建产物 web/dist 被 embed）
+web/src/styles/tokens.css   设计 token：颜色/间距/字号/圆角
+web/src/theme/          图表调色板与 Naive UI 主题覆盖
 scripts/mock-upstream.mjs  本地模拟上游
 scripts/e2e-check.mjs      端到端验收脚本
+scripts/gen-icon/          生成应用图标（多尺寸 ICO）
+scripts/gen-rc/            生成 Windows 资源脚本（含版本号）
 ```
 
 ## 已知边界
 
 - 只做转发与记账，**不在协议格式之间转换**。上游是什么格式，客户端就得用什么格式。
+- 桌面版暂只支持 Windows；Linux 继续用服务端版。
 - 主动去掉转发请求里的 `Accept-Encoding`：压缩后的响应无法旁路解析用量，而用量统计是本程序的
   核心功能。上游因此返回未压缩内容，客户端也会收到未压缩内容。
 - 请求体需要完整读入内存才能改写与记账，硬上限 128 MB。

@@ -12,6 +12,7 @@ export interface EventHandlers {
   onLive?: (items: Extract<ProxyEvent, { type: 'live' }>['data']) => void
   onProvidersChanged?: () => void
   onSettingsChanged?: (s: Extract<ProxyEvent, { type: 'settings' }>['data']) => void
+  onDesktopCloseAsk?: () => void
 }
 
 export function useEvents(handlers: EventHandlers) {
@@ -52,6 +53,9 @@ export function useEvents(handlers: EventHandlers) {
           break
         case 'settings':
           handlers.onSettingsChanged?.(payload.data)
+          break
+        case 'desktop-close-ask':
+          handlers.onDesktopCloseAsk?.()
           break
       }
     }

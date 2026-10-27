@@ -159,5 +159,43 @@ export const api = {
   live: () => request<import('@/types').LiveRequest[]>('/api/live'),
 }
 
+/* ---------- 桌面专属接口 ---------- */
+
+/** 桌面壳配置：关闭窗口行为。 */
+export interface DesktopConfig {
+  closeAction: 'ask' | 'quit' | 'tray'
+}
+
+export interface DesktopInfo {
+  dataDir: string
+  logDir: string
+  dbPath: string
+}
+
+export type DesktopCloseAction = 'quit' | 'tray' | 'cancel'
+
+export interface DesktopCloseRequest {
+  action: DesktopCloseAction
+  remember: boolean
+}
+
+/**
+ * 只有桌面窗口才会注册这些路由（见 internal/desktop/api.go）。
+ * 浏览器访问时调用会拿到 404，因此调用方必须先用 meta.desktop 判断。
+ */
+export const desktopApi = {
+  getSettings: () => request<DesktopConfig>('/api/desktop/settings'),
+  saveSettings: (c: DesktopConfig) =>
+    request<DesktopConfig>('/api/desktop/settings', { method: 'PUT', body: JSON.stringify(c) }),
+  info: () => request<DesktopInfo>('/api/desktop/info'),
+  close: (req: DesktopCloseRequest) =>
+    request<{ ok: boolean }>('/api/desktop/close', { method: 'POST', body: JSON.stringify(req) }),
+  open: (target: 'data' | 'logs') =>
+    request<{ ok: boolean; path: string }>('/api/desktop/open', {
+      method: 'POST',
+      body: JSON.stringify({ target }),
+    }),
+}
+
 export { API_FORMAT_LABELS as formatLabels } from '@/types'
 export type { APIFormat }

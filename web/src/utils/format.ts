@@ -1,5 +1,7 @@
 // 界面上的格式化工具。集中放在这里，保证各页面的数字口径一致。
 
+import { gradePalette } from '@/theme/palette'
+
 /** 把毫秒格式化成便于扫读的形式。 */
 export function formatDuration(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || ms <= 0) return '—'
@@ -46,12 +48,15 @@ export type Grade = 'excellent' | 'good' | 'fair' | 'poor'
  * 「绿」如果在列表里表示优秀、在总览里表示另一件事，颜色就不再是信息，
  * 只是装饰。中间两档用蓝色而不是灰色 —— 灰色读起来像「没有数据」，
  * 把「正常」和「没测到」混在一起同样是失去意义。
+ *
+ * 具体色值来自 theme/palette.ts，与图表、状态标签共用同一套；
+ * 亮暗两套由 CSS 变量承担，这里只暴露亮色值供内联样式/图表使用。
  */
 export const GRADE_STYLE: Record<Grade, { label: string; color: string }> = {
-  excellent: { label: '优秀', color: '#18a058' },
-  good: { label: '良好', color: '#2080f0' },
-  fair: { label: '一般', color: '#f0a020' },
-  poor: { label: '差', color: '#d03050' },
+  excellent: { label: '优秀', color: gradePalette(false).good },
+  good: { label: '良好', color: gradePalette(false).ok },
+  fair: { label: '一般', color: gradePalette(false).warn },
+  poor: { label: '差', color: gradePalette(false).bad },
 }
 
 /** 一个指标的档位边界。better 说明数值往哪个方向算好。 */
@@ -153,10 +158,11 @@ export const reasoningTokenColor = (v: number) => metricColor(v, 'reasoningToken
  * 其实那一刻没有任何信息。
  */
 export function quotaColor(percent: number): string {
-  if (percent <= 0) return 'rgba(128, 128, 128, 0.9)'
-  if (percent >= 85) return '#d03050'
-  if (percent >= 60) return '#f0a020'
-  return '#18a058'
+  const p = gradePalette(false)
+  if (percent <= 0) return p.muted
+  if (percent >= 85) return p.bad
+  if (percent >= 60) return p.warn
+  return p.good
 }
 
 /**

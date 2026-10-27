@@ -363,6 +363,10 @@ export interface MetaInfo {
   liveCount: number
   /** 进程实际监听的地址，可能与设置里的值不同（命令行参数优先）。 */
   listen: { host: string; port: number }
+  /** 构建版本号；桌面版用于设置页展示。 */
+  version?: string
+  /** 是否运行在桌面窗口里。为 true 时才显示「桌面应用」设置页。 */
+  desktop?: boolean
 }
 
 /** 后端通过 SSE 推送的事件。 */
@@ -372,3 +376,4 @@ export type ProxyEvent =
   | { type: 'settings'; data: Settings }
   | { type: 'providers'; data: unknown }
   | { type: 'logs-cleared'; data: { deleted: number } }
+  | { type: 'desktop-close-ask'; data: null }

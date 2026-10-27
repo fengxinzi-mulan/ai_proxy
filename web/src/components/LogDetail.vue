@@ -41,6 +41,9 @@ const props = defineProps<{
 
 const emit = defineEmits<{ 'update:show': [boolean] }>()
 
+/** 抽屉宽度跟随窗口：窄窗口下不能固定 820px 顶满屏幕。 */
+const drawerWidth = computed(() => 'min(880px, 92vw)')
+
 const message = useMessage()
 const log = ref<RequestLog | null>(null)
 const loading = ref(false)
@@ -92,7 +95,7 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
 </script>
 
 <template>
-  <NDrawer :show="show" :width="820" placement="right" @update:show="emit('update:show', $event)">
+  <NDrawer :show="show" :width="drawerWidth" placement="right" @update:show="emit('update:show', $event)">
     <NDrawerContent :title="log ? `请求详情 #${log.id}` : '请求详情'" closable>
       <NSpin :show="loading">
         <NEmpty v-if="!loading && !log" description="未找到该记录" style="padding: 60px 0" />
@@ -281,16 +284,16 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
 }
 
 .cont-detail {
-  font-size: 12px;
-  opacity: 0.75;
+  font-size: var(--text-xs);
+  color: var(--text-2);
 }
 
 .block-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 12px;
-  opacity: 0.72;
+  font-size: var(--text-xs);
+  color: var(--text-3);
   margin-bottom: 6px;
 }
 
@@ -299,7 +302,8 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
 }
 
 .code-block {
-  background: rgba(128, 128, 128, 0.09);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 12px;
   max-height: 460px;
@@ -317,10 +321,10 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
 }
 
 .code-block.before {
-  border-left: 3px solid #f0a020;
+  border-left: 3px solid var(--warning);
 }
 
 .code-block.after {
-  border-left: 3px solid #18a058;
+  border-left: 3px solid var(--success);
 }
 </style>

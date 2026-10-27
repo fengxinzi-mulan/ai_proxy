@@ -1,9 +1,19 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { computed, ref } from 'vue'
 import { api } from '@/api'
 import type { LiveRequest, MetaInfo, Provider, Settings, UsageSnapshot } from '@/types'
 
 const THEME_STORAGE = 'ai-proxy-theme'
+
+/** 主题模式：跟随系统 / 强制亮 / 强制暗。 */
+export type ThemeMode = 'system' | 'light' | 'dark'
+
+function readStoredMode(): ThemeMode {
+  const v = localStorage.getItem(THEME_STORAGE)
+  if (v === 'light' || v === 'dark' || v === 'system') return v
+  // 旧版本只存了 dark/light；没有记录时默认跟随系统。
+  return 'system'
+}
 
 /** 全局状态：设置、供应商列表、进行中的请求、主题。 */
 export const useAppStore = defineStore('app', () => {
@@ -18,7 +28,17 @@ export const useAppStore = defineStore('app', () => {
   // 放在 providers 的每一项上即可（见 Provider.usage）。这里只维护「谁正在手动刷新」。
   const usageRefreshing = ref<Record<number, boolean>>({})
 
-  const dark = ref(localStorage.getItem(THEME_STORAGE) === 'dark')
+  const themeMode = ref<ThemeMode>(readStoredMode())
+  const systemDark = ref(
+    typeof window !== 'undefined' && window.matchMedia
+      ? window.matchMedia('(prefers-color-scheme: dark)').matches
+      : false,
+  )
+
+  /** 当前实际是否暗色：mode 为 system 时看系统偏好。 */
+  const dark = computed(() =>
+    themeMode.value === 'system' ? systemDark.value : themeMode.value === 'dark',
+  )
 
   const activeProvider = computed(
     () => providers.value.find((p) => p.active && p.enabled) ?? providers.value.find((p) => p.enabled),
@@ -33,13 +53,35 @@ export const useAppStore = defineStore('app', () => {
     return `http://${shown}:${port}`
   })
 
-  function applyTheme() {
-    document.documentElement.classList.toggle('dark', dark.value)
-    localStorage.setItem(THEME_STORAGE, dark.value ? 'dark' : 'light')
+  const isDesktop = computed(() => !!meta.value?.desktop)
+  const version = computed(() => meta.value?.version || '')
+
+  /** 跟随系统主题变化。只在 mode=system 时影响实际配色。 */
+  function watchSystemTheme() {
+    if (typeof window === 'undefined' || !window.matchMedia) return
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const onChange = (e: MediaQueryListEvent) => {
+      systemDark.value = e.matches
+      applyTheme()
+    }
+    mq.addEventListener('change', onChange)
   }
 
-  function toggleTheme() {
-    dark.value = !dark.value
+  function applyTheme() {
+    document.documentElement.classList.toggle('dark', dark.value)
+    localStorage.setItem(THEME_STORAGE, themeMode.value)
+  }
+
+  /** 在 system → light → dark 之间循环。 */
+  function cycleTheme() {
+    const order: ThemeMode[] = ['system', 'light', 'dark']
+    const i = order.indexOf(themeMode.value)
+    themeMode.value = order[(i + 1) % order.length]
+    applyTheme()
+  }
+
+  function setThemeMode(mode: ThemeMode) {
+    themeMode.value = mode
     applyTheme()
   }
 
@@ -127,13 +169,18 @@ export const useAppStore = defineStore('app', () => {
     meta,
     loading,
     error,
+    themeMode,
     dark,
+    isDesktop,
+    version,
     usageRefreshing,
     activeProvider,
     enabledProviders,
     listenBaseURL,
+    watchSystemTheme,
     applyTheme,
-    toggleTheme,
+    cycleTheme,
+    setThemeMode,
     bootstrap,
     reloadProviders,
     reloadSettings,

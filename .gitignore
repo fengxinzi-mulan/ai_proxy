@@ -2,6 +2,11 @@
 /ai_proxy
 /ai_proxy.exe
 *.exe
+/dist/
+
+# Windows 资源中间产物（.ico/.rc 由 scripts 生成，编译好的 .syso 在 internal/winres
+# 里入库，这样没装 windres 的机器也能直接构建桌面版）
+/build/
 
 # 运行时数据（SQLite 数据库）
 /data/

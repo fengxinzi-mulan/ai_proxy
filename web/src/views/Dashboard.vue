@@ -2,25 +2,26 @@
 import { computed, h, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  NCard,
-  NGrid,
-  NGridItem,
   NSelect,
-  NSpace,
   NButton,
   NSpin,
   NEmpty,
   NDataTable,
   NAlert,
   NTooltip,
+  NIcon,
   useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import type { EChartsOption } from 'echarts'
+import { RefreshCw } from 'lucide-vue-next'
 import StatCard from '@/components/StatCard.vue'
 import EChart from '@/components/EChart.vue'
+import PageHeader from '@/components/PageHeader.vue'
+import AppCard from '@/components/AppCard.vue'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
+import { chartPalette } from '@/theme/palette'
 import {
   cacheRateColor,
   successRateColor,
@@ -147,6 +148,7 @@ function axisTooltip(labels: string[], valueFmt: Record<string, (v: number) => s
 
 /** 请求量与 token 的双轴趋势图。 */
 const trendOption = computed<EChartsOption>(() => {
+  const pal = chartPalette(store.dark)
   const labels = points.value.map((p) => formatBucketLabel(p.bucket))
   // 悬浮提示按系列分派格式：token 量级动辄几千万，原样显示会把提示框撑得读不下去。
   const valueFmt: Record<string, (v: number) => string> = {
@@ -167,16 +169,17 @@ const trendOption = computed<EChartsOption>(() => {
       data: ['请求数', '失败数', '输入 token', '缓存 token', '输出 token', '缓存命中率'],
       top: 0,
       itemGap: 12,
-      textStyle: { fontSize: 11 },
     },
     // 左右各留 56px 就够：左边只画 token 刻度（短格式，最宽「80M」），
     // 右边只有一个百分比轴。顶部留 56px 是因为窄窗口下 6 项图例会折成两行，
     // 留窄了会压到绘图区上沿。
-    grid: { left: 56, right: 56, top: 56, bottom: 40 },
+    grid: { left: 56, right: 56, top: 56, bottom: 36 },
     xAxis: {
       type: 'category',
       data: labels,
-      axisLabel: { hideOverlap: true },
+      axisLabel: { hideOverlap: true, color: pal.axisLabel },
+      axisLine: { lineStyle: { color: pal.axisLine } },
+      axisTick: { show: false },
     },
     // 只有两个轴写 name：图例已经逐条标注了系列名，再写轴名在窄窗口下会互相重叠。
     // 单位直接体现在刻度上（命中率轴补 %，token 轴走短格式）。
@@ -188,8 +191,13 @@ const trendOption = computed<EChartsOption>(() => {
       {
         type: 'value',
         position: 'left',
-        axisLabel: { formatter: (v: number) => formatCompact(v) },
-        axisPointer: { label: { formatter: (p: { value: unknown }) => formatCompact(Number(p.value)) } },
+        axisLabel: { formatter: (v: number) => formatCompact(v), color: pal.axisLabel },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: pal.splitLine, type: 'dashed' } },
+        axisPointer: {
+          label: { formatter: (p: { value: unknown }) => formatCompact(Number(p.value)) },
+        },
       },
       {
         type: 'value',
@@ -197,7 +205,9 @@ const trendOption = computed<EChartsOption>(() => {
         max: 100,
         position: 'right',
         splitLine: { show: false },
-        axisLabel: { formatter: '{value}%' },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { formatter: '{value}%', color: pal.axisLabel },
         axisPointer: {
           label: { formatter: (p: { value: unknown }) => formatPercent(Number(p.value), 0) },
         },
@@ -211,7 +221,7 @@ const trendOption = computed<EChartsOption>(() => {
         // 单个数据桶时限制柱宽，否则一根柱子会横跨整个绘图区，看着很怪。
         barMaxWidth: 42,
         data: points.value.map((p) => p.requests - p.failed),
-        itemStyle: { color: '#2082ff' },
+        itemStyle: { color: pal.series[0] },
       },
       {
         name: '失败数',
@@ -219,7 +229,7 @@ const trendOption = computed<EChartsOption>(() => {
         stack: 'req',
         barMaxWidth: 42,
         data: points.value.map((p) => p.failed),
-        itemStyle: { color: '#d03050' },
+        itemStyle: { color: pal.series[3] },
       },
       {
         name: '输入 token',
@@ -227,7 +237,8 @@ const trendOption = computed<EChartsOption>(() => {
         smooth: true,
         yAxisIndex: 1,
         data: points.value.map((p) => p.promptTokens),
-        itemStyle: { color: '#18a058' },
+        itemStyle: { color: pal.series[1] },
+        showSymbol: false,
       },
       {
         name: '缓存 token',
@@ -235,7 +246,8 @@ const trendOption = computed<EChartsOption>(() => {
         smooth: true,
         yAxisIndex: 1,
         data: points.value.map((p) => p.cachedTokens),
-        itemStyle: { color: '#f0a020' },
+        itemStyle: { color: pal.series[2] },
+        showSymbol: false,
       },
       {
         name: '输出 token',
@@ -243,7 +255,8 @@ const trendOption = computed<EChartsOption>(() => {
         smooth: true,
         yAxisIndex: 1,
         data: points.value.map((p) => p.completionTokens),
-        itemStyle: { color: '#7c4dff' },
+        itemStyle: { color: pal.series[4] },
+        showSymbol: false,
       },
       {
         // 命中率是百分比，需要独立的 0–100 轴，否则会被 token 量级压成一条平线。
@@ -253,8 +266,9 @@ const trendOption = computed<EChartsOption>(() => {
         smooth: true,
         yAxisIndex: 2,
         data: points.value.map((p) => (p.promptTokens > 0 ? Number(p.cacheHitRate.toFixed(1)) : null)),
-        itemStyle: { color: '#13c2c2' },
+        itemStyle: { color: pal.series[5] },
         lineStyle: { type: 'dashed', width: 2 },
+        showSymbol: false,
       },
     ],
   }
@@ -262,6 +276,7 @@ const trendOption = computed<EChartsOption>(() => {
 
 /** 性能趋势：首 token 耗时（秒）与 TPS。 */
 const perfOption = computed<EChartsOption>(() => {
+  const pal = chartPalette(store.dark)
   const labels = points.value.map((p) => formatBucketLabel(p.bucket))
   const valueFmt: Record<string, (v: number) => string> = {
     '平均首 token': (v) => `${v.toFixed(2)} s`,
@@ -272,15 +287,33 @@ const perfOption = computed<EChartsOption>(() => {
     legend: { data: ['平均首 token', '平均 TPS'], top: 0 },
     // 左轴用秒而不是毫秒：几秒级的读数比四位数毫秒好认，也和指标卡、
     // 模型排行里的「4.02 s」是同一个口径。
-    grid: { left: 60, right: 60, top: 44, bottom: 40 },
+    grid: { left: 52, right: 56, top: 40, bottom: 36 },
     xAxis: {
       type: 'category',
       data: labels,
-      axisLabel: { hideOverlap: true },
+      axisLabel: { hideOverlap: true, color: pal.axisLabel },
+      axisLine: { lineStyle: { color: pal.axisLine } },
+      axisTick: { show: false },
     },
     yAxis: [
-      { type: 'value', name: 's' },
-      { type: 'value', name: 'token/s' },
+      {
+        type: 'value',
+        name: 's',
+        nameTextStyle: { color: pal.axisLabel },
+        axisLabel: { color: pal.axisLabel },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: pal.splitLine, type: 'dashed' } },
+      },
+      {
+        type: 'value',
+        name: 'token/s',
+        nameTextStyle: { color: pal.axisLabel },
+        axisLabel: { color: pal.axisLabel },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { show: false },
+      },
     ],
     series: [
       {
@@ -288,7 +321,8 @@ const perfOption = computed<EChartsOption>(() => {
         type: 'line',
         smooth: true,
         data: points.value.map((p) => Number((p.avgTtftMs / 1000).toFixed(2))),
-        itemStyle: { color: '#f0a020' },
+        itemStyle: { color: pal.series[2] },
+        showSymbol: false,
       },
       {
         name: '平均 TPS',
@@ -296,31 +330,39 @@ const perfOption = computed<EChartsOption>(() => {
         smooth: true,
         yAxisIndex: 1,
         data: points.value.map((p) => Number(p.avgTps.toFixed(1))),
-        itemStyle: { color: '#18a058' },
+        itemStyle: { color: pal.series[1] },
+        showSymbol: false,
       },
     ],
   }
 })
 
-const providerShareOption = computed<EChartsOption>(() => ({
-  tooltip: { trigger: 'item', formatter: '{b}: {c} 次 ({d}%)' },
-  legend: { bottom: 0, type: 'scroll' },
-  series: [
-    {
-      type: 'pie',
-      radius: ['46%', '70%'],
-      avoidLabelOverlap: true,
-      itemStyle: { borderRadius: 6, borderWidth: 2, borderColor: 'transparent' },
-      label: { show: false },
-      data: byProvider.value.map((p) => ({
-        // providerId 为 0 表示请求没能匹配到任何供应商（例如短名写错），
-        // 直接显示 #0 会让人摸不着头脑。
-        name: p.providerName || (p.providerId ? `#${p.providerId}` : '未匹配供应商'),
-        value: p.requests,
-      })),
+const providerShareOption = computed<EChartsOption>(() => {
+  const pal = chartPalette(store.dark)
+  return {
+    tooltip: { trigger: 'item', formatter: '{b}: {c} 次 ({d}%)' },
+    legend: {
+      bottom: 0,
+      type: 'scroll',
+      textStyle: { color: pal.legendText },
     },
-  ],
-}))
+    series: [
+      {
+        type: 'pie',
+        radius: ['48%', '72%'],
+        avoidLabelOverlap: true,
+        itemStyle: { borderRadius: 4, borderWidth: 2, borderColor: 'transparent' },
+        label: { show: false },
+        data: byProvider.value.map((p) => ({
+          // providerId 为 0 表示请求没能匹配到任何供应商（例如短名写错），
+          // 直接显示 #0 会让人摸不着头脑。
+          name: p.providerName || (p.providerId ? `#${p.providerId}` : '未匹配供应商'),
+          value: p.requests,
+        })),
+      },
+    ],
+  }
+})
 
 const modelColumns: DataTableColumns<ModelStatsRow> = [
   { title: '模型', key: 'model', ellipsis: { tooltip: true } },
@@ -332,8 +374,8 @@ const modelColumns: DataTableColumns<ModelStatsRow> = [
     width: 70,
     render: (r) =>
       r.failed
-        ? h('span', { style: 'color:#d03050' }, String(r.failed))
-        : h('span', { style: 'opacity:.4' }, '0'),
+        ? h('span', { class: 'num', style: 'color:var(--danger)' }, String(r.failed))
+        : h('span', { style: 'color:var(--text-3)' }, '0'),
   },
   {
     title: '输出 token',
@@ -355,10 +397,13 @@ const modelColumns: DataTableColumns<ModelStatsRow> = [
       r.promptTokens
         ? h(
             'span',
-            { class: 'num', style: r.cacheHitRate >= 50 ? 'color:#18a058' : undefined },
+            {
+              class: 'num',
+              style: r.cacheHitRate >= 50 ? 'color:var(--success)' : undefined,
+            },
             formatPercent(r.cacheHitRate, 1),
           )
-        : h('span', { style: 'opacity:.35' }, '—'),
+        : h('span', { style: 'color:var(--text-3)' }, '—'),
   },
   {
     title: '首 token',
@@ -373,20 +418,22 @@ const modelColumns: DataTableColumns<ModelStatsRow> = [
 
 <template>
   <div class="page">
-    <div class="page-head">
-      <div>
-        <h2>仪表盘</h2>
-        <p class="sub">
-          统计的是经过本代理的请求。成功率要求 HTTP 2xx 且流式响应正常收尾。
-        </p>
-      </div>
-      <NSpace align="center">
-        <NSelect v-model:value="range" :options="RANGES" style="width: 150px" @update:value="load" />
-        <NButton :loading="loading" @click="load">刷新</NButton>
-      </NSpace>
-    </div>
+    <PageHeader
+      title="仪表盘"
+      description="统计的是经过本代理的请求。成功率要求 HTTP 2xx 且流式响应正常收尾。"
+    >
+      <template #actions>
+        <NSelect v-model:value="range" :options="RANGES" class="range-select" @update:value="load" />
+        <NButton :loading="loading" @click="load">
+          <template #icon>
+            <NIcon :size="15"><RefreshCw /></NIcon>
+          </template>
+          刷新
+        </NButton>
+      </template>
+    </PageHeader>
 
-    <NAlert v-if="!store.providers.length" type="warning" :bordered="false" style="margin-bottom: 16px">
+    <NAlert v-if="!store.providers.length" type="warning" :bordered="false" class="providers-alert">
       还没有配置任何供应商。
       <NButton text type="primary" @click="router.push('/providers')">去添加</NButton>
     </NAlert>
@@ -430,92 +477,87 @@ const modelColumns: DataTableColumns<ModelStatsRow> = [
       />
     </div>
 
-    <NGrid :cols="24" :x-gap="12" :y-gap="12" style="margin-top: 12px">
-      <NGridItem :span="16">
-        <NCard size="small" title="请求与 token 趋势" :bordered="false" class="chart-card">
-          <NSpin :show="loading">
-            <NEmpty v-if="!points.length" description="该时间段内没有请求" style="padding: 60px 0" />
-            <EChart v-else :option="trendOption" height="300px" />
-          </NSpin>
-        </NCard>
-      </NGridItem>
-      <NGridItem :span="8">
-        <NCard size="small" title="供应商请求占比" :bordered="false" class="chart-card">
-          <NSpin :show="loading">
-            <NEmpty v-if="!byProvider.length" description="暂无数据" style="padding: 60px 0" />
-            <EChart v-else :option="providerShareOption" height="300px" />
-          </NSpin>
-        </NCard>
-      </NGridItem>
-    </NGrid>
-
-    <NGrid :cols="24" :x-gap="12" :y-gap="12" style="margin-top: 12px">
-      <NGridItem :span="12">
-        <NCard size="small" title="性能趋势" :bordered="false" class="chart-card">
-          <NSpin :show="loading">
-            <NEmpty v-if="!points.length" description="暂无数据" style="padding: 60px 0" />
-            <EChart v-else :option="perfOption" height="260px" />
-          </NSpin>
-        </NCard>
-      </NGridItem>
-      <NGridItem :span="12">
-        <NCard size="small" title="模型排行" :bordered="false" class="chart-card">
-          <NDataTable
-            :columns="modelColumns"
-            :data="byModel"
-            :loading="loading"
-            :bordered="false"
-            size="small"
-            :max-height="260"
-            :row-key="(r: ModelStatsRow) => r.model"
-          />
-        </NCard>
-      </NGridItem>
-    </NGrid>
+    <div class="chart-grid">
+      <AppCard title="请求与 token 趋势" class="span-2">
+        <NSpin :show="loading">
+          <NEmpty v-if="!points.length" description="该时间段内没有请求" class="chart-empty" />
+          <EChart v-else :option="trendOption" height="300px" />
+        </NSpin>
+      </AppCard>
+      <AppCard title="供应商请求占比">
+        <NSpin :show="loading">
+          <NEmpty v-if="!byProvider.length" description="暂无数据" class="chart-empty" />
+          <EChart v-else :option="providerShareOption" height="300px" />
+        </NSpin>
+      </AppCard>
+      <AppCard title="性能趋势">
+        <NSpin :show="loading">
+          <NEmpty v-if="!points.length" description="暂无数据" class="chart-empty" />
+          <EChart v-else :option="perfOption" height="260px" />
+        </NSpin>
+      </AppCard>
+      <AppCard title="模型排行">
+        <NDataTable
+          :columns="modelColumns"
+          :data="byModel"
+          :loading="loading"
+          :bordered="false"
+          size="small"
+          :max-height="260"
+          :row-key="(r: ModelStatsRow) => r.model"
+        />
+      </AppCard>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .page {
-  max-width: 1560px;
+  width: 100%;
+  max-width: 1600px;
   margin: 0 auto;
 }
 
-.page-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
+.range-select {
+  width: 140px;
 }
 
-h2 {
-  margin: 0 0 4px;
-  font-size: 20px;
-  font-weight: 600;
-}
-
-.sub {
-  margin: 0;
-  font-size: 12px;
-  opacity: 0.6;
+.providers-alert {
+  margin-bottom: var(--space-4);
 }
 
 .stat-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
-  gap: 12px;
-  margin-top: 12px;
+  /* 7 个指标在常见窗口宽度下要能排成一行，避免最后一张落单。
+     140px 是最小可用宽度（26px 的数字和 11px 的标签都仍不换行）；
+     更窄时才退化成两行。 */
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-3);
 }
 
-.chart-card {
-  border-radius: 12px;
-  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.06);
+/* 图表区：宽屏两列，窄屏自动塌成一列；趋势图占两列。 */
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-3);
 }
 
-/* 让卡片撑满栅格行高：否则内容少的卡片（比如只有几行的模型排行）
-   底部会明显短于同排的图表卡，一排卡片的底边参差不齐。 */
-.chart-card {
-  height: 100%;
+.chart-grid > :deep(.span-2) {
+  grid-column: span 2;
+}
+
+@media (max-width: 1180px) {
+  .chart-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chart-grid > :deep(.span-2) {
+    grid-column: span 1;
+  }
+}
+
+.chart-empty {
+  padding: 60px 0;
 }
 </style>

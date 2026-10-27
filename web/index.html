@@ -3,8 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232082ff'/%3E%3Cpath d='M9 21l4-10 3 7 2-4 5 7z' fill='white'/%3E%3C/svg%3E" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M6 21l6-8 4 5 8-10' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <title>AI Proxy · 模型供应商代理</title>
+    <script>
+      // 在 CSS 加载前决定配色，避免暗色用户看到一帧白底。
+      // 与 stores/app.ts 的读取逻辑保持一致：system 时看系统偏好。
+      ;(function () {
+        try {
+          var mode = localStorage.getItem('ai-proxy-theme') || 'system'
+          var dark =
+            mode === 'dark' ||
+            (mode === 'system' &&
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) document.documentElement.classList.add('dark')
+        } catch (e) {}
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

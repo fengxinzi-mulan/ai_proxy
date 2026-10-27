@@ -141,7 +141,7 @@ onBeforeUnmount(() => window.clearTimeout(resetTimer))
 }
 
 .icon.ok {
-  color: #18a058;
+  color: var(--success);
   opacity: 1;
 }
 

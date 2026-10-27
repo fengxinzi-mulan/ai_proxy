@@ -1,5 +1,7 @@
 @echo off
-REM Build script: build the frontend, then embed it into a single Go binary.
+REM Build script: build the frontend once, then produce two binaries:
+REM   dist\ai_proxy-server.exe   console / server form (unchanged behaviour)
+REM   dist\ai_proxy-desktop.exe  native window desktop app (GUI subsystem)
 REM
 REM NOTE: this file is deliberately ASCII-only. cmd.exe reads .bat files using the
 REM console OEM code page (936/GBK on Chinese Windows) and does NOT understand
@@ -16,8 +18,9 @@ setlocal
 cd /d "%~dp0"
 
 set "SYS=%SystemRoot%\System32"
+set "VER=0.2.0"
 
-echo [1/3] Checking toolchain...
+echo [1/4] Checking toolchain...
 "%SYS%\where.exe" npm >nul 2>nul || (echo   ERROR: "npm" not found in PATH. & goto :fail)
 
 REM Use a specific Go from the version directory rather than PATH's "go". The
@@ -54,16 +57,8 @@ if %GO_MAJOR% LSS 2 if %GO_MINOR% LSS 25 (
 )
 for /f %%v in ('node --version') do echo   node %%v
 
-REM Stopping a running instance first is the safe move: on Windows the linker often
-REM cannot replace the executable while a process has it open, and whether it
-REM succeeds is not predictable. So remember whether it was running, and give a
-REM precise hint if the build then fails.
-set RUNNING=0
-"%SYS%\tasklist.exe" /fi "imagename eq ai_proxy.exe" /nh 2>nul | "%SYS%\findstr.exe" /i "ai_proxy.exe" >nul
-if not errorlevel 1 set RUNNING=1
-
 echo.
-echo [2/3] Building frontend...
+echo [2/4] Building frontend...
 if not exist "web\node_modules" (
   echo   installing dependencies ^(first run, may take a while^)...
   pushd web
@@ -71,32 +66,49 @@ if not exist "web\node_modules" (
   popd
 )
 pushd web
+call npm run typecheck || (popd & goto :fail)
 call npm run build || (popd & goto :fail)
 popd
 
 echo.
-echo [3/3] Building backend...
-"%GO%" build -o ai_proxy.exe .
-if errorlevel 1 (
-  echo.
-  if "%RUNNING%"=="1" (
-    echo   ai_proxy.exe is running and Windows would not let the linker replace it.
-    echo   Stop the program, then run this script again.
-  ) else (
-    echo   See the compiler output above for the cause.
+echo [3/4] Building Windows resources...
+REM Pass the .go file explicitly instead of a package path: after the frontend
+REM step cmd.exe may still be resolving relative package patterns from web\,
+REM which makes "go run ./scripts/gen-icon" look under the toolchain's src tree.
+"%GO%" run scripts\gen-icon\main.go || goto :fail
+"%GO%" run scripts\gen-rc\main.go -version %VER% || goto :fail
+set "WINDRES="
+if exist "D:\TDM-GCC-64\bin\windres.exe" set "WINDRES=D:\TDM-GCC-64\bin\windres.exe"
+if not defined WINDRES (
+  for /f "delims=" %%w in ('"%SYS%\where.exe" windres 2^>nul') do (
+    if not defined WINDRES set "WINDRES=%%w"
   )
-  goto :fail
+)
+if defined WINDRES (
+  pushd build\windows
+  REM -c 65001: app.rc holds UTF-8 Chinese text; without it windres reads the
+  REM file as ANSI and the exe's FileDescription shows mojibake.
+  "%WINDRES%" --target=pe-x86-64 -i app.rc -o ..\..\internal\winres\rsrc_windows_amd64.syso -O coff -c 65001 || (popd & goto :fail)
+  popd
+  echo   resources compiled
+) else (
+  echo   WARNING: windres not found, reusing existing .syso ^(icon/version may be stale^).
 )
 
-if "%RUNNING%"=="1" (
-  echo.
-  echo   NOTE: the instance that was running still uses the OLD code. Restart it.
-)
+if not exist "dist" mkdir dist
 
 echo.
-echo Done: ai_proxy.exe
-echo Run:  ai_proxy.exe -data data
-echo Open: http://127.0.0.1:8080/
+echo [4/4] Building binaries...
+"%GO%" build -trimpath -ldflags "-X ai_proxy/internal/version.Version=%VER%" -o dist\ai_proxy-server.exe . || goto :fail
+"%GO%" build -tags "production desktop" -trimpath -ldflags "-H windowsgui -s -w -X ai_proxy/internal/version.Version=%VER%" -o dist\ai_proxy-desktop.exe . || goto :fail
+
+echo.
+echo Done:
+echo   dist\ai_proxy-server.exe   ^(console / server form^)
+echo   dist\ai_proxy-desktop.exe  ^(desktop window^)
+echo.
+echo Run server:  dist\ai_proxy-server.exe -data data
+echo Run desktop: dist\ai_proxy-desktop.exe
 endlocal
 exit /b 0
 

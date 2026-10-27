@@ -33,6 +33,11 @@ type Server struct {
 	// 让界面展示的客户端接入地址永远与实际一致。
 	listenHost string
 	listenPort int
+
+	// version / desktop 由启动方注入：桌面版需要让界面知道
+	// 自己跑在窗口里（据此显示「桌面应用」设置页），服务端版保持关闭。
+	version string
+	desktop bool
 }
 
 // New 构造管理接口。
@@ -41,6 +46,12 @@ func New(st *store.Store, h *hub.Hub, p *proxy.Server, logger *slog.Logger, list
 		store: st, hub: h, proxy: p, logger: logger,
 		listenHost: listenHost, listenPort: listenPort,
 	}
+}
+
+// SetBuildInfo 注入构建信息与运行形态，供 /api/meta 下发给界面。
+func (s *Server) SetBuildInfo(version string, desktop bool) {
+	s.version = version
+	s.desktop = desktop
 }
 
 // Register 把所有管理路由挂到 mux 上。
@@ -138,6 +149,9 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"usageTemplates": proxy.UsageTemplates(),
 		// 实际监听地址，可能与数据库中的设置不同（命令行参数优先）。
 		"listen": map[string]any{"host": s.listenHost, "port": s.listenPort},
+		// 构建版本与运行形态：桌面版据此显示「桌面应用」设置页。
+		"version": s.version,
+		"desktop": s.desktop,
 	})
 }
 

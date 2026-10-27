@@ -198,7 +198,7 @@ const hasData = computed(() => {
               <template #trigger>
                 <div class="c-window">
                   <div class="c-window-head">
-                    <span class="c-window-label" :style="w.exceeded ? { color: '#d03050' } : undefined">
+                    <span class="c-window-label" :class="{ exceeded: w.exceeded }">
                       {{ w.label }}
                     </span>
                     <span class="c-window-pct" :style="{ color: quotaColor(w.percent) }">
@@ -476,9 +476,13 @@ const hasData = computed(() => {
 }
 
 .c-window-label {
-  font-size: 11px;
-  opacity: 0.6;
+  font-size: var(--text-2xs);
+  color: var(--text-3);
   white-space: nowrap;
+}
+
+.c-window-label.exceeded {
+  color: var(--danger);
 }
 
 .c-window-pct {
@@ -494,7 +498,7 @@ const hasData = computed(() => {
 }
 
 .c-note.warn {
-  color: #f0a020;
+  color: var(--warning);
 }
 
 .c-note-more {

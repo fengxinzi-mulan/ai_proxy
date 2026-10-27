@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onMounted, onBeforeUnmount, ref } from 'vue'
 import {
-  NCard,
   NDataTable,
   NInput,
   NSelect,
@@ -12,10 +11,14 @@ import {
   NPopconfirm,
   NPagination,
   NSwitch,
+  NIcon,
   useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, PaginationProps } from 'naive-ui'
+import { RefreshCw, Trash2, Search } from 'lucide-vue-next'
 import LogDetail from '@/components/LogDetail.vue'
+import PageHeader from '@/components/PageHeader.vue'
+import AppCard from '@/components/AppCard.vue'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { useEvents } from '@/composables/useEvents'
@@ -232,7 +235,7 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '模型',
     key: 'model',
-    width: 256,
+    width: 210,
     ellipsis: { tooltip: true },
     // 命中模型映射时渲染成「请求模型 → 上游模型」，一眼看出这条请求改写过模型。
     render: (r) => {
@@ -349,7 +352,7 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
   {
     title: '标记',
     key: 'flags',
-    width: 168,
+    width: 130,
     render: (r) => {
       const tags: ReturnType<typeof h>[] = []
       if (r.stream) tags.push(h(NTag, { size: 'tiny', bordered: false, type: 'info' }, { default: () => '流式' }))
@@ -410,84 +413,86 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
 
 <template>
   <div class="page">
-    <div class="page-head">
-      <div>
-        <h2>请求日志</h2>
-        <p class="sub">
-          每次转发都会记一条。开启实时后会即时插入新记录，每 30 秒与后端校正一次。
-        </p>
-      </div>
-      <NSpace align="center">
+    <PageHeader
+      title="请求日志"
+      description="每次转发都会记一条。开启实时后会即时插入新记录，每 30 秒与后端校正一次。"
+    >
+      <template #actions>
         <NSwitch v-model:value="live" size="small">
           <template #checked>实时</template>
           <template #unchecked>实时</template>
         </NSwitch>
-        <NButton :loading="loading" @click="load">刷新</NButton>
+        <NButton :loading="loading" @click="load">
+          <template #icon>
+            <NIcon :size="15"><RefreshCw /></NIcon>
+          </template>
+          刷新
+        </NButton>
         <NPopconfirm @positive-click="clearAll">
           <template #trigger>
-            <NButton type="error" ghost>清空日志</NButton>
+            <NButton type="error" ghost>
+              <template #icon>
+                <NIcon :size="15"><Trash2 /></NIcon>
+              </template>
+              清空日志
+            </NButton>
           </template>
           将删除所有历史记录，且无法恢复。确定继续吗？
         </NPopconfirm>
-      </NSpace>
-    </div>
+      </template>
+    </PageHeader>
 
-    <NCard size="small" :bordered="false" class="filter-card">
-      <NSpace align="center" :size="10" style="flex-wrap: wrap">
-        <NSelect
-          v-model:value="filter.range"
-          :options="RANGES"
-          style="width: 140px"
-          @update:value="applyFilter"
-        />
+    <AppCard class="filter-bar" dense>
+      <div class="filter-row">
+        <NSelect v-model:value="filter.range" :options="RANGES" class="f-range" @update:value="applyFilter" />
         <NSelect
           v-model:value="filter.providerId"
           :options="providerOptions"
-          style="width: 170px"
+          class="f-provider"
           @update:value="applyFilter"
         />
         <NSelect
           v-model:value="filter.model"
           :options="modelOptions"
           filterable
-          style="width: 210px"
+          class="f-model"
           @update:value="applyFilter"
         />
-        <NSelect
-          v-model:value="filter.status"
-          :options="STATUS"
-          style="width: 130px"
-          @update:value="applyFilter"
-        />
+        <NSelect v-model:value="filter.status" :options="STATUS" class="f-status" @update:value="applyFilter" />
         <NInput
           v-model:value="filter.q"
           placeholder="搜索模型 / 路径 / 错误信息"
-          style="width: 260px"
+          class="f-search"
           clearable
           @keyup.enter="applyFilter"
         />
-        <NButton type="primary" @click="applyFilter">查询</NButton>
+        <NButton type="primary" @click="applyFilter">
+          <template #icon>
+            <NIcon :size="15"><Search /></NIcon>
+          </template>
+          查询
+        </NButton>
         <NButton @click="resetFilter">重置</NButton>
-      </NSpace>
-    </NCard>
+      </div>
+    </AppCard>
 
-    <NCard size="small" :bordered="false" class="table-card">
+    <AppCard class="table-card">
       <NDataTable
         :columns="columns"
         :data="rows"
         :loading="loading"
         :row-key="(r: RequestLog) => r.id"
-        :scroll-x="1400"
+        :scroll-x="1344"
         :bordered="false"
         size="small"
         flex-height
-        style="height: calc(100vh - 300px); min-height: 320px"
+        class="log-table"
         :row-props="(r: RequestLog) => ({ style: 'cursor:pointer', onClick: () => openDetail(r) })"
       />
       <div class="pager">
         <NPagination v-bind="pagination" />
       </div>
-    </NCard>
+    </AppCard>
 
     <LogDetail v-model:show="detailShow" :log-id="detailId" />
   </div>
@@ -495,43 +500,75 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
 
 <style scoped>
 .page {
+  /* width:100% 不能省：.page 在 flex 纵列里，只写 max-width 时它会按内容
+     收缩到最窄，筛选行随之换行、表格被裁。 */
+  width: 100%;
   max-width: 1720px;
   margin: 0 auto;
-}
-
-.page-head {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 14px;
+  flex-direction: column;
+  /* 只减去顶栏(52) 与内容区上下内边距(20×2)；页面内部的高度分配交给 flex。 */
+  height: calc(100vh - 92px);
+  min-height: 0;
 }
 
-h2 {
-  margin: 0 0 4px;
-  font-size: 20px;
-  font-weight: 600;
+.filter-bar {
+  margin-bottom: var(--space-3);
+  flex-shrink: 0;
 }
 
-.sub {
-  margin: 0;
-  font-size: 12px;
-  opacity: 0.6;
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
 }
 
-.filter-card,
+.f-range {
+  width: 132px;
+}
+
+.f-provider {
+  width: 158px;
+}
+
+.f-model {
+  width: 190px;
+}
+
+.f-status {
+  width: 116px;
+}
+
+.f-search {
+  flex: 1 1 220px;
+  min-width: 180px;
+  max-width: 340px;
+}
+
 .table-card {
-  border-radius: 12px;
-  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.06);
+  flex: 1 1 auto;
+  min-height: 320px;
+  display: flex;
+  flex-direction: column;
 }
 
-.filter-card {
-  margin-bottom: 12px;
+.table-card :deep(.card-body) {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.log-table {
+  flex: 1 1 auto;
+  min-height: 240px;
 }
 
 .pager {
   display: flex;
   justify-content: flex-end;
-  padding-top: 12px;
+  padding-top: var(--space-3);
+  flex-shrink: 0;
 }
 </style>
