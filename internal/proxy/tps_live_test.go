@@ -228,8 +228,14 @@ func liveMeasureOnce(t *testing.T, client *http.Client, headers http.Header, tar
 // liveOpenCodeTarget 取 opencode zen 的密钥与 BaseURL：
 // 优先环境变量 OPENCODE_API_KEY，否则只读打开 data/ai_proxy.db 读该供应商的配置。
 // 密钥只留在内存里，不写任何文件、也不打进日志。
+//
+// 两条来源都没有时一律 t.Skip：这是实查用例，CI 上既没有 data/ 目录（运行时数据
+// 不入库）也没有密钥，跳过才是正确语义，不能算失败。
 func liveOpenCodeTarget(t *testing.T) (key, baseURL string, settings model.Settings) {
 	t.Helper()
+
+	baseURL = "https://opencode.ai/zen/go/v1"
+	key = os.Getenv("OPENCODE_API_KEY")
 
 	path := os.Getenv("AI_PROXY_DB")
 	if path == "" {
@@ -239,47 +245,68 @@ func liveOpenCodeTarget(t *testing.T) (key, baseURL string, settings model.Setti
 	if err != nil {
 		t.Fatalf("解析库路径失败: %v", err)
 	}
+
+	// 没有库文件就只剩环境变量这一条路；连密钥都没有，直接跳过。
+	if _, statErr := os.Stat(abs); statErr != nil {
+		if key == "" {
+			t.Skipf("未设置 OPENCODE_API_KEY，且没有可读的 %s，跳过实查", abs)
+		}
+		return key, baseURL, settings
+	}
+
 	db, err := sql.Open("sqlite", "file:"+strings.ReplaceAll(abs, `\`, "/")+"?mode=ro")
 	if err != nil {
-		t.Fatalf("打开只读数据库失败: %v", err)
+		if key == "" {
+			t.Skipf("打开只读数据库失败（%v），且未设置 OPENCODE_API_KEY，跳过实查", err)
+		}
+		return key, baseURL, settings
 	}
 	defer db.Close()
 
 	var raw string
 	if err := db.QueryRow(`SELECT value FROM settings WHERE key = 'global'`).Scan(&raw); err != nil {
-		t.Fatalf("读取全局设置失败: %v", err)
+		// 库能打开但读不到设置：多半是空库或旧结构，不该让实查用例失败。
+		if key == "" {
+			t.Skipf("读取全局设置失败（%v），且未设置 OPENCODE_API_KEY，跳过实查", err)
+		}
+		return key, baseURL, settings
 	}
 	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
-		t.Fatalf("解析全局设置失败: %v", err)
+		if key == "" {
+			t.Skipf("解析全局设置失败（%v），且未设置 OPENCODE_API_KEY，跳过实查", err)
+		}
+		return key, baseURL, settings
 	}
 	settings.ApplyDefaults()
 
 	var keysJSON string
+	var dbBase string
 	err = db.QueryRow(
 		`SELECT base_url, keys_json FROM providers
 		 WHERE display_name LIKE '%opencode%' AND enabled = 1
 		 ORDER BY active DESC, sort_order, id LIMIT 1`,
-	).Scan(&baseURL, &keysJSON)
-	if err != nil && os.Getenv("OPENCODE_API_KEY") == "" {
-		t.Fatalf("库中没有可用的 opencode 供应商，请设置 OPENCODE_API_KEY: %v", err)
-	}
-	if err != nil {
-		baseURL = "https://opencode.ai/zen/go/v1"
+	).Scan(&dbBase, &keysJSON)
+	if err == nil {
+		if strings.TrimSpace(dbBase) != "" {
+			baseURL = dbBase
+		}
+	} else if key == "" {
+		t.Skipf("库中没有可用的 opencode 供应商（%v），且未设置 OPENCODE_API_KEY，跳过实查", err)
 	}
 
-	if key = os.Getenv("OPENCODE_API_KEY"); key != "" {
+	if key != "" {
 		return key, baseURL, settings
 	}
 
 	var keys []model.APIKey
 	if err := json.Unmarshal([]byte(keysJSON), &keys); err != nil {
-		t.Fatalf("解析密钥失败: %v", err)
+		t.Skipf("解析密钥失败（%v），且未设置 OPENCODE_API_KEY，跳过实查", err)
 	}
 	for _, k := range keys {
 		if k.Enabled && strings.TrimSpace(k.Key) != "" {
 			return k.Key, baseURL, settings
 		}
 	}
-	t.Fatal("opencode 供应商没有可用密钥，请设置 OPENCODE_API_KEY")
+	t.Skip("opencode 供应商没有可用密钥，且未设置 OPENCODE_API_KEY，跳过实查")
 	return "", baseURL, settings
 }

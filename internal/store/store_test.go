@@ -595,7 +595,9 @@ func TestVacuumReclaimsSpace(t *testing.T) {
 
 func TestStatsAggregation(t *testing.T) {
 	st := newTestStore(t)
-	base := time.Now().Add(-2 * time.Hour)
+	// 分桶按 UTC 小时切，基准时间必须落在整点上：否则「2 小时前」的起点会跨过
+	// 一个整点边界，三条本该同桶的记录被拆到两个桶里，用例在 UTC 几点跑决定成败。
+	base := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
 	for i := 0; i < 3; i++ {
 		insertLog(t, st, func(l *model.RequestLog) {
 			l.TSStart = base.Add(time.Duration(i) * time.Minute)
