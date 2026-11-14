@@ -93,7 +93,7 @@ build.bat
 
 ```bash
 go run scripts/gen-icon/main.go                  # 生成 build/windows/app.ico
-go run scripts/gen-rc/main.go -version 0.2.0     # 生成 build/windows/app.rc（含版本号）
+go run scripts/gen-rc/main.go -version 0.2.1     # 生成 build/windows/app.rc（含版本号）
 cd build/windows && windres --target=pe-x86-64 -i app.rc -o ../../internal/winres/rsrc_windows_amd64.syso -O coff -c 65001
 ```
 
@@ -279,12 +279,25 @@ node scripts/mock-upstream.mjs 9911
 缓存命中率在总览指标卡、趋势图、模型排行、日志列表与日志详情里都会给出。
 它直接反映提示词缓存是否在起作用 —— 命中率高意味着同样内容的重复请求更便宜、首 token 更快。
 
+上游按「前缀块」命中缓存：Mistral 的块大小是 64 token，所以 `cached_tokens`
+永远是 64 的倍数；看到某条请求只命中 **512**，意思就是只复用了前 8 个块，
+通常是会话的第一段（系统提示 / 工具定义）撞上了，后面从某个字段开始就不一样了。
+
 非流式响应不计算 TPS：没有逐 token 的到达时刻，用输出量除以总耗时得到的是延迟的倒数，
 一个 4 ms 返回的短响应能算出几千 TPS，会把平均值完全带偏。
 
+### 数据库空间
+
+日志正文默认入库（可在设置里关），删掉的行只会变成 SQLite 的**空闲页**，
+文件不会自己变小 —— 保留策略每小时清一次，删得多了文件却一直是峰值大小。
+日志页标题栏在可回收空间超过 20 MB 时会出现「回收空间」按钮：它重建数据库文件、
+不删任何记录，只把空闲页还给磁盘；「清空日志」也会顺手做一次。
+另外，清理任务在「本次删得够多、且空闲页占比超过 20%」时会自动回收一次，
+一天最多一次（VACUUM 期间独占连接）。
+
 ## 请求体改写
 
-只有两件事会改动请求，各自独立开关，且都会在日志里留痕（保存改写前的原文供对比）：
+只有以下几件事会改动请求，各自独立开关，且都会在日志里留痕（保存改写前的原文供对比）：
 
 1. **注入 `stream_options.include_usage`**（默认开启）
    OpenAI Chat Completions 格式的流式请求，上游默认不返回 token 用量。注入这个参数后
@@ -296,6 +309,93 @@ node scripts/mock-upstream.mjs 9911
    全局默认 + 供应商覆盖 + 按模型正则规则，三种注入方式分别适配 OpenAI 的 `messages`、
    Anthropic 的顶层 `system`、Gemini 的 `systemInstruction`。
    任何一步解析失败都会放弃注入、原样转发，绝不把请求改坏。
+
+3. **`developer` 角色归一化**（始终生效）
+   ZCode、DSH 这类新客户端会把系统消息写成 `role:"developer"`。Mistral 这类严格上游的
+   messages schema 只认 `system` / `user` / `assistant` / `tool`，不改就整条 422。
+   这只是改名、不改变语义，所以不设开关；Responses 格式的 `input[]` 同样处理。
+   日志里记 `role_developer_to_system`。
+
+4. **剔除非标准字段**（供应商「高级」页开启，默认关闭）
+   开启后，OpenAI / Responses 请求体顶层的 `thinking`、`enable_thinking`、
+   `thinking_budget` 会在转发前移除；OpenAI Chat 格式还会额外移除 `store`，
+   对应日志里的 `strip_*`。
+
+   消息级字段同样会裁掉 —— 这些都不在 Mistral 的 `messages` schema 里
+   （`SystemMessage` / `UserMessage` / `AssistantMessage` 都是
+   `additionalProperties: false`）：
+
+   - `reasoning_content`、`reasoning_details`、`reasoning`：客户端（DSH、ZCode）
+     把上一轮模型自己吐出的思维链原样带进历史时捎上的字段；
+   - `refusal`、`annotations`、`audio`：OpenAI 的消息级扩展；
+   - `function_call`：`tool_calls` 之前的旧写法；
+   - `name`：schema 只给 `tool` 消息留了它，`system` / `user` / `assistant` 带上是 422。
+
+   Mistral 这种 `extra="forbid"` 的上游会连同消息一起校验，整条请求直接 422：
+
+   ```json
+   {"detail":[{"type":"extra_forbidden",
+     "loc":["body","messages",5,"assistant","reasoning_content"],
+     "msg":"Extra inputs are not permitted"}]}
+   ```
+
+   删掉它们不影响对话：决定上下文的是 `content` 与 `tool_calls`，思维链只是旁注。
+   只删字段，消息内容里的 `{"type":"thinking"}` 结构不受影响；
+   `role:"developer"` 的归一化照旧无条件生效。
+
+   **Responses 的 `store`** 单独一条规则：续传开启时必须保留（续传靠它），
+   续传关闭（`off` / `dry-run`）时连 `store` 和 `previous_response_id` 一起裁掉 ——
+   Mistral 的 Responses API 是无状态的，`store:true` 会直接 400，
+   `previous_response_id` 也引用不到上一轮响应。
+
+5. **注入 `prompt_cache_key`**（供应商「高级」页开启，默认关闭）
+   上游的缓存亲和提示。Mistral 官方文档：同一会话用同一个 `prompt_cache_key`
+   能提高前缀缓存命中率，缓存输入按标准输入价的 10% 计费，但**不保证命中**；
+   缓存按 64 token 的块命中，所以 `usage.prompt_tokens_details.cached_tokens`
+   永远是 64 的倍数（看到 512 就是只命中了 8 个块）。
+
+   选「自动派生」后，代理优先用客户端会话头（`X-Session-Id` /
+   `X-Opencode-Session` / `Session_id`），没有就用「首条消息 + tools」的指纹，
+   SHA-256 成 `aipx-…` 再注入 —— 多轮请求里这两部分不变，只有尾部增长，
+   所以同一会话的 key 稳定、不同会话自然分开。客户端自己带了 key 时不覆盖。
+   不认这个字段的严格网关会 422，所以默认关闭，按供应商开启。
+
+## 供应商优化预设
+
+不同上游对代理的要求是一整套的。与其让用户逐项对照文档勾开关，代理内置了
+**按域名识别的优化预设**：
+
+- 打开供应商编辑抽屉或改完 BaseURL 时，若地址命中预设域名（目前是 `*.mistral.ai`），
+  会弹窗列出「会改哪几项、为什么」，点「应用优化配置」一次套用，保存后生效；
+- 已经保存的供应商，卡片上会出现「可优化」标记与「优化配置」按钮，一键落库；
+- 预设内容由后端提供（`GET /api/provider-presets`），前端只负责识别与比对，
+  两端不会各维护一份配置；只改预设显式列出的字段，密钥、代理、提示词、模型映射
+  一概不动。
+
+Mistral 预设包含 5 项：开启严格上游兼容、自动注入 `prompt_cache_key`、
+关闭 `include_usage` 注入（Mistral 的流式响应自带 usage，schema 里也没有
+`stream_options`）、关闭 Responses 续传（无状态）、总超时提到 900 秒
+（该模型支持 128k 输出与高推理档，300 秒容易被我们自己截断）。
+
+## 响应归一化
+
+除了用户显式开启的「剥离 usage 块」，还有一处会改响应字节：
+
+**chat/completions 的 `content` 数组拍平**。有些推理模型（Mistral 上的
+`deepseek-v4-1-*` 就是一例）会把 `delta.content` / `message.content` 写成
+`[{"type":"thinking",...},{"type":"text",...}]`。OpenAI 规范里 content 只能是
+字符串，按 SDK 生成的客户端（ZCode、DSH）会直接类型校验失败，整轮作废。
+
+代理在转发前做最小归一化：
+
+- `type:"text"` 的文本拼成字符串回填 `content`；
+- `type:"thinking"` / `type:"reasoning"` 的文本挪到 `reasoning_content`
+  （DeepSeek / OpenRouter 的通行约定，不认识的客户端会忽略）；
+- 其它类型丢弃。
+
+流式按事件改写；非流式整体缓冲后改写（上限 32 MB，超限原样透传）。改写过的响应
+在日志里标记 `response_modified=1`。Responses 接口的 `output` 本来就是带类型的
+数组，不受影响。
 
 ## 套餐余量查询
 

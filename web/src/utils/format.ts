@@ -308,6 +308,21 @@ export const MODIFICATION_LABELS: Record<string, string> = {
   responses_continuation_seed: '续传建链',
   responses_continuation_fallback: '续传回退',
   responses_store_enabled: '开启上游存储',
+  role_developer_to_system: 'developer → system',
+  strip_thinking: '移除 thinking',
+  strip_enable_thinking: '移除 enable_thinking',
+  strip_thinking_budget: '移除 thinking_budget',
+  strip_store: '移除 store',
+  strip_previous_response_id: '移除 previous_response_id',
+  strip_reasoning_content: '移除 reasoning_content',
+  strip_reasoning_details: '移除 reasoning_details',
+  strip_reasoning: '移除 reasoning',
+  strip_refusal: '移除 refusal',
+  strip_annotations: '移除 annotations',
+  strip_audio: '移除 audio',
+  strip_function_call: '移除旧 function_call',
+  strip_name: '移除消息 name',
+  prompt_cache_key: '注入缓存键',
 }
 
 export function modificationLabel(key: string): string {

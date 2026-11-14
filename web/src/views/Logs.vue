@@ -15,14 +15,14 @@ import {
   useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, PaginationProps } from 'naive-ui'
-import { RefreshCw, Trash2, Search } from 'lucide-vue-next'
+import { RefreshCw, Trash2, Search, HardDriveDownload } from 'lucide-vue-next'
 import LogDetail from '@/components/LogDetail.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import AppCard from '@/components/AppCard.vue'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { useEvents } from '@/composables/useEvents'
-import type { RequestLog } from '@/types'
+import type { DBStats, RequestLog } from '@/types'
 import {
   OUTCOME_LABELS,
   cacheHitRateOf,
@@ -111,7 +111,7 @@ async function loadModels() {
 
 onMounted(async () => {
   if (!store.providers.length) await store.reloadProviders()
-  await Promise.all([load(), loadModels()])
+  await Promise.all([load(), loadModels(), loadDBStats()])
 })
 
 function applyFilter() {
@@ -193,9 +193,46 @@ async function clearAll() {
         : `已清空 ${res.deleted} 条记录`,
     )
     page.value = 1
-    await load()
+    await Promise.all([load(), loadDBStats()])
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+/* ---------- 数据库空间 ---------- */
+
+// 删除行只会把页面挂进 freelist，文件不会自己变小；这里让用户看到
+// 「现在点回收能腾出多少」，而不是对着一个越来越大的 db 文件猜。
+const dbStats = ref<DBStats | null>(null)
+const vacuuming = ref(false)
+
+/** 可回收空间超过这个阈值才在标题栏显示按钮，免得天天占位置。 */
+const RECLAIM_HINT_BYTES = 20 * 1024 * 1024
+
+const reclaimable = computed(() =>
+  dbStats.value && dbStats.value.freeBytes >= RECLAIM_HINT_BYTES ? dbStats.value.freeBytes : 0,
+)
+
+async function loadDBStats() {
+  try {
+    dbStats.value = await api.dbStats()
+  } catch {
+    // 拿不到就不显示按钮，不影响日志页本身。
+  }
+}
+
+async function vacuum() {
+  vacuuming.value = true
+  try {
+    const res = await api.vacuum()
+    message.success(
+      res.reclaimed > 0 ? `已回收 ${formatBytes(res.reclaimed)}` : '没有可回收的空间',
+    )
+    await loadDBStats()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    vacuuming.value = false
   }
 }
 
@@ -428,6 +465,18 @@ const columns = computed<DataTableColumns<RequestLog>>(() => [
           </template>
           刷新
         </NButton>
+        <NTooltip v-if="reclaimable > 0">
+          <template #trigger>
+            <NButton :loading="vacuuming" @click="vacuum">
+              <template #icon>
+                <NIcon :size="15"><HardDriveDownload /></NIcon>
+              </template>
+              回收空间
+            </NButton>
+          </template>
+          删除的日志只会留下空闲页，数据库文件不会自己变小。
+          点这里重建文件，可腾出约 {{ formatBytes(reclaimable) }}（不会删除任何记录）。
+        </NTooltip>
         <NPopconfirm @positive-click="clearAll">
           <template #trigger>
             <NButton type="error" ghost>

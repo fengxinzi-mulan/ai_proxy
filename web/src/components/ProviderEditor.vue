@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, h, reactive, ref, watch } from 'vue'
 import {
   NDrawer,
   NDrawerContent,
@@ -28,9 +28,10 @@ import {
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
 import ProviderUsagePanel from '@/components/ProviderUsagePanel.vue'
-import type { APIFormat, CustomUsageMapping, ProbeResult, Provider } from '@/types'
+import type { APIFormat, CustomUsageMapping, ProbeResult, Provider, ProviderPreset } from '@/types'
 import { API_FORMAT_LABELS, PROMPT_STRATEGY_LABELS } from '@/types'
 import { formatDuration } from '@/utils/format'
+import { hostOf, pendingPresets } from '@/utils/preset'
 
 const props = defineProps<{
   show: boolean
@@ -94,6 +95,8 @@ function blank(): Provider {
     continuationInvalidCooldownSeconds: 300,
     usageInjectMode: 'inherit',
     stripUsageChunk: false,
+    stripUnsupportedParams: false,
+    promptCacheKeyMode: 'off',
     customUsage: null,
     usageQuery: { template: '', baseUrl: '', autoRefreshSeconds: 0 },
     tags: [],
@@ -167,6 +170,8 @@ watch(
     mapModels.value = []
     baseURLManuallyEdited.value = Boolean(form.baseUrl)
     activeTab.value = 'basic'
+    // 打开抽屉时先看看这个地址是不是某个内置预设的厂商；是的话弹窗询问。
+    void loadPresets().then(maybeAskPreset)
   },
 )
 
@@ -190,6 +195,99 @@ function addKey() {
 function removeKey(idx: number) {
   form.keys.splice(idx, 1)
 }
+
+/* ---------- 厂商优化预设 ---------- */
+
+// 预设表来自后端（GET /api/provider-presets），前端只负责「识别 + 询问 + 套用」，
+// 避免同一份推荐配置在前后端各写一遍、慢慢漂移。
+const presets = ref<ProviderPreset[]>([])
+let presetsLoaded = false
+
+/** 当前 BaseURL 命中的、且表单还没完全符合的预设 —— 弹窗与提示条都看这个。 */
+const pending = computed(() => pendingPresets(presets.value, form))
+
+/** 把预设写进表单；只动预设声明过的字段。 */
+function applyPreset(preset: ProviderPreset) {
+  if (preset.stripUnsupportedParams !== undefined) form.stripUnsupportedParams = preset.stripUnsupportedParams
+  if (preset.promptCacheKeyMode !== undefined) form.promptCacheKeyMode = preset.promptCacheKeyMode
+  if (preset.usageInjectMode !== undefined) form.usageInjectMode = preset.usageInjectMode
+  if (preset.continuationMode !== undefined) form.continuationMode = preset.continuationMode
+  if (preset.timeoutSeconds !== undefined) form.timeoutSeconds = preset.timeoutSeconds
+  dismissPreset(preset)
+  message.success('已应用优化配置，保存后生效')
+}
+
+// 「暂不」按 预设 + 主机名 记住，避免同一个厂商反复弹窗。
+const dismissKey = (preset: ProviderPreset, host: string) => `provider-preset-dismissed:${preset.id}:${host}`
+
+function dismissPreset(preset: ProviderPreset) {
+  const host = hostOf(form.baseUrl)
+  if (host) localStorage.setItem(dismissKey(preset, host), '1')
+}
+
+function isDismissed(preset: ProviderPreset): boolean {
+  const host = hostOf(form.baseUrl)
+  return Boolean(host) && localStorage.getItem(dismissKey(preset, host)) === '1'
+}
+
+/** 确保预设表已加载（只拉一次）。 */
+async function loadPresets() {
+  if (presetsLoaded) return
+  try {
+    presets.value = await api.listProviderPresets()
+    presetsLoaded = true
+  } catch {
+    // 拉不到就不提示，编辑功能本身不受影响。
+  }
+}
+
+/**
+ * 弹出「检测到厂商，是否应用优化配置」询问。
+ *
+ * 触发点：打开抽屉、BaseURL 改动（防抖）。已经全部符合、或用户点过「暂不」的不再打扰。
+ */
+function maybeAskPreset() {
+  const host = hostOf(form.baseUrl)
+  if (!host) return
+  const preset = pending.value.find((p) => !isDismissed(p))
+  if (!preset) return
+
+  const dialogRef = dialog.info({
+    title: `检测到 ${preset.title}`,
+    content: () =>
+      h('div', { style: 'font-size: 13px; line-height: 1.7' }, [
+        h('p', { style: 'margin: 0 0 8px' }, preset.summary),
+        h(
+          'ul',
+          { style: 'margin: 0; padding-left: 18px' },
+          preset.changes.map((c) =>
+            h('li', {}, [
+              h('strong', {}, `${c.field}：${c.value}`),
+              h('span', { style: 'color: #888' }, ` —— ${c.reason}`),
+            ]),
+          ),
+        ),
+      ]),
+    positiveText: '应用优化配置',
+    negativeText: '暂不',
+    onPositiveClick: () => {
+      applyPreset(preset)
+      dialogRef.destroy()
+    },
+    onNegativeClick: () => {
+      dismissPreset(preset)
+      dialogRef.destroy()
+    },
+  })
+}
+
+/** BaseURL 改动后的防抖检测：别在用户每敲一个字时弹窗。 */
+let presetTimer: number | undefined
+function schedulePresetCheck() {
+  if (presetTimer) window.clearTimeout(presetTimer)
+  presetTimer = window.setTimeout(() => void loadPresets().then(maybeAskPreset), 600)
+}
+
 
 /** 提交给后端的供应商结构：时间戳由服务端管理，不在其中。 */
 type ProviderPayload = Omit<Provider, 'createdAt' | 'updatedAt'>
@@ -453,13 +551,27 @@ function remove() {
               <NInput
                 v-model:value="form.baseUrl"
                 :placeholder="baseURLPlaceholder"
-                @update:value="baseURLManuallyEdited = true"
+                @update:value="baseURLManuallyEdited = true; schedulePresetCheck()"
               />
+            </NFormItem>
+            <NFormItem v-if="pending.length" label="优化配置">
+              <NButton type="primary" secondary size="small" @click="maybeAskPreset">
+                应用「{{ pending[0].title }}」推荐配置
+              </NButton>
             </NFormItem>
             <NFormItem label="标签">
               <NInput v-model:value="tagText" placeholder="逗号分隔，例如：主力, 便宜" />
             </NFormItem>
           </NForm>
+          <NAlert
+            v-if="pending.length"
+            type="info"
+            :bordered="false"
+            style="margin-bottom: 12px; font-size: 12px"
+          >
+            检测到 <strong>{{ pending[0].title }}</strong>：{{ pending[0].summary }}
+            点上面的「优化配置」可以一次套用推荐的 {{ pending[0].changes.length }} 项配置（保存后生效）。
+          </NAlert>
 
           <NAlert type="info" :bordered="false" style="margin-top: 8px">
             <div style="font-size: 12px; line-height: 1.7">
@@ -752,6 +864,45 @@ function remove() {
             开启后，上游返回的「只带 usage、没有内容」的收尾块不会转发给客户端。
             极少数严格校验 <code class="mono">choices</code> 为空的客户端需要它。
             统计不受影响。
+          </NAlert>
+
+          <NDivider title-placement="left" style="font-size: 12px">严格上游兼容</NDivider>
+          <NForm label-placement="left" label-width="150" size="small">
+            <NFormItem label="剔除非标准字段">
+              <NSwitch v-model:value="form.stripUnsupportedParams" />
+            </NFormItem>
+            <NFormItem label="注入 prompt_cache_key">
+              <NRadioGroup v-model:value="form.promptCacheKeyMode">
+                <NRadioButton value="off">关闭</NRadioButton>
+                <NRadioButton value="auto">自动派生</NRadioButton>
+              </NRadioGroup>
+            </NFormItem>
+          </NForm>
+          <NAlert type="info" :bordered="false" style="margin-bottom: 12px; font-size: 12px">
+            开启后，OpenAI / Responses 请求体顶层的
+            <code class="mono">thinking</code>、<code class="mono">enable_thinking</code>、
+            <code class="mono">thinking_budget</code> 会在转发前移除；
+            OpenAI Chat 格式还会额外移除 <code class="mono">store</code>，
+            Responses 格式在<strong>续传关闭时</strong>也会移除
+            <code class="mono">store</code> / <code class="mono">previous_response_id</code>
+            （无状态上游引用不到上一轮响应，带着只会 400）。
+            消息级还会移除 <code class="mono">reasoning_content</code>、
+            <code class="mono">reasoning_details</code>、<code class="mono">reasoning</code>、
+            <code class="mono">refusal</code>、<code class="mono">annotations</code>、
+            <code class="mono">audio</code>、旧 <code class="mono">function_call</code>，
+            以及非 <code class="mono">tool</code> 消息上的 <code class="mono">name</code>
+            —— 这些都是 Mistral 这类「多一个字段就 422」schema 不认的。
+            如果上游本来就认这些字段（部分国产网关），别开，否则推理会被悄悄关掉。
+            另外 <code class="mono">role:"developer"</code> 会无条件归一化成
+            <code class="mono">system</code>，不受此开关影响。
+          </NAlert>
+          <NAlert type="info" :bordered="false" style="margin-bottom: 12px; font-size: 12px">
+            <code class="mono">prompt_cache_key</code> 是上游的<strong>缓存亲和提示</strong>
+            （Mistral 官方文档）：同一会话用稳定 key 能提高前缀缓存命中率，缓存输入按标准价的 10% 计费，
+            但不保证命中。选「自动派生」后，代理优先用客户端会话头
+            （<code class="mono">X-Session-Id</code> 等），没有就用「首条消息 + tools」的指纹，
+            哈希成 <code class="mono">aipx-…</code> 再注入；客户端自己带了 key 时不覆盖。
+            不认这个字段的严格网关会 422，所以默认关闭。
           </NAlert>
 
           <NDivider title-placement="left" style="font-size: 12px">Responses 会话续传</NDivider>

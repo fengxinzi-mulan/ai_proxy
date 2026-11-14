@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -26,6 +27,21 @@ import (
 // 这是唯一会改变「这次请求打的是哪个上游模型」的改动项。
 // （Gemini 的模型名在 URL 路径上而不是请求体里，路径那一段的替换由调用方负责。）
 func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, modelName string) ([]byte, []string) {
+	return rewriteRequestBodyOpts(prov, st, rawBody, modelName, rewriteOptions{})
+}
+
+// rewriteOptions 承载「不在请求体里、但会决定改写结果」的上下文。
+//
+// 单独抽出来是因为改写函数是纯函数（不碰 *http.Request），
+// 而 prompt_cache_key 要从请求头推导会话身份，只能由调用方算好传进来。
+type rewriteOptions struct {
+	// cacheKeySeed 是会话级标识（如客户端 X-Session-Id）；空串时改写函数
+	// 会退化为按「首条消息 + tools」的指纹派生，保证多轮之间仍然稳定。
+	cacheKeySeed string
+}
+
+// rewriteRequestBodyOpts 是带上下文版本的改写入口。
+func rewriteRequestBodyOpts(prov model.Provider, st model.Settings, rawBody []byte, modelName string, opts rewriteOptions) ([]byte, []string) {
 	if len(rawBody) == 0 {
 		return rawBody, nil
 	}
@@ -40,8 +56,17 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 	// 这个字段，所以客户端省略不算写错。这是合规性修正，不设开关：客户端本来就
 	// 带 type 时它是空操作，不会留下改写标记。
 	wantResponsesFix := prov.APIFormat == model.FormatResponses
+	// developer 角色归一化：OpenAI 新客户端（ZCode、DSH）会把系统消息写成
+	// role:"developer"，而 Mistral 这类严格上游只认 system/user/assistant/tool，
+	// 整条请求会 422。改名无损，直接对所有 OpenAI 系格式生效。
+	wantRoleFix := isOpenAIStyle(prov.APIFormat) && bytes.Contains(rawBody, []byte(`"developer"`))
+	// thinking / reasoning_content 裁剪则相反：不少兼容网关确实认这些字段，
+	// 替用户做主会悄悄关掉推理或丢掉思维链回放，所以只在供应商显式开启严格兼容时才动。
+	wantStrip := prov.StripUnsupportedParams && isOpenAIStyle(prov.APIFormat) && hasUnsupportedParam(rawBody)
+	// prompt_cache_key 同理：不认这个字段的严格网关会 422，必须按供应商显式开启。
+	wantCacheKey := prov.PromptCacheKeyMode == model.PromptCacheKeyAuto && isOpenAIStyle(prov.APIFormat)
 	promptText, promptStrategy, hasPrompt := resolvePromptForModel(prov, st, modelName, mappedModel, mapped)
-	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped {
+	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey {
 		return rawBody, nil
 	}
 
@@ -51,6 +76,9 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 	}
 
 	var mods []string
+	if wantRoleFix && normalizeDeveloperRole(obj) {
+		mods = append(mods, "role_developer_to_system")
+	}
 	if wantUsageInject {
 		if injectIncludeUsage(obj) {
 			mods = append(mods, "usage_inject")
@@ -71,6 +99,22 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 	if wantResponsesFix && normalizeResponsesInput(obj) {
 		mods = append(mods, "responses_input_type")
 	}
+	if wantStrip {
+		// 续传真的要用 store 时才保留它；其余情况下 Responses 的 store 也要裁
+		// （Mistral 的 Responses API 是无状态的，store:true 直接 400）。
+		keepResponsesStore := prov.ContinuationMode == model.ContinuationOn
+		for _, key := range stripUnsupportedParams(obj, keepResponsesStore) {
+			mods = append(mods, "strip_"+key)
+		}
+		for _, key := range stripChatMessageExtraFields(obj) {
+			mods = append(mods, "strip_"+key)
+		}
+	}
+	if wantCacheKey {
+		if key := derivePromptCacheKey(prov, obj, opts.cacheKeySeed); key != "" && applyPromptCacheKey(obj, key) {
+			mods = append(mods, "prompt_cache_key")
+		}
+	}
 	if len(mods) == 0 {
 		return rawBody, nil
 	}
@@ -80,6 +124,208 @@ func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, 
 		return rawBody, nil
 	}
 	return out, mods
+}
+
+// isOpenAIStyle 判断该格式是否建立在 OpenAI 的 messages / input 结构上。
+func isOpenAIStyle(f model.APIFormat) bool {
+	return f == model.FormatOpenAI || f == model.FormatResponses
+}
+
+// unsupportedTopLevelParams 是严格上游不认的顶层字段名。
+//
+// 只收「OpenAI 规范之外、又被常见客户端塞进 body」的几个：Anthropic 风格的
+// thinking 开关，以及部分国产网关的 enable_thinking / thinking_budget。
+var unsupportedTopLevelParams = []string{"thinking", "enable_thinking", "thinking_budget"}
+
+// chatOnlyUnsupportedParams 只在 chat 形态的请求体上裁剪。
+//
+// Responses 里 store 是合法字段（续传就靠它），不能动；但 OpenAI chat 规范之外
+// 又校得很紧的上游（Mistral 就是）会把 store 当非法输入直接 422 —— 客户端哪怕
+// 传的是 store:false 也照拒。
+var chatOnlyUnsupportedParams = []string{"store"}
+
+var chatUnsupportedTopLevelParams = append(
+	append([]string(nil), unsupportedTopLevelParams...), chatOnlyUnsupportedParams...)
+
+// chatMessageExtraFields 是 chat 消息体里常见、但不属于 OpenAI 规范的字段。
+//
+// reasoning_content 是客户端把上一轮 assistant 的思维链原样带进历史时捎上的
+// （DSH、ZCode 都这么干）。它不在 messages schema 里，而 Mistral 这类
+// extra="forbid" 的上游会连消息一起校验，整条请求直接 422：
+//
+//	{"detail":[{"type":"extra_forbidden","loc":["body","messages",5,"assistant",
+//	"reasoning_content"],"msg":"Extra inputs are not permitted"}]}
+//
+// 删掉它不影响上游理解对话：真正决定上下文的是 content 与 tool_calls，
+// 思维链只是回放给模型看的旁注。
+//
+// 同一类字段按官方 schema 一并补齐（Mistral 的 AssistantMessage 只有
+// role/content/tool_calls/prefix）：refusal、annotations、audio 是 OpenAI 的
+// 消息级扩展，function_call 是 tool_calls 之前的旧写法，都不在 schema 里。
+var chatMessageExtraFields = []string{
+	"reasoning_content", "reasoning_details", "reasoning",
+	"refusal", "annotations", "audio", "function_call",
+}
+
+// prefilterParams 是 hasUnsupportedParam 的字节预筛清单（顶层 ∪ 消息级 ∪ name）。
+var prefilterParams = func() []string {
+	out := make([]string, 0, len(chatUnsupportedTopLevelParams)+len(chatMessageExtraFields)+2)
+	out = append(out, chatUnsupportedTopLevelParams...)
+	out = append(out, chatMessageExtraFields...)
+	return append(out, "name", "previous_response_id")
+}()
+
+// isResponsesShaped 按 body 结构判断这是不是一次 Responses 请求。
+//
+// 不能只看供应商的 apiFormat：客户端可能把 /v1/responses 打到配置为 openai 的
+// 供应商上。chat 用 messages，Responses 用 input（或 instructions /
+// previous_response_id）——有 messages 就按 chat 处理。
+func isResponsesShaped(obj map[string]any) bool {
+	if _, ok := obj["messages"]; ok {
+		return false
+	}
+	for _, key := range []string{"input", "instructions", "previous_response_id"} {
+		if _, ok := obj[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// unsupportedParamsForBody 按请求体结构选裁剪清单。
+func unsupportedParamsForBody(obj map[string]any) []string {
+	if isResponsesShaped(obj) {
+		return unsupportedTopLevelParams
+	}
+	return chatUnsupportedTopLevelParams
+}
+
+// hasUnsupportedParam 是廉价的字节预筛：没命中就不必把整个 body 解析成 JSON。
+//
+// 这里按并集扫（含只在 chat 上裁的 store、只在消息上裁的 reasoning_content），
+// 因为还没解析、不知道 body 结构；多扫几个词的成本可以忽略，误命中时后面解析完
+// 发现无可裁剪字段也不会改写。name 这种常见词几乎必中，代价只是多一次解析。
+func hasUnsupportedParam(body []byte) bool {
+	for _, key := range prefilterParams {
+		if bytes.Contains(body, []byte(`"`+key+`"`)) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeDeveloperRole 把 OpenAI 新引入的 developer 角色改回 system。
+//
+// Chat 格式看 messages[]，Responses 格式看 input[]（元素可能带 type:"message"）。
+// developer 只是 system 的新名字，改名无损；而 Mistral 这类严格上游的 messages
+// schema 只有 system/user/assistant/tool 四种角色，不改就整条 422。
+func normalizeDeveloperRole(obj map[string]any) bool {
+	changed := false
+	for _, key := range []string{"messages", "input"} {
+		items, ok := obj[key].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range items {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if role, ok := item["role"].(string); ok && role == "developer" {
+				item["role"] = "system"
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// stripUnsupportedParams 删除顶层非标准字段，返回被删掉的键名（用于日志留痕）。
+//
+// 只动顶层：消息内容里的 {"type":"thinking"} 之类是上游正常返回的结构，不能连带删掉。
+// store 默认只对 chat 形态的 body 删；keepResponsesStore 为 false 时连 Responses
+// 形态的 store 也删 —— Mistral 的 Responses API 是无状态的，store 只能为 false，
+// 客户端传 true 会被直接 400。续传开着的时候必须保留，否则会把续传功能裁掉。
+func stripUnsupportedParams(obj map[string]any, keepResponsesStore bool) []string {
+	keys := unsupportedParamsForBody(obj)
+	if !keepResponsesStore && isResponsesShaped(obj) {
+		keys = append(append([]string(nil), keys...), "store", "previous_response_id")
+	}
+	var removed []string
+	for _, key := range keys {
+		if _, ok := obj[key]; ok {
+			delete(obj, key)
+			removed = append(removed, key)
+		}
+	}
+	return removed
+}
+
+// stripChatMessageExtraFields 删除 chat 消息里的非标准字段，返回被删掉的键名
+// （去重，用于日志留痕）。
+//
+// 只处理 messages[] 每个元素顶层的键：消息 content 里的 {"type":"thinking"} 是
+// 上游正常结构，不能连带删掉；Responses 的 input 也不动 —— 那边的 reasoning 项
+// 是合法输入。
+//
+// 两类字段分开处理：
+//   - chatMessageExtraFields：在任何角色上都不是合法字段，一律删；
+//   - name：schema 只给 tool 消息留了它，system/user/assistant 带上是 422。
+func stripChatMessageExtraFields(obj map[string]any) []string {
+	if isResponsesShaped(obj) {
+		return nil
+	}
+	messages, ok := obj["messages"].([]any)
+	if !ok {
+		return nil
+	}
+	var removed []string
+	seen := map[string]bool{}
+	mark := func(key string) {
+		// 历史里往往有好几条消息都带同一个字段，日志上留一个标记就够了，
+		// 否则改动清单会被同一项刷屏。
+		if !seen[key] {
+			seen[key] = true
+			removed = append(removed, key)
+		}
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range chatMessageExtraFields {
+			if _, has := msg[key]; has {
+				delete(msg, key)
+				mark(key)
+			}
+		}
+		if role, _ := msg["role"].(string); role != "tool" {
+			if _, has := msg["name"]; has {
+				delete(msg, "name")
+				mark("name")
+			}
+		}
+	}
+	return removed
+}
+
+// applyPromptCacheKey 把一个稳定的不透明 key 写进请求体顶层。
+//
+// Mistral 官方文档（prompt-caching）：同一会话使用同一个 prompt_cache_key 能提高
+// 前缀缓存命中率，缓存输入按标准输入价的 10% 计费；但它**不保证命中**，只是亲和提示。
+// chat 与 responses 的请求体顶层都有这个字段。
+//
+// 客户端自己带了非空 key 时不覆盖 —— 那是它自己的会话标识，比我们推导的更贴近真实会话。
+func applyPromptCacheKey(obj map[string]any, key string) bool {
+	if key == "" {
+		return false
+	}
+	if cur, ok := obj["prompt_cache_key"].(string); ok && strings.TrimSpace(cur) != "" {
+		return false
+	}
+	obj["prompt_cache_key"] = key
+	return true
 }
 
 // shouldInjectUsageOption 解析供应商级的三态开关，inherit 时回落到全局默认。

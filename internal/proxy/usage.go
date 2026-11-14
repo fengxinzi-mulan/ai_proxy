@@ -276,10 +276,97 @@ func extractError(obj map[string]any) string {
 			return s
 		}
 	}
+	// FastAPI / Pydantic 的校验错误把原因放在 detail 数组里，只认字符串的话
+	// 这类 422 在日志里就是一片空白：
+	//   {"detail":[{"type":"extra_forbidden","loc":["body","messages",5,"assistant",
+	//   "reasoning_content"],"msg":"Extra inputs are not permitted"}]}
+	if items, ok := obj["detail"].([]any); ok {
+		if s := formatValidationDetails(items); s != "" {
+			return s
+		}
+	}
 	for _, path := range []string{"message", "detail", "error_description", "response.error.message"} {
 		if s, ok := getString(obj, path); ok && s != "" {
 			return s
 		}
 	}
 	return ""
+}
+
+// maxValidationDetails 是日志里最多展开的校验错误条数，剩下的折叠成「等 N 项」。
+// 上游一次可能列出十几条，日志列表一栏放不下那么多。
+const maxValidationDetails = 3
+
+// formatValidationDetails 把 FastAPI 风格的 detail 数组拼成一行可读文本。
+//
+// 定位信息原样保留（数组下标也留着），用户拿着
+// `body.messages[5].assistant.reasoning_content: Extra inputs are not permitted`
+// 就能直接定位到是第几条消息的哪个字段被上游拒了。
+func formatValidationDetails(items []any) string {
+	var parts []string
+	total := 0
+	for _, raw := range items {
+		s := validationDetailText(raw)
+		if s == "" {
+			continue
+		}
+		total++
+		if len(parts) < maxValidationDetails {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if total > len(parts) {
+		parts = append(parts, "等 "+strconv.Itoa(total-len(parts))+" 项")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// validationDetailText 把 detail 数组里的一项拼成一行可读文本。
+func validationDetailText(raw any) string {
+	item, ok := raw.(map[string]any)
+	if !ok {
+		// 少数上游的 detail 是纯字符串数组。
+		s, _ := raw.(string)
+		return s
+	}
+	msg, _ := getString(item, "msg")
+	if msg == "" {
+		msg, _ = getString(item, "message")
+	}
+	loc := formatValidationLoc(item["loc"])
+	switch {
+	case loc != "" && msg != "":
+		return loc + ": " + msg
+	case msg != "":
+		return msg
+	default:
+		return loc
+	}
+}
+
+// formatValidationLoc 把 [body, messages, 5, assistant] 拼成
+// body.messages[5].assistant —— 数组下标用方括号，读起来和代码里的写法一致。
+func formatValidationLoc(v any) string {
+	arr, ok := v.([]any)
+	if !ok || len(arr) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, seg := range arr {
+		switch t := seg.(type) {
+		case string:
+			if sb.Len() > 0 {
+				sb.WriteString(".")
+			}
+			sb.WriteString(t)
+		case json.Number:
+			sb.WriteString("[" + t.String() + "]")
+		case float64:
+			sb.WriteString("[" + strconv.Itoa(int(t)) + "]")
+		}
+	}
+	return sb.String()
 }

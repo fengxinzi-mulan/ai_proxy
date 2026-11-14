@@ -19,6 +19,34 @@ func feedSSE(a *analyzer, chunks ...string) {
 	framer.Flush()
 }
 
+func TestAnalyzerTerminalEvent(t *testing.T) {
+	// 终止事件 ≠ StreamFinished：chat 的 finish_reason 之后还有 usage 块和 [DONE]，
+	// 提前收工会把用量丢掉，所以只有 [DONE] 才算「客户端收到的最后一个事件」。
+	cases := []struct {
+		name   string
+		format model.APIFormat
+		event  string
+		data   string
+		want   bool
+	}{
+		{"chat 的 DONE", model.FormatOpenAI, "", "[DONE]", true},
+		{"chat 的普通数据块", model.FormatOpenAI, "", `{"choices":[]}`, false},
+		{"chat 的 usage 块", model.FormatOpenAI, "", `{"choices":[],"usage":{}}`, false},
+		{"anthropic 的 message_stop", model.FormatAnthropic, "message_stop", `{}`, true},
+		{"anthropic 的 message_delta", model.FormatAnthropic, "message_delta", `{}`, false},
+		{"responses 不走这里", model.FormatResponses, "response.completed", `{}`, false},
+		{"gemini 不走这里", model.FormatGemini, "", `{"candidates":[]}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAnalyzer(tc.format, nil, "text/event-stream")
+			if got := a.TerminalEvent(tc.event, tc.data); got != tc.want {
+				t.Errorf("TerminalEvent(%q, %q) = %v，期望 %v", tc.event, tc.data, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAnalyzerOpenAIStream(t *testing.T) {
 	body := "data: {\"id\":\"1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
 		"data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\n" +

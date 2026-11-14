@@ -194,6 +194,15 @@ export interface Provider {
   usageInjectMode: 'inherit' | 'on' | 'off'
   stripUsageChunk: boolean
 
+  /** 严格上游兼容：剔除非标准字段（thinking 等顶层字段、assistant 消息里的 reasoning_content）。默认关闭。 */
+  stripUnsupportedParams: boolean
+
+  /**
+   * prompt_cache_key 注入模式。auto 时按「会话头 → 首条消息+tools 指纹」派生一个稳定值，
+   * 提升上游前缀缓存命中率；不认这个字段的严格网关会被 422，所以默认 off。
+   */
+  promptCacheKeyMode: 'off' | 'auto'
+
   customUsage: CustomUsageMapping | null
 
   usageQuery: UsageQueryConfig
@@ -351,6 +360,42 @@ export interface LogPage {
   total: number
   page: number
   pageSize: number
+}
+
+/** 一条「这个预设会改什么」的说明。 */
+export interface PresetChange {
+  field: string
+  value: string
+  reason: string
+}
+
+/**
+ * 供应商优化预设：按上游厂商给的一整套推荐配置。
+ *
+ * 字段是「可选」的：只有出现的项才会被写进供应商配置，没出现的保持原值。
+ */
+export interface ProviderPreset {
+  id: string
+  title: string
+  summary: string
+  /** 主机后缀匹配规则，例如 mistral.ai 同时命中 api.mistral.ai。 */
+  hosts: string[]
+  changes: PresetChange[]
+  stripUnsupportedParams?: boolean
+  promptCacheKeyMode?: 'off' | 'auto'
+  usageInjectMode?: 'inherit' | 'on' | 'off'
+  continuationMode?: 'off' | 'dry-run' | 'on'
+  timeoutSeconds?: number
+}
+
+/** 数据库页级占用，用来展示「回收空间」能腾出多少。 */
+export interface DBStats {
+  pageCount: number
+  freeCount: number
+  pageSize: number
+  fileBytes: number
+  freeBytes: number
+  freeRatio: number
 }
 
 export interface MetaInfo {

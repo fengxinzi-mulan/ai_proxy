@@ -19,9 +19,10 @@ import ProviderUsagePanel from '@/components/ProviderUsagePanel.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { api } from '@/api'
 import { useAppStore } from '@/stores/app'
-import type { Provider } from '@/types'
+import type { Provider, ProviderPreset } from '@/types'
 import { API_FORMAT_LABELS } from '@/types'
 import { formatRelative } from '@/utils/format'
+import { pendingPresets } from '@/utils/preset'
 
 const store = useAppStore()
 const message = useMessage()
@@ -52,6 +53,11 @@ async function autoRefresh() {
 
 onMounted(async () => {
   if (!store.providers.length) await store.reloadProviders()
+  try {
+    presets.value = await api.listProviderPresets()
+  } catch {
+    // 拉不到预设就不显示「可优化」，不影响其他功能。
+  }
   refreshTimer = window.setInterval(() => void autoRefresh(), AUTO_REFRESH_MS)
   document.addEventListener('visibilitychange', autoRefresh)
 })
@@ -123,6 +129,36 @@ function queryUsage(p: Provider) {
 const totalKeys = computed(() =>
   store.providers.reduce((sum, p) => sum + (p.keys?.filter((k) => k.enabled && k.key).length ?? 0), 0),
 )
+
+/* ---------- 厂商优化预设 ---------- */
+
+// 预设表来自后端；卡片上只做「这个供应商还能不能被优化」的判断与一键落库。
+const presets = ref<ProviderPreset[]>([])
+const presetBusy = ref<number | null>(null)
+
+/** 这个供应商命中、但还没完全应用的预设；没有就返回 undefined。 */
+function pendingPresetOf(p: Provider): ProviderPreset | undefined {
+  return pendingPresets(presets.value, p)[0]
+}
+
+async function applyPreset(p: Provider) {
+  const preset = pendingPresetOf(p)
+  if (!preset) return
+  presetBusy.value = p.id
+  try {
+    const res = await api.applyProviderPreset(p.id, preset.id)
+    await store.reloadProviders()
+    message.success(
+      res.applied.length
+        ? `已应用「${preset.title}」优化配置（${res.applied.length} 项）`
+        : '当前配置已符合推荐',
+    )
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    presetBusy.value = null
+  }
+}
 </script>
 
 <template>
@@ -226,6 +262,15 @@ const totalKeys = computed(() =>
               提示词
             </NTag>
             <NTag v-for="t in p.tags ?? []" :key="t" size="tiny" :bordered="false">{{ t }}</NTag>
+            <NTag
+              v-if="pendingPresetOf(p)"
+              size="tiny"
+              :bordered="false"
+              type="warning"
+              :title="`检测到 ${pendingPresetOf(p)!.title}，可一键应用推荐配置`"
+            >
+              可优化
+            </NTag>
           </div>
 
           <div v-if="p.remark" class="remark">{{ p.remark }}</div>
@@ -243,6 +288,16 @@ const totalKeys = computed(() =>
           <div class="card-foot">
             <span class="foot-meta">更新于 {{ formatRelative(p.updatedAt) }}</span>
             <NSpace :size="6">
+              <NButton
+                v-if="pendingPresetOf(p)"
+                size="tiny"
+                type="primary"
+                secondary
+                :loading="presetBusy === p.id"
+                @click="applyPreset(p)"
+              >
+                优化配置
+              </NButton>
               <NButton
                 v-if="!p.active"
                 size="tiny"

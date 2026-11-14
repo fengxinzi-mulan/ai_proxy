@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"ai_proxy/internal/hub"
+	"ai_proxy/internal/model"
 	"ai_proxy/internal/proxy"
 	"ai_proxy/internal/store"
 )
@@ -158,5 +160,148 @@ func TestGetMissingProviderReturns404(t *testing.T) {
 	status, resp := doJSON(t, h, http.MethodGet, "/api/providers/999", "")
 	if status != http.StatusNotFound {
 		t.Errorf("不存在的供应商应返回 404，实际 %d: %s", status, resp)
+	}
+}
+
+// ---------- 供应商优化预设 ----------
+
+// createProvider 建一个供应商并返回落库后的对象。
+func createProvider(t *testing.T, h http.Handler, body string) model.Provider {
+	t.Helper()
+	status, resp := doJSON(t, h, http.MethodPost, "/api/providers", body)
+	if status != http.StatusOK {
+		t.Fatalf("创建供应商失败: %d %s", status, resp)
+	}
+	var p model.Provider
+	if err := json.Unmarshal([]byte(resp), &p); err != nil {
+		t.Fatalf("创建结果不是合法 JSON: %v %s", err, resp)
+	}
+	return p
+}
+
+func TestListProviderPresets(t *testing.T) {
+	_, h := newTestAPI(t)
+	status, resp := doJSON(t, h, http.MethodGet, "/api/provider-presets", "")
+	if status != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", status, resp)
+	}
+	var presets []model.ProviderPreset
+	if err := json.Unmarshal([]byte(resp), &presets); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v %s", err, resp)
+	}
+	if len(presets) == 0 || presets[0].ID != "mistral" {
+		t.Fatalf("应内置 mistral 预设，实际 %+v", presets)
+	}
+	if len(presets[0].Hosts) == 0 || len(presets[0].Changes) == 0 {
+		t.Errorf("预设缺少域名或变更说明: %+v", presets[0])
+	}
+}
+
+func TestApplyProviderPreset(t *testing.T) {
+	_, h := newTestAPI(t)
+	p := createProvider(t, h, `{"name":"mistral","displayName":"Mistral",
+		"enabled":true,"baseUrl":"https://api.mistral.ai/v1","apiFormat":"openai"}`)
+
+	status, resp := doJSON(t, h, http.MethodPost, fmt.Sprintf("/api/providers/%d/apply-preset", p.ID),
+		`{"presetId":"mistral"}`)
+	if status != http.StatusOK {
+		t.Fatalf("应用预设应返回 200，实际 %d: %s", status, resp)
+	}
+	var result struct {
+		Provider model.Provider `json:"provider"`
+		Applied  []string       `json:"applied"`
+	}
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v %s", err, resp)
+	}
+	if len(result.Applied) != 4 {
+		t.Errorf("应改动四项，实际 %v", result.Applied)
+	}
+	if !result.Provider.StripUnsupportedParams ||
+		result.Provider.PromptCacheKeyMode != model.PromptCacheKeyAuto ||
+		result.Provider.UsageInjectMode != "off" ||
+		result.Provider.TimeoutSeconds != 900 {
+		t.Errorf("预设未正确落库: %+v", result.Provider)
+	}
+
+	// 落库后重新读取，确认不是只改了内存。
+	status, resp = doJSON(t, h, http.MethodGet, fmt.Sprintf("/api/providers/%d", p.ID), "")
+	if status != http.StatusOK {
+		t.Fatalf("读取供应商失败: %d %s", status, resp)
+	}
+	var stored model.Provider
+	if err := json.Unmarshal([]byte(resp), &stored); err != nil {
+		t.Fatalf("供应商不是合法 JSON: %v", err)
+	}
+	if stored.PromptCacheKeyMode != model.PromptCacheKeyAuto || stored.TimeoutSeconds != 900 {
+		t.Errorf("重新读取后配置没变: %+v", stored)
+	}
+
+	// 幂等：第二次应用没有新改动。
+	status, resp = doJSON(t, h, http.MethodPost, fmt.Sprintf("/api/providers/%d/apply-preset", p.ID),
+		`{"presetId":"mistral"}`)
+	if status != http.StatusOK {
+		t.Fatalf("重复应用应返回 200，实际 %d: %s", status, resp)
+	}
+	if !strings.Contains(resp, `"applied":[]`) {
+		t.Errorf("重复应用不该再有改动，实际 %s", resp)
+	}
+}
+
+func TestApplyProviderPresetRejectsWrongHost(t *testing.T) {
+	_, h := newTestAPI(t)
+	p := createProvider(t, h, `{"name":"other","displayName":"别家",
+		"enabled":true,"baseUrl":"https://api.example.com/v1","apiFormat":"openai"}`)
+
+	status, resp := doJSON(t, h, http.MethodPost, fmt.Sprintf("/api/providers/%d/apply-preset", p.ID),
+		`{"presetId":"mistral"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("域名不匹配应拒绝，实际 %d: %s", status, resp)
+	}
+	if !strings.Contains(resp, "force=true") {
+		t.Errorf("错误信息应提示可以强制应用，实际 %s", resp)
+	}
+
+	// 显式强制时允许应用（自建反代的场景）。
+	status, resp = doJSON(t, h, http.MethodPost, fmt.Sprintf("/api/providers/%d/apply-preset", p.ID),
+		`{"presetId":"mistral","force":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("force=true 时应允许应用，实际 %d: %s", status, resp)
+	}
+}
+
+func TestApplyProviderPresetUnknownID(t *testing.T) {
+	_, h := newTestAPI(t)
+	p := createProvider(t, h, `{"name":"mistral","enabled":true,
+		"baseUrl":"https://api.mistral.ai/v1","apiFormat":"openai"}`)
+	status, resp := doJSON(t, h, http.MethodPost, fmt.Sprintf("/api/providers/%d/apply-preset", p.ID),
+		`{"presetId":"nope"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("未知预设应返回 400，实际 %d: %s", status, resp)
+	}
+}
+
+// ---------- 数据库空间 ----------
+
+func TestDBStatsAndVacuum(t *testing.T) {
+	_, h := newTestAPI(t)
+	status, resp := doJSON(t, h, http.MethodGet, "/api/stats/db", "")
+	if status != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", status, resp)
+	}
+	var stats store.DBStats
+	if err := json.Unmarshal([]byte(resp), &stats); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v %s", err, resp)
+	}
+	if stats.PageSize <= 0 || stats.PageCount <= 0 {
+		t.Errorf("页统计异常: %+v", stats)
+	}
+
+	status, resp = doJSON(t, h, http.MethodPost, "/api/stats/vacuum", "")
+	if status != http.StatusOK {
+		t.Fatalf("回收空间应返回 200，实际 %d: %s", status, resp)
+	}
+	if !strings.Contains(resp, "reclaimed") {
+		t.Errorf("应返回回收字节数，实际 %s", resp)
 	}
 }

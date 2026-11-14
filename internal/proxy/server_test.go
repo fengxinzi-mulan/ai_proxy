@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -164,6 +165,86 @@ func TestForwardNonStreaming(t *testing.T) {
 }
 
 // ---------- 流式转发 ----------
+
+// 上游把 delta.content 写成 thinking 分块数组时，必须归一化成字符串再转发，
+// 否则按 OpenAI 规范做类型校验的客户端（ZCode / DSH）会整轮报错。
+func TestForwardStreamingNormalizesContentArray(t *testing.T) {
+	chunks := []string{
+		"data: {\"model\":\"deepseek-v4-1-flash-1017\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"The\"}],\"closed\":true}]}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+		"data: [DONE]\n\n",
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for _, c := range chunks {
+			io.WriteString(w, c)
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4-1-flash-1017","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if strings.Contains(body, `"content":[`) {
+		t.Errorf("客户端不该收到数组形式的 content:\n%s", body)
+	}
+	if !strings.Contains(body, `"reasoning_content":"The"`) {
+		t.Errorf("思考内容应转成 reasoning_content:\n%s", body)
+	}
+	if !strings.Contains(body, `"content":"Hi"`) {
+		t.Errorf("正文增量应原样保留:\n%s", body)
+	}
+
+	entry := lastLog(t, st)
+	if !entry.ResponseModified {
+		t.Error("改写过响应字节，应标记响应被改写")
+	}
+	if !entry.Success {
+		t.Errorf("应记为成功，错误信息: %s", entry.ErrorMsg)
+	}
+}
+
+func TestForwardNonStreamNormalizesContentArray(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":[{"type":"thinking","thinking":[{"type":"text","text":"先想"}],"closed":true},{"type":"text","text":"再答"}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4-1-flash-1017","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if strings.Contains(body, `"content":[`) {
+		t.Errorf("客户端不该收到数组形式的 content: %s", body)
+	}
+	if !strings.Contains(body, `"content":"再答"`) {
+		t.Errorf("正文应拼成字符串: %s", body)
+	}
+	if !strings.Contains(body, `"reasoning_content":"先想"`) {
+		t.Errorf("思考内容应转成 reasoning_content: %s", body)
+	}
+	if entry := lastLog(t, st); !entry.ResponseModified {
+		t.Error("应标记响应被改写")
+	}
+}
 
 func TestForwardStreaming(t *testing.T) {
 	chunks := []string{
@@ -512,6 +593,181 @@ func TestForwardClientDisconnect(t *testing.T) {
 	}
 	if entry.HTTPStatus != statusClientClosedRequest {
 		t.Errorf("客户端断开应记为 %d，实际 %d", statusClientClosedRequest, entry.HTTPStatus)
+	}
+	// 客户端走了之后读上游必然拿到 context canceled，那是结果不是原因。
+	if entry.ErrorMsg != "客户端已断开连接" {
+		t.Errorf("应记录客户端断开，实际 %q", entry.ErrorMsg)
+	}
+}
+
+// cancelOnDone 是「客户端收到 [DONE] 就挂断」的模拟器。
+//
+// 真实客户端（ZCode、DSH）拿到 [DONE] 立刻关闭连接；代理如果继续读上游，
+// 就会读到 context canceled，把一条正常完成的请求记成「已取消」。
+type cancelOnDone struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+	seen   bool
+}
+
+func (c *cancelOnDone) Write(p []byte) (int, error) {
+	n, err := c.ResponseRecorder.Write(p)
+	if !c.seen && bytes.Contains(c.ResponseRecorder.Body.Bytes(), []byte("[DONE]")) {
+		c.seen = true
+		c.cancel()
+	}
+	return n, err
+}
+
+func TestForwardChatDoneThenClientCancelIsSuccess(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `data: {"model":"m","choices":[{"delta":{"content":"好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`+"\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+		// 客户端已经拿到 [DONE] 走人，但上游这条连接还没结束。
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	ctx, cancel := context.WithCancel(req.Context())
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	rec := &cancelOnDone{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}
+	srv.ServeHTTP(rec, req)
+
+	entry := lastLog(t, st)
+	if !rec.seen {
+		t.Fatal("测试没有走到 [DONE] 就结束了")
+	}
+	if entry.Cancelled {
+		t.Errorf("收到 [DONE] 后客户端断开不该记成已取消，实际 errorMsg=%q", entry.ErrorMsg)
+	}
+	if !entry.Success {
+		t.Errorf("流已正常收尾，应记为成功，实际 errorMsg=%q", entry.ErrorMsg)
+	}
+	// 用量来自 [DONE] 之前的收尾块，必须照常统计。
+	if entry.CompletionTokens != 1 || entry.PromptTokens != 5 {
+		t.Errorf("用量统计丢失: prompt=%d completion=%d", entry.PromptTokens, entry.CompletionTokens)
+	}
+}
+
+// 供应商配的是 openai-responses，客户端却打 /v1/chat/completions（DSH 同时用两个端点）。
+// 响应必须按「这次请求的形状」解析：分块数组要拍平，用量要按 chat 解析，
+// 否则客户端会报 text-delta text must be a string。
+func TestForwardChatShapeOnResponsesProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `data: {"model":"m","choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"想"}],"closed":true}]},"finish_reason":null}]}`+"\n\n")
+		io.WriteString(w, `data: {"choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`+"\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatResponses)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"reasoning_content":"想"`) {
+		t.Errorf("thinking 分块应挪到 reasoning_content，实际响应: %s", body)
+	}
+	if strings.Contains(body, `"content":[{"type"`) {
+		t.Errorf("content 分块数组应被拍平成字符串，实际响应: %s", body)
+	}
+
+	entry := lastLog(t, st)
+	if entry.APIFormat != string(model.FormatOpenAI) {
+		t.Errorf("日志应按实际请求形状记 openai，实际 %q", entry.APIFormat)
+	}
+	if entry.PromptTokens != 10 || entry.CompletionTokens != 2 || entry.TokensEstimated {
+		t.Errorf("用量应按 chat 解析: prompt=%d completion=%d 估算=%v",
+			entry.PromptTokens, entry.CompletionTokens, entry.TokensEstimated)
+	}
+	if !entry.Success {
+		t.Errorf("应记为成功，实际 errorMsg=%q", entry.ErrorMsg)
+	}
+}
+
+// ---------- 上游报错的日志 ----------
+
+func TestForwardRecordsPydanticValidationError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		io.WriteString(w, `{"detail":[{"type":"extra_forbidden",
+			"loc":["body","messages",1,"assistant","reasoning_content"],
+			"msg":"Extra inputs are not permitted","input":"回放的思维链"}]}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("上游状态码应原样透传，实际 %d", rec.Code)
+	}
+	entry := lastLog(t, st)
+	if entry.Success {
+		t.Error("422 不应记为成功")
+	}
+	// 日志必须能说清是哪个字段被拒，否则列表里就只有一条没有原因的红色记录。
+	if !strings.Contains(entry.ErrorMsg, "Extra inputs are not permitted") {
+		t.Errorf("应记录上游的错误描述，实际 %q", entry.ErrorMsg)
+	}
+	if !strings.Contains(entry.ErrorMsg, "messages[1].assistant.reasoning_content") {
+		t.Errorf("应记录出错位置，实际 %q", entry.ErrorMsg)
+	}
+}
+
+func TestForwardRecordsFallbackForOpaqueErrorBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, `<html><body>502 Bad Gateway</body></html>`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[]}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	entry := lastLog(t, st)
+	if entry.Success {
+		t.Error("502 不应记为成功")
+	}
+	if entry.ErrorMsg == "" {
+		t.Error("不认识错误结构时也要留下状态码，不能空着")
+	}
+	if !strings.Contains(entry.ErrorMsg, "502") {
+		t.Errorf("兜底信息应包含状态码，实际 %q", entry.ErrorMsg)
 	}
 }
 

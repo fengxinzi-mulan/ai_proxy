@@ -116,6 +116,39 @@ func (s *Store) diskBytes() int64 {
 	return total
 }
 
+// DBStats 描述 SQLite 的页级占用。
+//
+// 删除行只会把页面挂进 freelist，文件不会自己缩小；界面据此告诉用户
+// 「现在点回收能腾出多少」，而不是让人对着一个 2 GB 的文件猜。
+type DBStats struct {
+	PageCount int64   `json:"pageCount"`
+	FreeCount int64   `json:"freeCount"`
+	PageSize  int64   `json:"pageSize"`
+	FileBytes int64   `json:"fileBytes"` // 主文件 + WAL
+	FreeBytes int64   `json:"freeBytes"` // 可回收的上限
+	FreeRatio float64 `json:"freeRatio"` // 空闲页占比 0..1
+}
+
+// PageStats 读取数据库的页级占用。
+func (s *Store) PageStats() (DBStats, error) {
+	var st DBStats
+	if err := s.db.QueryRow(`PRAGMA page_count`).Scan(&st.PageCount); err != nil {
+		return st, fmt.Errorf("读取数据库页数失败: %w", err)
+	}
+	if err := s.db.QueryRow(`PRAGMA freelist_count`).Scan(&st.FreeCount); err != nil {
+		return st, fmt.Errorf("读取数据库空闲页数失败: %w", err)
+	}
+	if err := s.db.QueryRow(`PRAGMA page_size`).Scan(&st.PageSize); err != nil {
+		return st, fmt.Errorf("读取数据库页大小失败: %w", err)
+	}
+	st.FileBytes = s.diskBytes()
+	st.FreeBytes = st.FreeCount * st.PageSize
+	if st.PageCount > 0 {
+		st.FreeRatio = float64(st.FreeCount) / float64(st.PageCount)
+	}
+	return st, nil
+}
+
 // migration 是一次结构变更。版本号单调递增，且一旦发布不可修改。
 type migration struct {
 	version int
@@ -260,6 +293,21 @@ var migrations = []migration{
 		stmts: []string{
 			`ALTER TABLE providers ADD COLUMN continuation_cooldown_seconds INTEGER NOT NULL DEFAULT -1`,
 			`ALTER TABLE providers ADD COLUMN continuation_invalid_cooldown_seconds INTEGER NOT NULL DEFAULT -1`,
+		},
+	},
+	{
+		// 严格上游兼容：剔除非标准顶层字段。默认 0，避免影响认 thinking 的网关。
+		version: 7,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN strip_unsupported_params INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		// prompt_cache_key 注入模式。默认 off：这是上游厂商（Mistral 等）的
+		// 缓存亲和提示，不认这个字段的严格网关会 422，必须按供应商显式开启。
+		version: 8,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN prompt_cache_key_mode TEXT NOT NULL DEFAULT 'off'`,
 		},
 	},
 }

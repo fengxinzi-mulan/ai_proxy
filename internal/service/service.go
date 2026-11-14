@@ -255,11 +255,24 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	return err
 }
 
+// 自动回收空间的触发门槛。
+//
+// 保留策略每小时删一批行，但 DELETE 只是把页面挂进 freelist，文件不会变小；
+// 空闲页少的时候重建整库不划算，所以只在「删得多、空闲比例高」时动一次，
+// 且一天最多一次 —— VACUUM 期间独占连接（MaxOpenConns=1），不能太频繁。
+const (
+	autoVacuumMinFreePages int64 = 1000
+	autoVacuumMinFreeRatio       = 0.2
+	autoVacuumInterval           = 24 * time.Hour
+)
+
 // runLogCleanup 按保留策略定期清理历史日志。
 func runLogCleanup(ctx context.Context, st *store.Store, logger *slog.Logger) {
 	// 启动后先等一会儿再清理，避免和启动阶段抢数据库。
 	timer := time.NewTimer(30 * time.Second)
 	defer timer.Stop()
+
+	var lastVacuum time.Time
 
 	for {
 		select {
@@ -274,9 +287,34 @@ func runLogCleanup(ctx context.Context, st *store.Store, logger *slog.Logger) {
 				logger.Warn("清理历史日志失败", "err", err)
 			} else if n > 0 {
 				logger.Info("已清理历史日志", "count", n)
+				maybeAutoVacuum(st, logger, &lastVacuum)
 			}
 		}
 		timer.Reset(time.Hour)
+	}
+}
+
+// maybeAutoVacuum 在清理之后判断要不要顺手回收磁盘。
+func maybeAutoVacuum(st *store.Store, logger *slog.Logger, last *time.Time) {
+	if time.Since(*last) < autoVacuumInterval {
+		return
+	}
+	stats, err := st.PageStats()
+	if err != nil {
+		logger.Warn("读取数据库页统计失败", "err", err)
+		return
+	}
+	if stats.FreeCount < autoVacuumMinFreePages || stats.FreeRatio < autoVacuumMinFreeRatio {
+		return
+	}
+	reclaimed, err := st.Vacuum()
+	if err != nil {
+		logger.Warn("清理后回收数据库空间失败", "err", err)
+		return
+	}
+	*last = time.Now()
+	if reclaimed > 0 {
+		logger.Info("已回收数据库空间", "reclaimedBytes", reclaimed, "freeRatio", stats.FreeRatio)
 	}
 }
 

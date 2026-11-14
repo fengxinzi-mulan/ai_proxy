@@ -62,6 +62,20 @@ const (
 	ContinuationOn     = "on"
 )
 
+// prompt_cache_key 的注入模式。
+//
+//   - off：完全不注入，保持原样透传。
+//   - auto：从会话头（X-Session-Id 等）或「稳定前缀指纹」派生一个不透明 key
+//     注入到请求体顶层。Mistral 官方文档说明：同一会话使用同一个 prompt_cache_key
+//     可以提高前缀缓存命中率（缓存输入按 10% 计费），但**不保证命中**。
+//
+// 默认 off：部分严格网关的请求体是 additionalProperties=false 且不认识这个字段，
+// 注入会直接 422，所以必须由用户按供应商显式开启。
+const (
+	PromptCacheKeyOff  = "off"
+	PromptCacheKeyAuto = "auto"
+)
+
 // 续传冷却默认值。0 表示不冷却；provider 里的负值表示「未配置」，
 // ApplyDefaults 会补成这里的默认值。
 const (
@@ -219,6 +233,18 @@ type Provider struct {
 	UsageInjectMode string `json:"usageInjectMode"` // inherit | on | off
 	StripUsageChunk bool   `json:"stripUsageChunk"`
 
+	// StripUnsupportedParams 开启后，OpenAI / Responses 格式的请求体会剔除非标准
+	// 字段：顶层的 thinking / enable_thinking / thinking_budget（Chat 还含 store），
+	// 以及 assistant 消息里回放的思维链 reasoning_content / reasoning_details /
+	// reasoning。用来对接只认 OpenAI 规范、其余字段一律 422 的严格上游
+	// （例如 Mistral 的 extra="forbid" schema）。
+	// 默认关闭：不少兼容网关确实认 thinking，不能替用户做主。
+	StripUnsupportedParams bool `json:"stripUnsupportedParams"`
+
+	// PromptCacheKeyMode 控制是否给请求注入 prompt_cache_key（off | auto）。
+	// 只对 OpenAI 系格式生效；客户端自己带了 key 时不覆盖。
+	PromptCacheKeyMode string `json:"promptCacheKeyMode"`
+
 	// 自定义用量映射（apiFormat=custom 时使用）
 	CustomUsage *CustomUsageMapping `json:"customUsage"`
 
@@ -350,6 +376,11 @@ func (p *Provider) ApplyDefaults() {
 	case ModeInherit, "on", "off":
 	default:
 		p.UsageInjectMode = ModeInherit
+	}
+	switch p.PromptCacheKeyMode {
+	case PromptCacheKeyOff, PromptCacheKeyAuto:
+	default:
+		p.PromptCacheKeyMode = PromptCacheKeyOff
 	}
 	if p.Prompt.Strategy == "" {
 		p.Prompt.Strategy = StrategyAppend

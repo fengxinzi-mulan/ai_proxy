@@ -73,8 +73,11 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/providers/{id}/activate", s.handleActivateProvider)
 	mux.HandleFunc("POST /api/providers/{id}/test", s.handleTestProvider)
 	mux.HandleFunc("POST /api/providers/{id}/models", s.handleProviderModels)
+	mux.HandleFunc("POST /api/providers/{id}/apply-preset", s.handleApplyProviderPreset)
 	mux.HandleFunc("GET /api/providers/{id}/keys", s.handleKeyHealth)
 	mux.HandleFunc("POST /api/providers/{id}/usage", s.handleProviderUsage)
+	// 优化预设：界面按域名识别厂商、展示「会改什么」都读这张表。
+	mux.HandleFunc("GET /api/provider-presets", s.handleListProviderPresets)
 
 	mux.HandleFunc("GET /api/logs", s.handleListLogs)
 	mux.HandleFunc("DELETE /api/logs", s.handleDeleteLogs)
@@ -86,6 +89,8 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/stats/timeseries", s.handleTimeSeries)
 	mux.HandleFunc("GET /api/stats/by-model", s.handleByModel)
 	mux.HandleFunc("GET /api/stats/by-provider", s.handleByProvider)
+	mux.HandleFunc("GET /api/stats/db", s.handleDBStats)
+	mux.HandleFunc("POST /api/stats/vacuum", s.handleVacuum)
 	mux.HandleFunc("GET /api/live", s.handleLive)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 }
@@ -446,6 +451,95 @@ func (s *Server) handleKeyHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, s.proxy.KeyHealth(prov))
+}
+
+// handleListProviderPresets 返回内置的供应商优化预设。
+//
+// 界面用它在「新建 / 编辑供应商」时按域名识别厂商，并把「会改哪几项、为什么」
+// 摆给用户确认；预设本身留在后端，避免前后端两份配置互相漂移。
+func (s *Server) handleListProviderPresets(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, model.ProviderPresets())
+}
+
+// handleApplyProviderPreset 把某个预设写到已保存的供应商上。
+//
+// 默认只在 BaseURL 命中预设域名时允许应用，防止手滑把别的供应商改坏；
+// 确实要用在自建反代上时，请求体里带 force=true 显式跳过域名校验。
+// 只改预设列出的字段（严格兼容 / 缓存键 / 用量注入 / 续传 / 超时），
+// 密钥、代理、提示词、模型映射一概不动。
+func (s *Server) handleApplyProviderPreset(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.pathID(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		PresetID string `json:"presetId"`
+		Force    bool   `json:"force"`
+	}
+	if !s.decode(w, r, &body) {
+		return
+	}
+	preset, found := model.LookupProviderPreset(strings.TrimSpace(body.PresetID))
+	if !found {
+		s.writeError(w, http.StatusBadRequest, "未知的优化预设: "+body.PresetID)
+		return
+	}
+	prov, err := s.store.GetProvider(id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if !body.Force && !preset.AppliesTo(prov.BaseURL) {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"供应商「%s」的 BaseURL 不属于 %s，如确需应用请带 force=true",
+			prov.DisplayName, preset.Title))
+		return
+	}
+	applied := preset.Apply(&prov)
+	if len(applied) == 0 {
+		s.writeJSON(w, http.StatusOK, map[string]any{"provider": prov, "applied": []string{}})
+		return
+	}
+	updated, err := s.store.UpdateProvider(prov)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.logger.Info("已应用供应商优化预设", "provider", updated.Name, "preset", preset.ID, "fields", applied)
+	s.writeJSON(w, http.StatusOK, map[string]any{"provider": updated, "applied": applied})
+}
+
+// handleDBStats 报告数据库的空闲页：删掉的行只进 freelist，文件不会自己变小。
+func (s *Server) handleDBStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.PageStats()
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, stats)
+}
+
+// handleVacuum 重建数据库文件，把 freelist 真正还给文件系统。
+//
+// 与「清空日志」不同，它不删任何数据，只是让文件大小回到真实占用，
+// 所以可以放心做成界面上的常规按钮。
+func (s *Server) handleVacuum(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.PageStats()
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	reclaimed, err := s.store.Vacuum()
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.logger.Info("已回收数据库空间", "reclaimedBytes", reclaimed, "fileBytesBefore", stats.FileBytes)
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"reclaimed": reclaimed,
+		"before":    stats.FileBytes,
+		"after":     stats.FileBytes - reclaimed,
+	})
 }
 
 // handleProviderUsage 立即查询一次套餐余量并落库。

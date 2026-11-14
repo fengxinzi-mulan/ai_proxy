@@ -168,6 +168,25 @@ func (a *analyzer) Done() bool { return a.done }
 // 一条有内容却始终没有终止信号的流，基本可以判定被中途切断了。
 func (a *analyzer) StreamFinished() bool { return a.terminal }
 
+// TerminalEvent 判断某个 SSE 事件是不是「客户端应该收到的最后一个事件」。
+//
+// 它和 StreamFinished 的区别很关键：OpenAI Chat 的 finish_reason 之后还有
+// 用量块和 [DONE]，所以在 finish_reason 上收工会把统计丢掉；只有 [DONE]
+// 才是真·末尾。Anthropic 同理，message_stop 之后不会再有事件。
+//
+// 用途：转发层收到终止事件后立刻停止读上游。否则客户端拿到 [DONE] 就关连接，
+// 我们还在读，拿到一个 context canceled，把一条正常完成的请求记成「已取消」。
+func (a *analyzer) TerminalEvent(event, data string) bool {
+	switch a.format {
+	case model.FormatOpenAI:
+		return data == "[DONE]"
+	case model.FormatAnthropic:
+		return event == "message_stop"
+	default:
+		return false
+	}
+}
+
 // Truncated 报告非流式响应体是否因超限而放弃了解析。
 func (a *analyzer) Truncated() bool { return a.bodyOver }
 

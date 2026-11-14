@@ -1,10 +1,13 @@
 // Package proxy 实现请求的透明转发与全程记账。
 //
-// 核心承诺：除了用户显式开启的请求体改写（usage 注入、提示词注入）之外，
-// 请求与响应都按原字节透传，不做格式转换、不做字段裁剪。
+// 核心承诺：除了用户显式开启的请求体改写（usage 注入、提示词注入、严格上游
+// 字段裁剪）之外，请求按原字节转发；响应只在两种情况下动字节——用户开启的
+// 「剥离 usage 块」，以及把非标准的 chat/completions content 数组拍平成字符串
+//（不改内容的语义，只为让按 OpenAI 规范校验的客户端能正常解析）。
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -122,6 +125,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 而 Gemini 这两项都不在请求体里（模型在路径上，流式靠 :streamGenerateContent / alt=sse）。
 	in.model = modelNameForRequest(prov.APIFormat, in.clientPath, reqBody)
 	in.wantStream = requestWantsStream(prov.APIFormat, in.clientPath, r.URL.RawQuery, reqBody)
+	// 响应按「这次请求实际用的协议」解析，而不是供应商配置的协议：
+	// DSH 会同时打 /v1/chat/completions 和 /v1/responses，供应商却只能配一种。
+	in.format = effectiveFormat(prov.APIFormat, in.clientPath)
 
 	// 模型映射：把客户端请求的模型名换成目标模型名。非 Gemini 的格式模型名在请求体里，
 	// 由 rewriteRequestBody 改写；Gemini 的模型名在 URL 路径上，必须在拼上游地址之前
@@ -133,7 +139,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	in.outBody, in.modifications = rewriteRequestBody(prov, settings, reqBody, in.model)
+	// 会话标识先于改写算好：prompt_cache_key 要用它保持多轮稳定。
+	in.outBody, in.modifications = rewriteRequestBodyOpts(prov, settings, reqBody, in.model, rewriteOptions{
+		cacheKeySeed: sessionCacheSeed(r),
+	})
 
 	s.forward(w, r, in)
 }
@@ -155,6 +164,37 @@ type forwardInput struct {
 	outBody       []byte // 改写后实际发出的请求体
 	modifications []string
 	continuation  *continuationAttempt
+	// format 是「这次请求实际用的协议」，由请求路径推导（见 effectiveFormat）。
+	// 响应解析、归一化、统计都看它，而不是供应商配置的 apiFormat。
+	format model.APIFormat
+}
+
+// apiFormat 返回本次请求实际使用的协议。
+//
+// ServeHTTP 里已经按路径算好 in.format；这里保留一个回落，是为了 relay 等
+// 直接构造 forwardInput 的调用方（测试、失败路径）不显式设置时仍按供应商配置走。
+func (in forwardInput) apiFormat() model.APIFormat {
+	if in.format != "" {
+		return in.format
+	}
+	return in.provider.APIFormat
+}
+
+// effectiveFormat 决定这次请求按哪种协议解析响应。
+//
+// 不能只看供应商配置的 apiFormat：客户端可能把 /v1/chat/completions 打到配置成
+// openai-responses 的供应商上（DSH 就同时用两个端点）。响应解析、归一化、用量统计
+// 都必须跟着「实际这条请求的形状」走，否则 chat 的分块数组没人拍平，客户端会
+// 直接报 text-delta text must be a string。
+func effectiveFormat(fallback model.APIFormat, clientPath string) model.APIFormat {
+	path := strings.TrimSuffix(clientPath, "/")
+	switch {
+	case strings.HasSuffix(path, "/chat/completions"):
+		return model.FormatOpenAI
+	case strings.HasSuffix(path, "/responses"):
+		return model.FormatResponses
+	}
+	return fallback
 }
 
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput) {
@@ -217,6 +257,16 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput
 	// 按状态码决定是否让该密钥进入冷却。
 	s.keys.Report(prov.ID, key.ID, resp.StatusCode, "")
 
+	// 非流式 chat 响应可能要改写 content 数组，长度会随之变化。必须在写响应头
+	// 之前把上游的 Content-Length 摘掉，让 Go 走分块传输，否则客户端会按旧长度
+	// 截断或一直等剩余字节。
+	if in.apiFormat() == model.FormatOpenAI &&
+		!isEventStream(resp.Header.Get("Content-Type")) &&
+		!hasNonIdentityEncoding(resp.Header.Get("Content-Encoding")) {
+		resp.Header.Del("Content-Length")
+		resp.ContentLength = -1
+	}
+
 	copyResponseHeaders(w.Header(), resp.Header, prov.StripUsageChunk)
 	w.WriteHeader(resp.StatusCode)
 
@@ -270,7 +320,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 
 	// 上游用了压缩时无法旁路解析用量，直接退化为估算。
 	compressed := hasNonIdentityEncoding(resp.Header.Get("Content-Encoding"))
-	an := newAnalyzer(prov.APIFormat, prov.CustomUsage, resp.Header.Get("Content-Type"))
+	an := newAnalyzer(in.apiFormat(), prov.CustomUsage, resp.Header.Get("Content-Type"))
 
 	capture := newCapture(in.settings.StoreBodies, in.settings.MaxBodyBytes)
 
@@ -313,20 +363,31 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 			}
 			// 「剥离 usage 块」只影响回传给客户端的字节；统计该看的一个都不能少，
 			// 否则开了这个开关用量就退化成估算值了。
+			analyzerData := data
 			if prov.StripUsageChunk && an.IsUsageOnlyChunk(event, data) {
 				respModded = true
 			} else {
-				n, err := w.Write(raw)
-				if err == nil && n != len(raw) {
+				out := raw
+				// chat/completions 的 content 偶尔是分块数组，客户端按规范只认
+				// 字符串，这里按事件归一化后再转发；分析器同样看归一化后的内容。
+				if in.apiFormat() == model.FormatOpenAI {
+					if replaced, newData, ok := normalizeChatSSEEvent(event, data); ok {
+						out = replaced
+						analyzerData = newData
+						respModded = true
+					}
+				}
+				n, err := w.Write(out)
+				if err == nil && n != len(out) {
 					err = io.ErrShortWrite
 				}
 				if err != nil {
 					writeErr = err
 					return
 				}
-				capture.add(raw)
+				capture.add(out)
 			}
-			an.OnEvent(event, data)
+			an.OnEvent(event, analyzerData)
 			if !ttftSeen && an.HasContent() {
 				ttftSeen = true
 				ttft = time.Since(in.start)
@@ -337,8 +398,15 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 				s.live.UpdateTokens(liveID, an.EstimateOutputTokens())
 			}
 			flush()
-			if writeErr == nil && prov.APIFormat == model.FormatResponses && an.StreamFinished() {
-				terminalDelivered = true
+			// 交付了终止事件就不再读上游：Chat 的 [DONE]、Anthropic 的
+			// message_stop、Responses 的 response.completed/failed/incomplete。
+			// 少了这一步，客户端收完就关连接，我们还在读，会拿到一个
+			// context canceled，把一条正常完成的请求记成「已取消」。
+			if writeErr == nil {
+				if an.TerminalEvent(event, analyzerData) ||
+					(in.apiFormat() == model.FormatResponses && an.StreamFinished()) {
+					terminalDelivered = true
+				}
 			}
 		})
 
@@ -366,6 +434,27 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		}
 	} else {
 		flush()
+		// 非流式 chat/completions 同样可能把 content 写成数组。整体解析才能改，
+		// 所以先读进内存（有上限），改完再交回原来的转发循环；超限就放弃改写、
+		// 原样透传，避免为了一次兼容把内存吃穿。
+		var pendingReadErr error
+		if in.apiFormat() == model.FormatOpenAI && !compressed {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxNormalizeBodyBytes+1))
+			pendingReadErr = readErr
+			if int64(len(body)) <= maxNormalizeBodyBytes {
+				resp.Body.Close()
+				if out, changed := normalizeChatResponseBody(body); changed {
+					body = out
+					respModded = true
+				}
+				resp.Body = io.NopCloser(bytes.NewReader(body))
+			} else {
+				resp.Body = prefixedReadCloser{
+					Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
+					Closer: resp.Body,
+				}
+			}
+		}
 		for writeErr == nil {
 			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
@@ -387,6 +476,9 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 				break
 			}
 		}
+		if pendingReadErr != nil {
+			readFailure(pendingReadErr)
+		}
 		flush()
 	}
 
@@ -400,7 +492,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	usage := an.Result()
 	if !usage.Found {
 		// 上游没给用量：输入从头估算，输出按流式增量估算。
-		usage.PromptTokens = estimatePromptTokens(prov.APIFormat, in.outBody)
+		usage.PromptTokens = estimatePromptTokens(in.apiFormat(), in.outBody)
 		usage.CompletionTokens = an.EstimateOutputTokens()
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 		usage.Estimated = true
@@ -414,7 +506,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	res.contentSeen = an.HasContent()
 	res.streaming = an.Streaming()
 	res.streamFinished = an.StreamFinished()
-	if prov.APIFormat == model.FormatResponses {
+	if in.apiFormat() == model.FormatResponses {
 		res.responseStatus = an.FinishReason()
 		res.terminalDelivered = terminalDelivered
 		if res.streaming && !compressed && !res.streamFinished && res.analyzerErr == "" {
@@ -433,9 +525,9 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	}
 	if !terminalDelivered && isClientGone(r, nil) {
 		res.cancelled = true
-		if res.errMsg == "" {
-			res.errMsg = "客户端已断开连接"
-		}
+		// 客户端一断，正在读的上游流必然返回 context canceled。那是结果、不是原因，
+		// 留着它日志里就全是「读取上游响应失败: context canceled」这种误导性文案。
+		res.errMsg = "客户端已断开连接"
 	}
 	return res
 }
@@ -482,9 +574,9 @@ func (s *Server) record(in forwardInput, res logResult) {
 		Model:           in.model,
 		ModelMapped:     in.modelMapped,
 		ModelResponse:   res.model,
-		APIFormat:       string(in.provider.APIFormat),
+		APIFormat:       string(in.apiFormat()),
 		Stream:          in.wantStream,
-		ReasoningEffort: extractReasoningEffort(in.provider.APIFormat, in.outBody),
+		ReasoningEffort: extractReasoningEffort(in.apiFormat(), in.outBody),
 		ClientIP:        in.clientIP,
 
 		RequestModified:  len(in.modifications) > 0,
@@ -532,6 +624,11 @@ func (s *Server) record(in forwardInput, res logResult) {
 	if entry.ErrorMsg == "" && res.streaming && res.contentSeen && !res.streamFinished {
 		entry.ErrorMsg = "流式响应未正常结束（上游提前关闭连接）"
 	}
+	// 兜底：上游明确报错（4xx/5xx）但响应体不是我们认识的错误结构（例如网关返回
+	// HTML 错误页）时，至少让日志说明是哪个状态码，而不是一条红色但没有原因的记录。
+	if entry.ErrorMsg == "" && entry.HTTPStatus >= 400 {
+		entry.ErrorMsg = fmt.Sprintf("上游返回 HTTP %d（响应体未给出错误描述）", entry.HTTPStatus)
+	}
 	entry.Success = isSuccess(res, entry.ErrorMsg)
 
 	if in.settings.StoreBodies {
@@ -548,7 +645,7 @@ func (s *Server) record(in forwardInput, res logResult) {
 		s.logger.Error("写入请求日志失败", "err", err)
 	}
 	entry.ID = id
-	if in.provider.APIFormat == model.FormatResponses {
+	if in.apiFormat() == model.FormatResponses {
 		s.logger.Debug("Responses 转发结束", "request_id", entry.ID, "response_status", res.responseStatus,
 			"terminal_delivered", res.terminalDelivered, "http_status", res.status,
 			"success", entry.Success, "cancelled", entry.Cancelled, "error", entry.ErrorMsg)

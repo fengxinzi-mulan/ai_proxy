@@ -115,6 +115,450 @@ func TestRewriteUsageInjectModeOverride(t *testing.T) {
 	}
 }
 
+// ---------- 严格上游兼容：developer 角色与 thinking 字段 ----------
+
+func TestRewriteNormalizesDeveloperRole(t *testing.T) {
+	st := model.DefaultSettings()
+	body := []byte(`{"model":"m","stream":false,"messages":[{"role":"developer","content":"sys"},{"role":"user","content":"hi"}]}`)
+
+	out, mods := rewriteRequestBody(baseProvider(), st, body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "role_developer_to_system" {
+		t.Fatalf("应记录 role_developer_to_system，实际 %v", mods)
+	}
+	msgs := decode(t, out)["messages"].([]any)
+	if role := msgs[0].(map[string]any)["role"]; role != "system" {
+		t.Errorf("developer 应改成 system，实际 %v", role)
+	}
+	if role := msgs[1].(map[string]any)["role"]; role != "user" {
+		t.Errorf("其它角色不该被改动，实际 %v", role)
+	}
+}
+
+func TestRewriteNormalizesDeveloperRoleInResponsesInput(t *testing.T) {
+	p := baseProvider()
+	p.APIFormat = model.FormatResponses
+	body := []byte(`{"model":"m","input":[{"type":"message","role":"developer","content":"sys"},{"type":"message","role":"user","content":"hi"}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "role_developer_to_system" {
+		t.Fatalf("Responses 的 input 也应归一化，实际 %v", mods)
+	}
+	items := decode(t, out)["input"].([]any)
+	if role := items[0].(map[string]any)["role"]; role != "system" {
+		t.Errorf("developer 应改成 system，实际 %v", role)
+	}
+}
+
+func TestRewriteLeavesAnthropicDeveloperRoleAlone(t *testing.T) {
+	p := baseProvider()
+	p.APIFormat = model.FormatAnthropic
+	body := []byte(`{"model":"m","messages":[{"role":"developer","content":"sys"}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("非 OpenAI 系格式不该动角色，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
+	}
+}
+
+func TestRewriteStripsUnsupportedParamsWhenEnabled(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	body := []byte(`{"model":"m","stream":false,"messages":[],"thinking":{"type":"enabled"},"enable_thinking":true,"reasoning_effort":"low"}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 2 || mods[0] != "strip_thinking" || mods[1] != "strip_enable_thinking" {
+		t.Fatalf("应记录两个 strip 改动，实际 %v", mods)
+	}
+	m := decode(t, out)
+	if _, ok := m["thinking"]; ok {
+		t.Error("thinking 应被删除")
+	}
+	if _, ok := m["enable_thinking"]; ok {
+		t.Error("enable_thinking 应被删除")
+	}
+	if m["reasoning_effort"] != "low" {
+		t.Errorf("标准字段不该被牵连: %v", m["reasoning_effort"])
+	}
+}
+
+func TestRewriteStripsStoreForChat(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	// Mistral 的 chat schema 里没有 store，传 false 也一样 422。
+	body := []byte(`{"model":"m","stream":false,"messages":[],"store":false}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_store" {
+		t.Fatalf("chat 格式应裁掉 store，实际 %v", mods)
+	}
+	if _, ok := decode(t, out)["store"]; ok {
+		t.Error("store 应被删除")
+	}
+}
+
+func TestRewriteStripsStoreForResponsesWhenContinuationOff(t *testing.T) {
+	p := baseProvider()
+	p.APIFormat = model.FormatResponses
+	p.StripUnsupportedParams = true
+	// Mistral 的 Responses API 是无状态的：store 只能为 false，客户端传 true 直接 400。
+	// 续传没开的时候，留着这个字段只会把请求打穿，所以一并裁掉。
+	body := []byte(`{"model":"m","input":"hi","store":true}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_store" {
+		t.Fatalf("Responses 在续传关闭时应裁掉 store，实际 %v", mods)
+	}
+	if _, ok := decode(t, out)["store"]; ok {
+		t.Error("store 应被删除")
+	}
+}
+
+func TestRewriteStripsPreviousResponseIDForStatelessResponses(t *testing.T) {
+	p := baseProvider()
+	p.APIFormat = model.FormatResponses
+	p.StripUnsupportedParams = true
+	// 无状态上游引用不到上一轮响应，带着 previous_response_id 只会 400。
+	body := []byte(`{"model":"m","input":"hi","previous_response_id":"resp_1"}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_previous_response_id" {
+		t.Fatalf("应裁掉 previous_response_id，实际 %v", mods)
+	}
+	if _, ok := decode(t, out)["previous_response_id"]; ok {
+		t.Error("previous_response_id 应被删除")
+	}
+}
+
+func TestRewriteKeepsStoreForResponsesWhenContinuationOn(t *testing.T) {
+	p := baseProvider()
+	p.APIFormat = model.FormatResponses
+	p.StripUnsupportedParams = true
+	p.ContinuationMode = model.ContinuationOn
+	// 续传真的要用 store，这时不能跟着 chat 一起裁，否则功能直接失效。
+	body := []byte(`{"model":"m","input":"hi","store":true}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("续传开启时不该裁 store，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
+	}
+}
+
+func TestRewriteStripsStoreWhenResponsesBodyOnChatProvider(t *testing.T) {
+	p := baseProvider() // 供应商配的是 openai，客户端却打了 /v1/responses
+	p.StripUnsupportedParams = true
+	body := []byte(`{"model":"m","input":"hi","store":true}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_store" {
+		t.Fatalf("Responses 结构的 body 在续传关闭时也应裁 store，实际 %v", mods)
+	}
+	if _, ok := decode(t, out)["store"]; ok {
+		t.Error("store 应被删除")
+	}
+}
+
+func TestRewriteKeepsUnsupportedParamsByDefault(t *testing.T) {
+	body := []byte(`{"model":"m","stream":false,"messages":[],"thinking":{"type":"enabled"}}`)
+
+	out, mods := rewriteRequestBody(baseProvider(), model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("默认不该裁剪 thinking，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
+	}
+}
+
+func TestRewriteKeepsNestedThinkingChunks(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	// 消息内容里的 {"type":"thinking"} 是上游正常结构，只能删顶层字段。
+	body := []byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":[{"type":"thinking","thinking":"推理内容"}]}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("嵌套结构不该被裁掉，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("嵌套 thinking 场景应原样返回")
+	}
+}
+
+func TestRewriteStripsReasoningContentFromAssistantMessages(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	// 回放过思维链的真实形状：assistant 消息顶层多带一个 reasoning_content。
+	// Mistral 的 messages schema 是 extra="forbid"，带着就整条 422。
+	body := []byte(`{"model":"m","stream":false,"messages":[
+		{"role":"system","content":"sys"},
+		{"role":"assistant","content":"第一轮","reasoning_content":"想一想"},
+		{"role":"user","content":"接着说"},
+		{"role":"assistant","content":[{"type":"text","text":"第二轮"}],"reasoning_content":"再想想","tool_calls":[]}
+	]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	// 两条 assistant 消息各带一个，日志里只该留一个标记。
+	if len(mods) != 1 || mods[0] != "strip_reasoning_content" {
+		t.Fatalf("应只记录一个 strip_reasoning_content，实际 %v", mods)
+	}
+
+	msgs := decode(t, out)["messages"].([]any)
+	for i, raw := range msgs {
+		m := raw.(map[string]any)
+		if _, has := m["reasoning_content"]; has {
+			t.Errorf("messages[%d] 的 reasoning_content 应被删除", i)
+		}
+	}
+	// 正文一个字都不能动。
+	if got := msgs[1].(map[string]any)["content"]; got != "第一轮" {
+		t.Errorf("assistant 正文被改动: %v", got)
+	}
+	if got := msgs[3].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]; got != "第二轮" {
+		t.Errorf("分块正文被改动: %v", got)
+	}
+	if _, ok := msgs[3].(map[string]any)["tool_calls"]; !ok {
+		t.Error("tool_calls 是标准字段，不该被牵连")
+	}
+}
+
+func TestRewriteStripsReasoningDetailsAndReasoning(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	body := []byte(`{"model":"m","stream":false,"messages":[
+		{"role":"assistant","content":"hi","reasoning_details":[{"type":"summary","text":"x"}],"reasoning":"想"}
+	]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 2 {
+		t.Fatalf("应记录两个 strip 改动，实际 %v", mods)
+	}
+	msg := decode(t, out)["messages"].([]any)[0].(map[string]any)
+	for _, key := range []string{"reasoning_details", "reasoning"} {
+		if _, has := msg[key]; has {
+			t.Errorf("%s 应被删除", key)
+		}
+	}
+}
+
+func TestRewriteStripsExtraFieldsOnAnyRole(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	// 这些字段在任何角色上都不是合法字段（schema 里只有 role/content 等），
+	// 一律裁掉；name 只有 tool 消息允许。
+	body := []byte(`{"model":"m","stream":false,"messages":[
+		{"role":"user","content":"hi","reasoning_content":"x","name":"alice"},
+		{"role":"tool","content":"ok","tool_call_id":"c1","name":"search"}
+	]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	want := map[string]bool{"strip_reasoning_content": true, "strip_name": true}
+	if len(mods) != len(want) {
+		t.Fatalf("应记录两个 strip 改动，实际 %v", mods)
+	}
+	for _, m := range mods {
+		if !want[m] {
+			t.Errorf("意外的改动标记: %s", m)
+		}
+	}
+
+	msgs := decode(t, out)["messages"].([]any)
+	user := msgs[0].(map[string]any)
+	if _, ok := user["reasoning_content"]; ok {
+		t.Error("user 消息的 reasoning_content 应被删除")
+	}
+	if _, ok := user["name"]; ok {
+		t.Error("user 消息的 name 应被删除")
+	}
+	tool := msgs[1].(map[string]any)
+	if tool["name"] != "search" {
+		t.Errorf("tool 消息的 name 是合法字段，不该被删: %v", tool["name"])
+	}
+}
+
+func TestRewriteStripsAssistantLegacyFields(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	// OpenAI 的历史扩展在 Mistral 的 AssistantMessage 里都不存在。
+	body := []byte(`{"model":"m","stream":false,"messages":[
+		{"role":"assistant","content":"hi","refusal":null,"annotations":[],"audio":null,"function_call":{"name":"f"},"name":"bot"}
+	]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 5 {
+		t.Fatalf("应记录五个 strip 改动，实际 %v", mods)
+	}
+	msg := decode(t, out)["messages"].([]any)[0].(map[string]any)
+	for _, key := range []string{"refusal", "annotations", "audio", "function_call", "name"} {
+		if _, ok := msg[key]; ok {
+			t.Errorf("%s 应被删除", key)
+		}
+	}
+	if msg["content"] != "hi" {
+		t.Errorf("正文不该被改动: %v", msg["content"])
+	}
+}
+
+func TestRewriteKeepsReasoningFieldsByDefault(t *testing.T) {
+	// 开关关着时一律不动：有些网关靠回放的思维链维持多轮推理的连贯性。
+	body := []byte(`{"model":"m","stream":false,"messages":[{"role":"assistant","content":"hi","reasoning_content":"x"}]}`)
+
+	out, mods := rewriteRequestBody(baseProvider(), model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("默认不该裁剪 reasoning_content，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
+	}
+}
+
+func TestRewriteKeepsReasoningFieldsInResponsesInput(t *testing.T) {
+	p := baseProvider()
+	p.APIFormat = model.FormatResponses
+	p.StripUnsupportedParams = true
+	// Responses 的 input 里 reasoning 项是合法输入，不能跟着 chat 一起裁。
+	body := []byte(`{"model":"m","input":[{"type":"reasoning","id":"r1","summary":[]},{"type":"message","role":"assistant","content":"hi"}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("Responses 的 input 不该被裁，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
+	}
+}
+
+// ---------- prompt_cache_key ----------
+
+func TestRewriteInjectsPromptCacheKey(t *testing.T) {
+	p := baseProvider()
+	p.PromptCacheKeyMode = model.PromptCacheKeyAuto
+	body := []byte(`{"model":"m","stream":false,"messages":[
+		{"role":"system","content":"你是助手"},
+		{"role":"user","content":"你好"}
+	]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "prompt_cache_key" {
+		t.Fatalf("应记录 prompt_cache_key 改动，实际 %v", mods)
+	}
+	key := cacheKeyOf(t, out)
+	if !strings.HasPrefix(key, promptCacheKeyPrefix) {
+		t.Errorf("注入的 key 应带 %s 前缀，实际 %q", promptCacheKeyPrefix, key)
+	}
+}
+
+func TestPromptCacheKeyStableAcrossTurns(t *testing.T) {
+	p := baseProvider()
+	p.PromptCacheKeyMode = model.PromptCacheKeyAuto
+
+	first := []byte(`{"model":"m","stream":false,"messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"第一轮"}]}`)
+	// 第二轮只是尾部追加，前缀不变 —— 官方文档要求的正是这种「同一会话前缀稳定」。
+	second := []byte(`{"model":"m","stream":false,"messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"第一轮"},{"role":"assistant","content":"好"},{"role":"user","content":"第二轮"}]}`)
+
+	k1 := cacheKeyOf(t, mustRewrite(t, p, first))
+	k2 := cacheKeyOf(t, mustRewrite(t, p, second))
+	if k1 == "" || k1 != k2 {
+		t.Errorf("同一会话的多轮请求应共用同一个 key，实际 %q / %q", k1, k2)
+	}
+
+	// 换了系统提示就是另一条缓存链。
+	other := []byte(`{"model":"m","stream":false,"messages":[{"role":"system","content":"另一个助手"},{"role":"user","content":"第一轮"}]}`)
+	if k3 := cacheKeyOf(t, mustRewrite(t, p, other)); k3 == k1 {
+		t.Errorf("不同会话不该共用 key，实际都是 %q", k1)
+	}
+}
+
+func TestPromptCacheKeyUsesSessionSeed(t *testing.T) {
+	p := baseProvider()
+	p.PromptCacheKeyMode = model.PromptCacheKeyAuto
+	body := []byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+
+	mk := func(seed string) string {
+		out, _ := rewriteRequestBodyOpts(p, model.DefaultSettings(), body, modelNameFromBody(body),
+			rewriteOptions{cacheKeySeed: seed})
+		return cacheKeyOf(t, out)
+	}
+	if mk("session-a") != mk("session-a") {
+		t.Error("同一个会话 id 必须得到同一个 key")
+	}
+	if mk("session-a") == mk("session-b") {
+		t.Error("不同会话 id 应得到不同的 key")
+	}
+	if mk("session-a") == mk("") {
+		t.Error("带会话头的 key 不该与指纹兜底的 key 相同")
+	}
+}
+
+func TestRewriteKeepsClientPromptCacheKey(t *testing.T) {
+	p := baseProvider()
+	p.PromptCacheKeyMode = model.PromptCacheKeyAuto
+	body := []byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}],"prompt_cache_key":"client-key"}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("客户端自带的 key 不该被覆盖，实际 %v", mods)
+	}
+	if got := cacheKeyOf(t, out); got != "client-key" {
+		t.Errorf("key 被改动了: %q", got)
+	}
+}
+
+func TestRewritePromptCacheKeyOffByDefault(t *testing.T) {
+	body := []byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+
+	out, mods := rewriteRequestBody(baseProvider(), model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("默认不该注入 prompt_cache_key，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
+	}
+}
+
+func TestRewritePromptCacheKeyOnResponses(t *testing.T) {
+	p := baseProvider()
+	p.APIFormat = model.FormatResponses
+	p.PromptCacheKeyMode = model.PromptCacheKeyAuto
+	// Responses 的请求体顶层同样有 prompt_cache_key（内置 input.type 修正也要一起生效）。
+	body := []byte(`{"model":"m","input":[{"role":"user","content":"hi"}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if !containsMod(mods, "prompt_cache_key") {
+		t.Fatalf("Responses 也应注入 key，实际 %v", mods)
+	}
+	if cacheKeyOf(t, out) == "" {
+		t.Error("body 里没写进 key")
+	}
+}
+
+// cacheKeyOf 取出改写结果里的 prompt_cache_key。
+func cacheKeyOf(t *testing.T, body []byte) string {
+	t.Helper()
+	key, _ := decode(t, body)["prompt_cache_key"].(string)
+	return key
+}
+
+func mustRewrite(t *testing.T, p model.Provider, body []byte) []byte {
+	t.Helper()
+	out, _ := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	return out
+}
+
+func containsMod(mods []string, want string) bool {
+	for _, m := range mods {
+		if m == want {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------- 提示词注入 ----------
 
 func promptSettings(text, strategy string) model.Settings {

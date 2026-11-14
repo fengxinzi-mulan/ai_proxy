@@ -5,12 +5,14 @@
 
 import type {
   APIFormat,
+  DBStats,
   LogPage,
   MetaInfo,
   ModelStatsRow,
   OverviewStats,
   ProbeResult,
   Provider,
+  ProviderPreset,
   ProviderStatsRow,
   RequestLog,
   Settings,
@@ -108,6 +110,23 @@ export const api = {
     request<{ models: string[] }>(`/api/providers/${id}/models`, {
       method: 'POST',
       body: JSON.stringify(provider ?? {}),
+    }),
+
+  /** 内置的供应商优化预设（按上游厂商推荐的一整套配置）。 */
+  listProviderPresets: () => request<ProviderPreset[]>('/api/provider-presets'),
+  /** 把预设写到已保存的供应商上；force 用于自建反代（域名对不上时强制应用）。 */
+  applyProviderPreset: (id: number, presetId: string, force = false) =>
+    request<{ provider: Provider; applied: string[] }>(`/api/providers/${id}/apply-preset`, {
+      method: 'POST',
+      body: JSON.stringify({ presetId, force }),
+    }),
+
+  /** 数据库页级占用：可回收空间就在这里算。 */
+  dbStats: () => request<DBStats>('/api/stats/db'),
+  /** 重建数据库文件，把 freelist 真正还给磁盘（不删数据）。 */
+  vacuum: () =>
+    request<{ reclaimed: number; before: number; after: number }>('/api/stats/vacuum', {
+      method: 'POST',
     }),
 
   /**
