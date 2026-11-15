@@ -223,6 +223,69 @@ func TestProviderUsageQueryRoundTrip(t *testing.T) {
 	}
 }
 
+// 用量查询的账号密码单独存列，不进 usage_query_json。
+//
+// 这条用例盯两件事：往返要能存住；改模板时不能把凭据弄丢或读回旧值。
+// 实现里写入时会把这两项从 JSON 里剥离，读取时再补回来 —— 顺序写反就会
+// 出现「密码存进去了但读出来是空」。
+func TestProviderUsageCredentialsRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+
+	p := newProvider("mistral")
+	p.UsageQuery = model.UsageQueryConfig{
+		Template: "mistral",
+		Account:  "someone@example.com",
+		Password: "s3cret-pass",
+	}
+	created, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+
+	got, err := st.GetProvider(created.ID)
+	if err != nil {
+		t.Fatalf("读取供应商失败: %v", err)
+	}
+	if got.UsageQuery.Account != "someone@example.com" || got.UsageQuery.Password != "s3cret-pass" {
+		t.Fatalf("账号密码未正确往返: %+v", got.UsageQuery)
+	}
+
+	// 改模板但不动凭据：密码必须还在。
+	got.UsageQuery.Template = "mistral"
+	got.UsageQuery.AutoRefreshSeconds = 600
+	updated, err := st.UpdateProvider(got)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if updated.UsageQuery.Password != "s3cret-pass" {
+		t.Fatalf("改其它字段后密码丢失: %+v", updated.UsageQuery)
+	}
+	if updated.UsageQuery.AutoRefreshSeconds != 600 {
+		t.Fatalf("刷新间隔未生效: %+v", updated.UsageQuery)
+	}
+
+	// 换密码要能覆盖。
+	updated.UsageQuery.Password = "new-pass"
+	changed, err := st.UpdateProvider(updated)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if changed.UsageQuery.Password != "new-pass" {
+		t.Fatalf("密码未更新: %+v", changed.UsageQuery)
+	}
+
+	// 清空凭据。
+	changed.UsageQuery.Account = ""
+	changed.UsageQuery.Password = ""
+	cleared, err := st.UpdateProvider(changed)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if cleared.UsageQuery.Account != "" || cleared.UsageQuery.Password != "" {
+		t.Fatalf("凭据清空未生效: %+v", cleared.UsageQuery)
+	}
+}
+
 // 用量快照是服务端定时刷出来的运行态数据，要能覆盖写、能按供应商索引、
 // 还要随供应商删除一起清掉（否则新建同名供应商会读到上一个的旧快照）。
 func TestProviderUsageSnapshot(t *testing.T) {

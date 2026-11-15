@@ -29,7 +29,7 @@ const providerColumns = `id, name, display_name, remark, enabled, active, sort_o
 	model_map_json, continuation_mode, continuation_models_json,
 	continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
 	usage_inject_mode, strip_usage_chunk, strip_unsupported_params, prompt_cache_key_mode,
-		custom_usage_json, usage_query_json, tags_json,
+		custom_usage_json, usage_query_json, usage_account, usage_password, tags_json,
 	created_at, updated_at`
 
 func boolToInt(b bool) int {
@@ -125,9 +125,9 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		model_map_json, continuation_mode, continuation_models_json,
 		continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
 		usage_inject_mode, strip_usage_chunk, strip_unsupported_params, prompt_cache_key_mode,
-		custom_usage_json, usage_query_json, tags_json,
+		custom_usage_json, usage_query_json, usage_account, usage_password, tags_json,
 		created_at, updated_at
-	) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?,?,?,?,?, ?,?)`,
+	) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?,?,?,?,?,?,?, ?,?)`,
 		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), boolToInt(p.Active), p.SortOrder,
 		p.BaseURL, string(p.APIFormat), p.CustomPath, p.AuthHeader, p.AuthPrefix,
 		keysJSON, headersJSON,
@@ -137,7 +137,7 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), boolToInt(p.StripUnsupportedParams),
 		p.PromptCacheKeyMode,
-		customUsageJSON, usageQueryJSON, tagsJSON,
+		customUsageJSON, usageQueryJSON, p.UsageQuery.Account, p.UsageQuery.Password, tagsJSON,
 		tsToDB(p.CreatedAt), tsToDB(p.UpdatedAt),
 	)
 	if err != nil {
@@ -190,7 +190,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		model_map_json=?, continuation_mode=?, continuation_models_json=?,
 		continuation_cooldown_seconds=?, continuation_invalid_cooldown_seconds=?,
 		usage_inject_mode=?, strip_usage_chunk=?, strip_unsupported_params=?, prompt_cache_key_mode=?,
-		custom_usage_json=?, usage_query_json=?, tags_json=?,
+		custom_usage_json=?, usage_query_json=?, usage_account=?, usage_password=?, tags_json=?,
 		updated_at=?
 		WHERE id=?`,
 		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), p.SortOrder,
@@ -202,7 +202,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), boolToInt(p.StripUnsupportedParams),
 		p.PromptCacheKeyMode,
-		customUsageJSON, usageQueryJSON, tagsJSON,
+		customUsageJSON, usageQueryJSON, p.UsageQuery.Account, p.UsageQuery.Password, tagsJSON,
 		tsToDB(p.UpdatedAt), p.ID,
 	)
 	if err != nil {
@@ -320,8 +320,15 @@ func marshalProviderParts(p model.Provider) (keys, headers, rules, modelMap, tag
 	// 模板为空即「未启用」，存空串而不是 {}，便于人工看库时一眼区分。
 	if p.UsageQuery.Template == "" {
 		usageQuery = ""
-	} else if usageQuery, err = marshal(p.UsageQuery, "用量查询配置"); err != nil {
-		return
+	} else {
+		// 账号密码单独存列（usage_account / usage_password），不写进这份 JSON：
+		// 同一份凭据存两处，迟早出现「改了 A 读到 B」。
+		uq := p.UsageQuery
+		uq.Account = ""
+		uq.Password = ""
+		if usageQuery, err = marshal(uq, "用量查询配置"); err != nil {
+			return
+		}
 	}
 	return
 }
@@ -353,7 +360,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		&modelMapJSON, &p.ContinuationMode, &contModelsJSON,
 		&p.ContinuationCooldownSeconds, &p.ContinuationInvalidCooldownSeconds,
 		&p.UsageInjectMode, &stripUsage, &stripUnsupported, &p.PromptCacheKeyMode,
-		&customUsageJSON, &usageQueryJSON, &tagsJSON,
+		&customUsageJSON, &usageQueryJSON, &p.UsageQuery.Account, &p.UsageQuery.Password, &tagsJSON,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -390,7 +397,12 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		decode(customUsageJSON, &cu)
 		p.CustomUsage = &cu
 	}
+	// 账号密码来自独立列，而 usage_query_json 里没有这两项（写入时被剥离）。
+	// 先记下来再解 JSON，否则 Unmarshal 会把刚扫描到的凭据清空。
+	usageAccount, usagePassword := p.UsageQuery.Account, p.UsageQuery.Password
 	decode(usageQueryJSON, &p.UsageQuery)
+	p.UsageQuery.Account = usageAccount
+	p.UsageQuery.Password = usagePassword
 
 	p.CreatedAt = tsFromDB(createdAt)
 	p.UpdatedAt = tsFromDB(updatedAt)

@@ -98,7 +98,7 @@ function blank(): Provider {
     stripUnsupportedParams: false,
     promptCacheKeyMode: 'off',
     customUsage: null,
-    usageQuery: { template: '', baseUrl: '', autoRefreshSeconds: 0 },
+    usageQuery: { template: '', baseUrl: '', autoRefreshSeconds: 0, account: '', password: '' },
     tags: [],
     createdAt: '',
     updatedAt: '',
@@ -1034,6 +1034,29 @@ function remove() {
                 placeholder="留空则自动从 BaseURL 推导"
               />
             </NFormItem>
+            <template v-if="form.usageQuery.template === 'mistral'">
+              <NFormItem label="账号">
+                <NInput
+                  v-model:value="form.usageQuery.account"
+                  placeholder="admin.mistral.ai 的登录邮箱"
+                />
+              </NFormItem>
+              <NFormItem label="密码">
+                <NInput
+                  v-model:value="form.usageQuery.password"
+                  type="password"
+                  show-password-on="click"
+                  placeholder="该账号的登录密码"
+                />
+              </NFormItem>
+              <NFormItem :show-label="false">
+                <span class="muted" style="font-size: 12px; line-height: 1.6">
+                  Mistral 的订阅额度只挂在网页后台，普通 API key 读不到。程序会用这里的账号密码
+                  自动登录 admin.mistral.ai 并缓存会话，过期后自动重登，无需手工维护 Cookie。
+                  密码与 API 密钥同等对待，明文存在本地数据库里。
+                </span>
+              </NFormItem>
+            </template>
             <NFormItem label="定时刷新">
               <NSelect
                 v-model:value="form.usageQuery.autoRefreshSeconds"

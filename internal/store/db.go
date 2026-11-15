@@ -310,6 +310,17 @@ var migrations = []migration{
 			`ALTER TABLE providers ADD COLUMN prompt_cache_key_mode TEXT NOT NULL DEFAULT 'off'`,
 		},
 	},
+	{
+		// 用量查询的账号密码（目前只有 Mistral 模板在用）。
+		//
+		// 单独成列而不是塞进 usage_query_json：这两项是凭据，与其它配置项的
+		// 生命周期不同 —— 改模板不该顺手把密码清掉。
+		version: 9,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN usage_account  TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE providers ADD COLUMN usage_password TEXT NOT NULL DEFAULT ''`,
+		},
+	},
 }
 
 func (s *Store) migrate() error {

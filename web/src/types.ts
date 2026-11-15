@@ -80,6 +80,15 @@ export interface UsageQueryConfig {
   baseUrl: string
   /** 用量快照的刷新间隔（秒）。0 = 不自动刷新。刷新由服务端按此间隔执行。 */
   autoRefreshSeconds: number
+  /**
+   * 账号密码，目前只有 Mistral 模板在用。
+   *
+   * Mistral 的订阅额度只挂在网页后台（admin.mistral.ai），普通 API key 访问
+   * Admin 端点会被拒（401），所以只能拿账号密码去换网页会话。服务端会自动登录
+   * 并缓存会话，过期后自动重登 —— 不需要手工维护 Cookie。
+   */
+  account?: string
+  password?: string
 }
 
 export interface UsageBalance {

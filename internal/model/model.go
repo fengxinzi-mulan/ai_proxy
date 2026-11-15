@@ -178,6 +178,21 @@ type UsageQueryConfig struct {
 	// BaseURL 留空时由模板从供应商的 BaseURL 推导（例如 commandcode 会去掉 /provider/v1），
 	// 只在推导结果不对时才需要手填。
 	BaseURL string `json:"baseUrl"`
+	// Account / Password 是模板可用的账号凭据，目前只有 Mistral 模板在用。
+	//
+	// Mistral 的订阅额度只挂在网页后台（admin.mistral.ai），普通 API key 访问
+	// Admin 端点会被直接拒绝（实测 401 Invalid API Key），所以只能拿账号密码去
+	// 换网页会话。程序用 Ory 的登录 API 自动登录，把 session_token 缓存起来复用，
+	// 过期或收到 401 时自动重登 —— 用户不需要手工粘贴会过期的 Cookie。
+	//
+	// 密码与 API 密钥同等对待：明文存库，不额外加密。
+	//
+	// 这两个字段虽然挂在 UsageQueryConfig 上，但**不进 usage_query_json**：
+	// 它们单独存 providers 表的 usage_account / usage_password 列
+	// （见 store.marshalProviderParts 里的剥离逻辑）。否则同一份密码会在库里
+	// 存两遍，改一处忘另一处就会读到旧值。
+	Account  string `json:"account"`
+	Password string `json:"password"`
 	// AutoRefreshSeconds 是用量快照的刷新间隔，0 表示不自动刷新。
 	// 刷新由服务端按这个间隔做（见 proxy.UsageRefresher），结果落库后广播给管理界面，
 	// 前端不自己定时查上游 —— 页面关着的时候额度也一直在更新。

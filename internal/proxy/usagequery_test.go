@@ -529,7 +529,7 @@ func TestUsageTemplatesRegistered(t *testing.T) {
 		}
 		seen[tpl.ID] = true
 	}
-	for _, want := range []string{"commandcode", "deepseek", "opencode"} {
+	for _, want := range []string{"commandcode", "deepseek", "opencode", "mistral"} {
 		if !seen[want] {
 			t.Errorf("缺少 %s 模板", want)
 		}
