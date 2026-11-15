@@ -220,8 +220,11 @@ func liveMeasureOnce(t *testing.T, client *http.Client, headers http.Header, tar
 		usage.CompletionTokens, usage.ReasoningTokens, usage.CachedTokens, usage.Estimated,
 		(end - firstContentAt).Milliseconds(), tps)
 
-	if tps > maxPlausibleTPS {
-		t.Errorf("第 %d 次算出超过可信上限的速度 %.1f t/s（整流下发时本应判为不可测）", run, tps)
+	// 判据与 computeTPS 一致：要么算出可信速度，要么被识别为整流下发记 0。
+	// 不能只断言「速度 <= maxPlausibleTPS」—— 真实高速流（每 token 0.5~1.0ms）
+	// 会算出 1000~2000 t/s，那是正常吐字，不该判失败。
+	if tps > maxPlausibleTPS && float64(end.Milliseconds()-firstContentAt.Milliseconds())/float64(usage.CompletionTokens) < minPlausibleMsPerToken {
+		t.Errorf("第 %d 次：整流下发应判为不可测（TPS=0），实际算出 %.1f t/s", run, tps)
 	}
 }
 

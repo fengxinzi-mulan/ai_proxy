@@ -42,7 +42,10 @@ type Server struct {
 	clients      *clientPool
 	keys         *keyPool
 	continuation *continuationManager
-	logger       *slog.Logger
+	// mistral 缓存 Mistral 网页后台的登录会话（见 mistralauth.go）。
+	// 放在 Server 上而不是每次查询新建：登录有速率限制，定时刷新时不能每次重登。
+	mistral *mistralSession
+	logger  *slog.Logger
 
 	idSeq atomic.Uint64
 }
@@ -56,6 +59,7 @@ func NewServer(st *store.Store, h *hub.Hub, logger *slog.Logger) *Server {
 		clients:      newClientPool(),
 		keys:         newKeyPool(),
 		continuation: newContinuationManager(),
+		mistral:      newMistralSession(),
 		logger:       logger,
 	}
 }
@@ -1158,38 +1162,81 @@ func geminiWantsStream(path, rawQuery string) bool {
 // （响应体里 35~66 个 SSE 事件全部挤在首内容事件之后的 3~78ms 内到达，
 // 同一时段的正常流式行窗口是 448~1312ms），commandcode 等其它上游也偶发。
 //
-// 取值依据是全库分桶：生成窗口 ≥3 秒的行速度最高 393.6 t/s，而整流下发行的最低值是
-// 591.8 t/s，500 落在两者之间。将来接入 Groq、Cerebras 这类单流上千 tok/s 的推理服务，
-// 需要把这个上限调高。
+// 但这个上限只在「生成窗口塌陷」时才生效，判据见 minPlausibleMsPerToken：
+// 光看速度绝对值会把真实的高速流一起误杀。
 const maxPlausibleTPS = 500
+
+// minPlausibleMsPerToken 是「每个输出 token 至少占用的生成时间」（毫秒）。
+//
+// 整流下发的本质不是「算出来的速度大」，而是「传输时间与 token 数脱钩」：
+// 上游在服务端把整条流攒完，再一次性灌进 socket，于是生成窗口只反映一次
+// 网络传输的耗时（几毫秒到一百多毫秒），与 token 数无关。真实流式则相反，
+// 每个 token 都要过一次模型前向，窗口随 token 数线性增长。
+//
+// 2026-11-15 用全库 851 条流式行校准（data/ai_proxy.db）：
+//   - 每 token 耗时 ≥1.0ms 的有 789 条，占绝对多数，对应 1~500 t/s 的常规吐字；
+//   - 0.5~1.0ms 的 31 条是高速上游（≈1000~2000 t/s）的正常表现；
+//   - <0.5ms 的 16 条几乎全是整流下发，其中 10 条超过 5000 t/s（最高 23000 t/s，
+//     即 46 个 token 落在 2ms 里），这些值物理上不可能是逐 token 生成的结果。
+//
+// 取 0.5ms/token（等价于 2000 t/s）作为分界：它把上述 16 条整流下发行全部拦下，
+// 同时给 Groq、Cerebras 这类单流上千 tok/s 的真实高速推理留出余量。
+// 将来接入更快的内核时需要重新校准这个值。
+const minPlausibleMsPerToken = 0.5
+
+// minTPSMeasureTokens 是「值得计算吐字速度」的最小输出量。
+//
+// token 数太少时，生成窗口主要由网络往返与事件间隔决定，而不是模型前向：
+// 库里 8 个 token 的响应窗口从 2ms 到 581ms 连续分布、毫无断层（对应 4000~13.8 t/s），
+// 同一批响应里 reasoning_tokens 全是 8，即只吐了思维链就结束。这种短响应的
+// 「速度」在两个方向上都不具参考价值，按不可测处理，与「非流式不算 TPS」同口径。
+//
+// 取 20：低于它的行只占全库 4%（35/851），且几乎都是纯 reasoning 的短收尾；
+// 保留它们只会让平均值被网络抖动带偏。
+const minTPSMeasureTokens = 20
 
 // computeTPS 计算生成速度，即每秒输出 token 数。
 //
 // 分母是「总耗时 - 首 token 等待」，反映模型真正的吐字速度，
 // 而不是把排队与预填充的时间也算进去。
 //
-// 三种算不出速度的情况一律返回 0，与「非流式不计算 TPS」一样按不可测处理：
+// 四种算不出速度的情况一律返回 0，与「非流式不计算 TPS」一样按不可测处理：
 // 界面显示为 —，聚合统计也因为只取 tps > 0 而不会把它算进平均值。
 //   - 拿不到首 token 时刻（ttftMs <= 0）：流式但没识别出内容，退回用总耗时做分母，
 //     得到的是吞吐而非吐字速度；这种值也要守住可信上限。
 //   - 首 token 与响应结束落在同一毫秒：整条流是一次性到的，量不出速度。
-//   - 算出来的速度超过可信上限（见 maxPlausibleTPS）。
+//   - 输出量少于 minTPSMeasureTokens：窗口由网络抖动主导，速度不具参考价值。
+//   - 每 token 耗时低于 minPlausibleMsPerToken 且速度超过 maxPlausibleTPS：
+//     整流下发的特征，量不出速度。
+//
+// 最后一条必须两个判据同时成立。只看速度会误杀真实高速流：2026-11-15
+// 库里有 21980 个 token 在 32136ms 内持续到达（684 t/s）、18845 个 token 用了
+// 35809ms（526 t/s），这些是实打实的持续吐字，不是整流下发，此前被 500 的
+// 单一阈值全部判成 0，导致最近 200 条里 166 条 TPS 显示「—」。
 func computeTPS(completionTokens int, ttftMs, totalMs int64) float64 {
 	if completionTokens <= 0 || totalMs <= 0 {
 		return 0
 	}
+	// 输出太少时窗口由网络往返与事件间隔主导，算出来的不是吐字速度。
+	if completionTokens < minTPSMeasureTokens {
+		return 0
+	}
 
 	var tps float64
+	var windowMs int64
 	if ttftMs <= 0 {
+		windowMs = totalMs
 		tps = float64(completionTokens) / (float64(totalMs) / 1000)
 	} else {
-		denom := totalMs - ttftMs
-		if denom <= 0 {
+		windowMs = totalMs - ttftMs
+		if windowMs <= 0 {
 			return 0
 		}
-		tps = float64(completionTokens) / (float64(denom) / 1000)
+		tps = float64(completionTokens) / (float64(windowMs) / 1000)
 	}
-	if tps > maxPlausibleTPS {
+	// 两个判据同时成立才判为整流下发：速度快，且每个 token 占用的时间短到
+	// 不可能是逐 token 生成的结果。窗口够长时的高速度是真实吞吐，予以保留。
+	if tps > maxPlausibleTPS && float64(windowMs)/float64(completionTokens) < minPlausibleMsPerToken {
 		return 0
 	}
 	return tps

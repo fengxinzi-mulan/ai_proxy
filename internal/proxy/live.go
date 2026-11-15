@@ -62,11 +62,16 @@ func (r *LiveRegistry) UpdateTokens(id string, tokens int) {
 	}
 	now := time.Now()
 	elapsed := now.Sub(e.ttftAt).Seconds()
-	if elapsed > 0 {
+	// 输出太少时窗口由网络往返与事件间隔主导，算出来的不是吐字速度。口径与
+	// 落库 TPS 一致（见 minTPSMeasureTokens），实时页也不显示这种值。
+	if elapsed > 0 && tokens >= minTPSMeasureTokens {
 		// 用整体均值而不是瞬时差分：瞬时值抖动太大，界面上跳得没法看。
-		// 超过可信上限的值说明这一批是上游整流下发的，不更新（保留上一次的值），
-		// 否则实时监控页会闪出上万 t/s。口径与落库 TPS 保持一致，见 maxPlausibleTPS。
-		if rate := float64(tokens) / elapsed; rate <= maxPlausibleTPS {
+		// 判据与落库 TPS 保持一致（见 computeTPS）：只有「速度快 + 每 token 耗时
+		// 短到不可能是逐 token 生成」同时成立才是整流下发，此时不更新（保留上一次
+		// 的值），否则实时监控页会闪出上万 t/s。窗口正常时的高速度是真实吞吐。
+		rate := float64(tokens) / elapsed
+		msPerToken := elapsed * 1000 / float64(tokens)
+		if !(rate > maxPlausibleTPS && msPerToken < minPlausibleMsPerToken) {
 			e.tps = rate
 		}
 	}

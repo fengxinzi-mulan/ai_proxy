@@ -912,7 +912,7 @@ func TestMetrics(t *testing.T) {
 		t.Errorf("无输出 token 时 TPS 应为 0，实际 %v", got)
 	}
 	// 上游把整流攒齐后一次性下发时，生成窗口会塌成几毫秒：58 个 token 落在 3ms 里
-	// 能算出 19000 t/s。这不是吐字速度，必须按不可测处理（见 maxPlausibleTPS）。
+	// 能算出 19000 t/s。这不是吐字速度，必须按不可测处理（见 minPlausibleMsPerToken）。
 	if got := computeTPS(58, 6131, 6134); got != 0 {
 		t.Errorf("生成窗口塌缩时应记为不可测，实际 %v", got)
 	}
@@ -924,6 +924,84 @@ func TestMetrics(t *testing.T) {
 	// 正好等于可信上限的速度仍然保留：护栏只拦「超过」的值。
 	if got := computeTPS(500, 0, 1000); got != 500 {
 		t.Errorf("等于上限的速度应保留，实际 %v", got)
+	}
+}
+
+// 真实的高速流式不能因为「速度超过 500」就被当成整流下发。
+//
+// 2026-11-15 的库里这类行被单一速度阈值全部判成 0，最近 200 条里 166 条 TPS
+// 显示「—」。判据必须是「速度快」且「每 token 耗时短到不可能是逐 token 生成」
+// 两个条件同时成立，样本取自 data/ai_proxy.db 的真实记录。
+func TestComputeTPSKeepsRealFastStreams(t *testing.T) {
+	cases := []struct {
+		name             string
+		tokens           int
+		ttftMs, totalMs  int64
+		wantTPS          float64
+		wantApproximately bool
+	}{
+		// 21980 个 token 在 32 秒里持续到达：684 t/s 是真实吐字速度。
+		{"21980 token / 32s", 21980, 2498, 34634, 684, true},
+		// 18845 个 token 用了 35.8 秒，526 t/s，仅略高于旧上限。
+		{"18845 token / 35.8s", 18845, 9241, 45050, 526, true},
+		// 大响应的速度稳定在 500~800 区间，是这批数据的主力形态。
+		{"17915 token / 32.5s", 17915, 2678, 35205, 551, true},
+		// 高速上游（≈1000~2000 t/s）的正常表现：每 token 0.5~1.0ms。
+		{"658 token / 522ms", 658, 1000, 1522, 1261, true},
+	}
+	for _, c := range cases {
+		got := computeTPS(c.tokens, c.ttftMs, c.totalMs)
+		if got == 0 {
+			t.Errorf("%s：真实高速流不应被判为不可测", c.name)
+			continue
+		}
+		if c.wantApproximately && (got < c.wantTPS*0.99 || got > c.wantTPS*1.01) {
+			t.Errorf("%s：TPS 应约为 %.0f，实际 %.1f", c.name, c.wantTPS, got)
+		}
+	}
+}
+
+// 整流下发的判据是「每 token 耗时短到不可能逐 token 生成」，与 token 数无关。
+// 这些样本同样取自 data/ai_proxy.db，算出 5000 t/s 以上，物理上不成立。
+func TestComputeTPSRejectsBufferedDumps(t *testing.T) {
+	cases := []struct {
+		name            string
+		tokens          int
+		ttftMs, totalMs int64
+	}{
+		// 46 个 token 落在 2ms 里 = 23000 t/s。
+		{"46 token / 2ms", 46, 100, 102},
+		// 8 个 token 落在 2ms 里。
+		{"8 token / 2ms", 8, 500, 502},
+		// 492 个 token 落在 41ms 里 = 12000 t/s。
+		{"492 token / 41ms", 492, 3000, 3041},
+		// 324 个 token 落在 37ms 里。
+		{"324 token / 37ms", 324, 800, 837},
+	}
+	for _, c := range cases {
+		if got := computeTPS(c.tokens, c.ttftMs, c.totalMs); got != 0 {
+			t.Errorf("%s：整流下发应记为不可测，实际 %.1f t/s", c.name, got)
+		}
+	}
+}
+
+// 输出 token 太少时，生成窗口由网络往返与事件间隔主导，不是吐字速度。
+//
+// 库里 8 个 token 的响应窗口从 2ms 到 581ms 连续分布、毫无断层（对应 4000~13.8 t/s），
+// 同一批响应 reasoning_tokens 全是 8，即只吐了思维链就结束。这类短响应的「速度」
+// 在两个方向上都不具参考价值，必须按不可测处理，否则平均值会被网络抖动带偏。
+func TestComputeTPSRequiresEnoughTokens(t *testing.T) {
+	// 8 个 token 落在 12ms 里：按每 token 0.75ms 本可通过整流判据，但输出量太少。
+	if got := computeTPS(8, 100, 112); got != 0 {
+		t.Errorf("输出量不足 %d 时应记为不可测，实际 %.1f t/s", minTPSMeasureTokens, got)
+	}
+	// 同样 8 个 token、窗口拉到 581ms，算出 13.8 t/s 看着「正常」，但同样不可采信。
+	if got := computeTPS(8, 100, 681); got != 0 {
+		t.Errorf("输出量不足时无论速度高低都应记为不可测，实际 %.1f t/s", got)
+	}
+	// 刚好达到门槛就正常计算。
+	if got := computeTPS(minTPSMeasureTokens, 0, 1000); got != float64(minTPSMeasureTokens) {
+		t.Errorf("达到门槛时应正常计算，实际 %.1f t/s", got)
 	}
 }
 
