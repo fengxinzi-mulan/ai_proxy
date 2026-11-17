@@ -15,10 +15,12 @@ import (
 	"strings"
 	"time"
 
+	"ai_proxy/internal/autostart"
 	"ai_proxy/internal/hub"
 	"ai_proxy/internal/model"
 	"ai_proxy/internal/proxy"
 	"ai_proxy/internal/store"
+	"ai_proxy/internal/update"
 )
 
 // Server 是管理接口的处理器集合。
@@ -38,6 +40,11 @@ type Server struct {
 	// 自己跑在窗口里（据此显示「桌面应用」设置页），服务端版保持关闭。
 	version string
 	desktop bool
+
+	// autostart 描述本进程以什么身份写登录启动项；零值时接口如实回报「不支持」。
+	autostart autostart.Spec
+	// updater 负责检测与安装新版本；为 nil 时相关接口返回「不可用」。
+	updater *update.Manager
 }
 
 // New 构造管理接口。
@@ -52,6 +59,16 @@ func New(st *store.Store, h *hub.Hub, p *proxy.Server, logger *slog.Logger, list
 func (s *Server) SetBuildInfo(version string, desktop bool) {
 	s.version = version
 	s.desktop = desktop
+}
+
+// SetAutostart 注入本进程的启动项身份（名字 + 命令行 + 后端）。
+func (s *Server) SetAutostart(spec autostart.Spec) {
+	s.autostart = spec
+}
+
+// SetUpdater 注入更新管理器；传 nil 表示本形态不提供更新能力。
+func (s *Server) SetUpdater(m *update.Manager) {
+	s.updater = m
 }
 
 // Register 把所有管理路由挂到 mux 上。
@@ -93,6 +110,15 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/stats/vacuum", s.handleVacuum)
 	mux.HandleFunc("GET /api/live", s.handleLive)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
+
+	// 系统级设置：开机自启与版本更新。两者都不是数据库里的字段，
+	// 状态以系统/远端为准，所以单独成组。
+	mux.HandleFunc("GET /api/autostart", s.handleGetAutostart)
+	mux.HandleFunc("PUT /api/autostart", s.handlePutAutostart)
+	mux.HandleFunc("GET /api/update", s.handleGetUpdate)
+	mux.HandleFunc("POST /api/update/check", s.handleCheckUpdate)
+	mux.HandleFunc("POST /api/update/download", s.handleInstallUpdate)
+	mux.HandleFunc("POST /api/update/skip", s.handleSkipUpdate)
 }
 
 // Auth 是套在所有管理接口外面的访问密钥校验。
@@ -183,10 +209,26 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
-	var incoming model.Settings
-	if !s.decode(w, r, &incoming) {
+	// 用指针接收图片压缩配置：区分「没传」与「传了 false」。
+	// 直接解到值类型时，省略该字段的请求会把 Enabled 静默变成 false ——
+	// 症状是「压缩莫名其妙不生效」，极难排查。
+	// （内置前端总是带全字段，但脚本与缓存了旧页面的客户端未必。）
+	type settingsPayload struct {
+		model.Settings
+		ImageCompress *model.ImageCompressSettings `json:"imageCompress"`
+	}
+	var payload settingsPayload
+	if !s.decode(w, r, &payload) {
 		return
 	}
+	incoming := payload.Settings
+	if payload.ImageCompress != nil {
+		incoming.ImageCompress = *payload.ImageCompress
+	} else if cur, err := s.store.GetSettings(); err == nil {
+		// 没传就保持原值。
+		incoming.ImageCompress = cur.ImageCompress
+	}
+
 	// 访问密钥留空表示「保持原值」，这样前端不必为了改代理而回传密钥。
 	if incoming.AccessKey == "" {
 		if cur, err := s.store.GetSettings(); err == nil {
@@ -833,6 +875,119 @@ func (s *Server) writeSSE(w http.ResponseWriter, eventType string, data any) {
 		return
 	}
 	fmt.Fprintf(w, "data: %s\n\n", payload)
+}
+
+// ---------- 开机自启 ----------
+
+// handleGetAutostart 返回启动项的真实状态（读的是系统，不是数据库）。
+func (s *Server) handleGetAutostart(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, s.autostart.Read())
+}
+
+// handlePutAutostart 打开或关闭登录启动项。
+//
+// 这是系统级副作用，因此不落库、也不走设置页的「保存」按钮 ——
+// 开关一拨就生效，界面读到的永远是系统里的真实现状。
+func (s *Server) handlePutAutostart(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !s.decode(w, r, &body) {
+		return
+	}
+	st, err := s.autostart.Set(body.Enabled)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.logger.Info("已更新开机自启设置", "enabled", body.Enabled, "name", st.Name)
+	s.writeJSON(w, http.StatusOK, st)
+}
+
+// ---------- 版本更新 ----------
+
+// handleGetUpdate 返回当前更新状态（不发起网络请求）。
+func (s *Server) handleGetUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.updater == nil {
+		s.writeError(w, http.StatusNotImplemented, "当前形态不提供更新检查")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, s.updater.State())
+}
+
+// handleCheckUpdate 立即检查一次（跳过 6 小时的最小间隔）。
+func (s *Server) handleCheckUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.updater == nil {
+		s.writeError(w, http.StatusNotImplemented, "当前形态不提供更新检查")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	st, err := s.updater.Check(ctx, true)
+	if err != nil {
+		// 检查失败不是 HTTP 错误：界面要能显示「为什么没查到」，
+		// 而不是弹一个红框然后什么都不说。
+		s.writeJSON(w, http.StatusOK, st)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, st)
+}
+
+// handleInstallUpdate 启动「下载 → 校验 → 替换 → 重启」流程。
+//
+// 立即返回 202：整个流程要几十秒，同步等待会让前端超时。
+// 进度通过 SSE 的 update 事件推送，前端据此推进度条。
+//
+// 响应体刻意只回 {accepted:true} 而不是完整 State：安装线程已经开始推
+// SSE，若这里回一份「还没开始下载」的旧快照，前端拿它覆盖 store 就会把
+// 已经收到的进度打回 idle（进度条闪一下消失）。
+func (s *Server) handleInstallUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.updater == nil {
+		s.writeError(w, http.StatusNotImplemented, "当前形态不提供更新安装")
+		return
+	}
+	st := s.updater.State()
+	if !st.HasUpdate {
+		s.writeError(w, http.StatusBadRequest, "当前没有可安装的新版本")
+		return
+	}
+	if !st.CanAutoInstall {
+		s.writeError(w, http.StatusBadRequest, "当前形态不支持自动安装，请手动下载")
+		return
+	}
+	if s.updater.Installing() {
+		// 连点两次不该起第二个下载线程（第二个会被内部拒绝，但用户看到的是「没反应」）。
+		s.writeError(w, http.StatusConflict, "更新已在安装中")
+		return
+	}
+	go func() {
+		// 与请求解耦：前端可能提前关页面，但安装要继续。
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if err := s.updater.Install(ctx); err != nil {
+			s.logger.Warn("安装更新失败", "err", err)
+		}
+	}()
+	s.writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true})
+}
+
+// handleSkipUpdate 记住「跳过这个版本」。
+func (s *Server) handleSkipUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.updater == nil {
+		s.writeError(w, http.StatusNotImplemented, "当前形态不提供更新检查")
+		return
+	}
+	var body struct {
+		Version string `json:"version"`
+		Clear   bool   `json:"clear"`
+	}
+	// 允许空请求体：不带 version 就是「跳过当前最新版」。
+	_ = s.decodeOptional(w, r, &body)
+	if body.Clear {
+		s.writeJSON(w, http.StatusOK, s.updater.ClearSkip())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, s.updater.Skip(body.Version))
 }
 
 // ---------- 工具 ----------

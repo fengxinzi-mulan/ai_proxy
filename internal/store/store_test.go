@@ -72,6 +72,104 @@ func TestSettingsMissingFieldsFallBack(t *testing.T) {
 	if got.DefaultTimeoutSeconds == 0 || got.MaxBodyBytes == 0 {
 		t.Errorf("缺失字段应回落默认值: %+v", got)
 	}
+	// 老库没有 imageCompress：升级后应自动是「开启 + 有合理阈值」。
+	if !got.ImageCompress.Enabled {
+		t.Error("老库升级后图片压缩应默认开启")
+	}
+	if got.ImageCompress.ThresholdBytes <= 0 || got.ImageCompress.Quality <= 0 {
+		t.Errorf("图片压缩参数应回落默认值: %+v", got.ImageCompress)
+	}
+}
+
+// 图片压缩配置必须能完整往返，且「关掉」不会被 ApplyDefaults 顶回来。
+func TestImageCompressRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+
+	got, err := st.GetSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ImageCompress.Enabled {
+		t.Fatal("默认应开启")
+	}
+
+	got.ImageCompress = model.ImageCompressSettings{
+		Enabled:        false,
+		ThresholdBytes: 256 * 1024,
+		MaxEdge:        1024,
+		Quality:        70,
+	}
+	if err := st.SaveSettings(got); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := st.GetSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ImageCompress.Enabled {
+		t.Error("显式关闭后不该被默认值顶回来")
+	}
+	if again.ImageCompress.ThresholdBytes != 256*1024 ||
+		again.ImageCompress.MaxEdge != 1024 || again.ImageCompress.Quality != 70 {
+		t.Errorf("参数未正确往返: %+v", again.ImageCompress)
+	}
+}
+
+// 非法参数要被修正，但 Enabled 不动。
+func TestImageCompressApplyDefaults(t *testing.T) {
+	s := model.DefaultSettings()
+	s.ImageCompress = model.ImageCompressSettings{Enabled: false, ThresholdBytes: -1, MaxEdge: -5, Quality: 999}
+	s.ApplyDefaults()
+	if s.ImageCompress.Enabled {
+		t.Error("Enabled 不该被 ApplyDefaults 改动")
+	}
+	if s.ImageCompress.ThresholdBytes <= 0 {
+		t.Errorf("负阈值应回落默认值: %d", s.ImageCompress.ThresholdBytes)
+	}
+	if s.ImageCompress.MaxEdge != 2048 {
+		t.Errorf("负长边应回落默认值: %d", s.ImageCompress.MaxEdge)
+	}
+	if s.ImageCompress.Quality != 85 {
+		t.Errorf("越界质量应回落默认值: %d", s.ImageCompress.Quality)
+	}
+}
+
+// KV 用于存「跳过版本」这类与全局设置无关的小状态。
+func TestKVRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+
+	v, err := st.GetKV("update")
+	if err != nil {
+		t.Fatalf("读取不存在的键应返回空值而不是错误: %v", err)
+	}
+	if v != "" {
+		t.Errorf("不存在的键应为空串，实际 %q", v)
+	}
+
+	if err := st.PutKV("update", `{"skippedVersion":"v1.2.3"}`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetKV("update")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `{"skippedVersion":"v1.2.3"}` {
+		t.Errorf("往返不一致: %q", got)
+	}
+
+	// 覆盖写。
+	if err := st.PutKV("update", `{}`); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetKV("update"); got != `{}` {
+		t.Errorf("覆盖写失败: %q", got)
+	}
+
+	// KV 不该污染全局设置。
+	if _, err := st.GetSettings(); err != nil {
+		t.Errorf("写 KV 后读取设置仍应正常: %v", err)
+	}
 }
 
 func newProvider(name string) model.Provider {

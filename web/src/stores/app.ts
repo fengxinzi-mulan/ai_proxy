@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { api } from '@/api'
-import type { LiveRequest, MetaInfo, Provider, Settings, UsageSnapshot } from '@/types'
+import type { LiveRequest, MetaInfo, Provider, Settings, UpdateState, UsageSnapshot } from '@/types'
 
 const THEME_STORAGE = 'ai-proxy-theme'
 
@@ -35,6 +35,10 @@ export const useAppStore = defineStore('app', () => {
       : false,
   )
 
+  // 更新状态放在 store 而不是 App.vue 的局部 ref：弹框（App.vue 的子组件）
+  // 与设置页都要读同一份，两处各自拉一次必然漂移。
+  const updateState = ref<UpdateState | null>(null)
+
   /** 当前实际是否暗色：mode 为 system 时看系统偏好。 */
   const dark = computed(() =>
     themeMode.value === 'system' ? systemDark.value : themeMode.value === 'dark',
@@ -55,6 +59,37 @@ export const useAppStore = defineStore('app', () => {
 
   const isDesktop = computed(() => !!meta.value?.desktop)
   const version = computed(() => meta.value?.version || '')
+
+  /** 有新版本且用户没跳过：侧边栏显示小圆点。 */
+  const updateAvailable = computed(
+    () => !!updateState.value?.hasUpdate && !updateState.value.skipped,
+  )
+
+  /** 安装流程正在进行中（下载/校验/替换/重启）。 */
+  const updateInstalling = computed(() => {
+    const p = updateState.value?.phase
+    return p === 'downloading' || p === 'verifying' || p === 'applying' || p === 'restarting'
+  })
+
+  /**
+   * 拉一次当前更新状态。
+   *
+   * 这个接口不发起网络请求（纯读服务端内存里的状态），所以页面加载时调它很便宜。
+   * 不调的话，服务端启动 8 秒后那次自动检查广播时页面通常还没连上 SSE，
+   * 之后 6 小时内不会再有事件 —— 用户就永远看不到「有新版本」。
+   */
+  async function loadUpdate() {
+    try {
+      updateState.value = await api.update.get()
+    } catch {
+      // 老后端没有这个接口：保持 null，界面按「不支持」处理。
+      updateState.value = null
+    }
+  }
+
+  function setUpdateState(s: UpdateState) {
+    updateState.value = s
+  }
 
   /** 跟随系统主题变化。只在 mode=system 时影响实际配色。 */
   function watchSystemTheme() {
@@ -98,6 +133,8 @@ export const useAppStore = defineStore('app', () => {
     } finally {
       loading.value = false
     }
+    // 单独拉更新状态：它失败不该让整个界面进入错误态。
+    void loadUpdate()
   }
 
   async function reloadProviders() {
@@ -174,6 +211,9 @@ export const useAppStore = defineStore('app', () => {
     isDesktop,
     version,
     usageRefreshing,
+    updateState,
+    updateAvailable,
+    updateInstalling,
     activeProvider,
     enabledProviders,
     listenBaseURL,
@@ -186,5 +226,7 @@ export const useAppStore = defineStore('app', () => {
     reloadSettings,
     activate,
     refreshUsage,
+    loadUpdate,
+    setUpdateState,
   }
 })

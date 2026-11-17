@@ -70,3 +70,33 @@ func (s *Store) PatchSettings(fn func(*model.Settings) error) (model.Settings, e
 	}
 	return st, nil
 }
+
+// GetKV 读取一段与全局设置无关的键值状态（例如「已跳过的更新版本」）。
+//
+// 为什么不塞进 model.Settings：前端保存设置时是整份 PUT 覆盖，
+// 把这类「运行态小状态」混在里面，迟早被一次普通的保存抹掉。
+// 复用 settings 表而不是新建一张表 —— 它本来就是 key/value 结构。
+func (s *Store) GetKV(key string) (string, error) {
+	var raw string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("读取 %s 失败: %w", key, err)
+	}
+	return raw, nil
+}
+
+// PutKV 覆盖写入一段键值状态。
+func (s *Store) PutKV(key, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO settings(key, value) VALUES(?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key, value,
+	)
+	if err != nil {
+		return fmt.Errorf("保存 %s 失败: %w", key, err)
+	}
+	return nil
+}

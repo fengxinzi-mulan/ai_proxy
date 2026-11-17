@@ -157,6 +157,29 @@ func (p *clientPool) client(r resolvedNet) (*http.Client, error) {
 	})
 }
 
+// NewHTTPClient 按一份代理配置构造独立的 HTTP 客户端。
+//
+// 给「不属于转发流程」的请求用（目前是检测更新）：它们同样必须遵循用户配的
+// 全局代理，否则墙内用户永远查不到新版本。复用同一套 applyProxy 逻辑，
+// 不另写一份，避免 socks5 / no_proxy 的行为在两处漂移。
+func NewHTTPClient(cfg model.ProxyConfig, connectTimeout time.Duration) (*http.Client, error) {
+	if connectTimeout <= 0 {
+		connectTimeout = 15 * time.Second
+	}
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: connectTimeout,
+		ForceAttemptHTTP2:   true,
+	}
+	if err := applyProxy(transport, cfg); err != nil {
+		return nil, err
+	}
+	return &http.Client{Transport: transport, Timeout: 60 * time.Second}, nil
+}
+
 // applyProxy 把代理配置装到 Transport 上。
 //
 // http/https 代理走 Transport.Proxy（标准库会为 https 目标自动建立 CONNECT 隧道）；

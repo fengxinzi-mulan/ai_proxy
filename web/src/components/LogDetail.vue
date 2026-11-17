@@ -189,6 +189,14 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
                 <NDescriptionsItem label="TPS">{{ formatTps(log.tps) }}</NDescriptionsItem>
               </NDescriptions>
 
+              <template v-if="log.imageCompressed > 0">
+                <h4 class="section">图片压缩</h4>
+                <div class="cont-verdict">
+                  <NTag type="success" size="small" :bordered="false">已压缩 {{ log.imageCompressed }} 张</NTag>
+                  <span class="cont-detail">请求体节省 {{ formatBytes(log.imageSavedBytes) }}</span>
+                </div>
+              </template>
+
               <template v-if="log.modifications?.length">
                 <h4 class="section">本次改写</h4>
                 <NSpace :size="6">

@@ -20,11 +20,14 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"ai_proxy/internal/autostart"
 	"ai_proxy/internal/logging"
 	"ai_proxy/internal/service"
+	"ai_proxy/internal/update"
 	"ai_proxy/internal/version"
 )
 
@@ -55,6 +58,9 @@ func main() {
 		port    = flag.Int("port", 0, "监听端口，留空则使用设置里的值（默认 8080）")
 		dataDir = flag.String("data", "data", "数据目录，存放 SQLite 数据库")
 		debug   = flag.Bool("debug", false, "输出调试日志")
+		// 由启动项带上的标记。它不改变任何行为，只用来在日志里区分
+		// 「用户双击」和「登录时自动拉起」—— 排查启动问题时这一条很有用。
+		fromAutostart = flag.Bool("autostart", false, "由开机自启动拉起（由启动项自动传入）")
 	)
 	flag.Parse()
 
@@ -68,6 +74,10 @@ func main() {
 	logger, closer := logging.New(*dataDir, level)
 	defer closer.Close()
 
+	if *fromAutostart {
+		logger.Info("由开机自启动拉起")
+	}
+
 	if err := run(*host, *port, *dataDir, logger); err != nil {
 		logger.Error("启动失败", "err", err)
 		os.Exit(1)
@@ -80,14 +90,45 @@ func run(hostFlag string, portFlag int, dataDir string, logger *slog.Logger) err
 		return err
 	}
 
-	s, err := service.Start(service.Options{
-		Host:        hostFlag,
-		Port:        portFlag,
-		DataDir:     dataDir,
-		WebFS:       web,
-		Placeholder: placeholderHTML,
-		Logger:      logger,
-		Version:     version.Version,
+	// 上次更新留下的 .old-* 文件此刻已解锁，顺手清掉。
+	if exe, err := os.Executable(); err == nil {
+		update.CleanupOld(exe)
+	}
+
+	// s 先声明再赋值：Restart 回调要引用它，而它只能在 Start 之后才有值。
+	var s *service.Service
+	stopForRestart := func() {
+		if s == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	}
+
+	s, err = service.Start(service.Options{
+		Host:          hostFlag,
+		Port:          portFlag,
+		DataDir:       dataDir,
+		WebFS:         web,
+		Placeholder:   placeholderHTML,
+		Logger:        logger,
+		Version:       version.Version,
+		Autostart:     serverAutostartSpec(dataDir),
+		BeforeRestart: stopForRestart,
+		Restart: func() error {
+			exe, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			if err := update.Restart(exe, os.Args[1:]); err != nil {
+				return err
+			}
+			// 新进程已经起来，当前进程让位。用 os.Exit 而不是走正常退出流程：
+			// 服务已经在 BeforeRestart 里关掉了，再走一遍信号处理没有意义。
+			os.Exit(0)
+			return nil
+		},
 	})
 	if err != nil {
 		return err
@@ -102,4 +143,39 @@ func run(hostFlag string, portFlag int, dataDir string, logger *slog.Logger) err
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return s.Shutdown(ctx)
+}
+
+// serverAutostartSpec 描述服务端形态的启动项。
+//
+// -data 必须写成绝对路径：默认值是相对当前目录的 "data"，而登录时的工作目录
+// 是 System32，相对路径会直接建库失败。这是「自启能开但一启动就崩」的经典坑。
+func serverAutostartSpec(dataDir string) autostart.Spec {
+	exe, err := os.Executable()
+	if err != nil {
+		return autostart.Spec{Name: "AIProxy-Server", Reason: "无法确定可执行文件路径"}
+	}
+	if ok, reason := autostart.IsUsableExecutable(exe); !ok {
+		return autostart.Spec{Name: "AIProxy-Server", Reason: reason}
+	}
+
+	args := []string{"-autostart"}
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "host":
+			args = append(args, "-host", f.Value.String())
+		case "port":
+			args = append(args, "-port", f.Value.String())
+		}
+	})
+	abs, err := filepath.Abs(dataDir)
+	if err != nil {
+		abs = dataDir
+	}
+	args = append(args, "-data", abs)
+
+	return autostart.Spec{
+		Name:    "AIProxy-Server",
+		Command: autostart.CommandLine(exe, args),
+		Backend: autostart.System(),
+	}
 }

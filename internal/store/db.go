@@ -19,6 +19,8 @@ type Store struct {
 	db *sql.DB
 	// path 是主数据库文件路径，用来报告 VACUUM 前后真实的磁盘占用。
 	path string
+	// dir 是数据目录，更新暂存文件等「与库同级的运行态文件」放在这里。
+	dir string
 }
 
 // dbTimeLayout 是所有时间列的存储格式。
@@ -68,13 +70,19 @@ func Open(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("连接数据库失败: %w", err)
 	}
-	s := &Store{db: db, path: filepath.Join(dataDir, "ai_proxy.db")}
+	s := &Store{db: db, path: filepath.Join(dataDir, "ai_proxy.db"), dir: dataDir}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
+
+// DataDir 返回数据目录。
+//
+// 更新包的暂存文件、以及需要落在「库旁边」的运行态文件都用它，
+// 这样用户清理数据目录时不会漏掉这些中间产物。
+func (s *Store) DataDir() string { return s.dir }
 
 // Close 关闭数据库。
 func (s *Store) Close() error { return s.db.Close() }
@@ -319,6 +327,17 @@ var migrations = []migration{
 		stmts: []string{
 			`ALTER TABLE providers ADD COLUMN usage_account  TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE providers ADD COLUMN usage_password TEXT NOT NULL DEFAULT ''`,
+		},
+	},
+	{
+		// 请求体内联图片压缩的留痕。
+		//
+		// 单独成列而不是塞进 modifications：这两个是可累加的量，
+		// 用户想知道的是「开了这个功能到底省了多少流量」，而不是「这次改过没有」。
+		version: 10,
+		stmts: []string{
+			`ALTER TABLE request_logs ADD COLUMN image_compressed  INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE request_logs ADD COLUMN image_saved_bytes INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
 }

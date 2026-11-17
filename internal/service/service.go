@@ -18,10 +18,12 @@ import (
 	"time"
 
 	"ai_proxy/internal/api"
+	"ai_proxy/internal/autostart"
 	"ai_proxy/internal/hub"
 	"ai_proxy/internal/model"
 	"ai_proxy/internal/proxy"
 	"ai_proxy/internal/store"
+	"ai_proxy/internal/update"
 )
 
 // Options 描述一次服务启动所需的全部输入。
@@ -48,6 +50,13 @@ type Options struct {
 	// PreferEphemeral 为 true 时忽略 Host/Port 与设置，交给系统分配端口。
 	// 桌面模式在用户选择「自动换端口」且顺序探测失败时用它兜底。
 	PreferEphemeral bool
+
+	// Autostart 描述本进程写登录启动项时用的名字与命令行。
+	Autostart autostart.Spec
+	// BeforeRestart / Restart 由入口注入：更新安装完成后先停服务，再拉起新进程。
+	// 两者都为 nil 时，界面只能「打开下载页」，不能自动安装。
+	BeforeRestart func()
+	Restart       func() error
 }
 
 // Service 是一个已启动的代理服务。
@@ -113,6 +122,26 @@ func Start(o Options) (*Service, error) {
 	proxySrv := proxy.NewServer(st, h, o.Logger)
 	apiSrv := api.New(st, h, proxySrv, o.Logger, settings.Host, actualPort)
 	apiSrv.SetBuildInfo(o.Version, o.DesktopMode)
+	apiSrv.SetAutostart(o.Autostart)
+
+	// 更新管理器：检测走全局代理设置，这样墙内也能查到新版本。
+	updater := update.New(update.Options{
+		CurrentVersion: o.Version,
+		Desktop:        o.DesktopMode,
+		Store:          st,
+		Hub:            h,
+		Logger:         o.Logger,
+		ClientFactory: func() (*http.Client, error) {
+			cur, err := st.GetSettings()
+			if err != nil {
+				return nil, err
+			}
+			return proxy.NewHTTPClient(cur.Proxy, 15*time.Second)
+		},
+		BeforeRestart: o.BeforeRestart,
+		Restart:       o.Restart,
+	})
+	apiSrv.SetUpdater(updater)
 
 	// protected 覆盖除静态资源之外的一切：/api/* 是管理接口，其余路径转发给上游。
 	//
@@ -177,6 +206,21 @@ func Start(o Options) (*Service, error) {
 	go func() {
 		wg.Wait()
 		close(s.done)
+	}()
+
+	// 启动后延迟一会儿再查更新：先把服务与界面拉起来，别让一次网络请求
+	// 拖慢启动。失败只记 debug —— 离线、被墙、限流都是常态。
+	go func() {
+		select {
+		case <-rootCtx.Done():
+			return
+		case <-time.After(8 * time.Second):
+		}
+		ctx, cancel := context.WithTimeout(rootCtx, 30*time.Second)
+		defer cancel()
+		if _, err := updater.Check(ctx, false); err != nil {
+			o.Logger.Debug("启动时检查更新失败", "err", err)
+		}
 	}()
 
 	go func() {

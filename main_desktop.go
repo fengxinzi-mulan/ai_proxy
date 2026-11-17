@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"testing/fstest"
@@ -28,9 +29,11 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"ai_proxy/internal/autostart"
 	"ai_proxy/internal/desktop"
 	"ai_proxy/internal/logging"
 	"ai_proxy/internal/service"
+	"ai_proxy/internal/update"
 	"ai_proxy/internal/version"
 	// 空引入：把图标与版本信息链接进桌面版 exe。服务端入口不引这个包。
 	_ "ai_proxy/internal/winres"
@@ -48,6 +51,8 @@ func main() {
 		port    = flag.Int("port", 0, "监听端口，留空则使用设置里的值（默认 8080）")
 		dataArg = flag.String("data", "", "数据目录；留空时优先沿用 exe 同目录的 data，其次用户配置目录")
 		debug   = flag.Bool("debug", false, "输出调试日志")
+		// 由启动项带上的标记：窗口不显示，直接收进托盘。
+		fromAutostart = flag.Bool("autostart", false, "由开机自启动拉起，启动后隐藏到托盘")
 	)
 	flag.Parse()
 
@@ -85,7 +90,7 @@ func main() {
 
 	logger, closer := logging.New(dataDir, level)
 	defer closer.Close()
-	logger.Info("桌面版启动", "version", version.Version, "dataDir", dataDir)
+	logger.Info("桌面版启动", "version", version.Version, "dataDir", dataDir, "autostart", *fromAutostart)
 
 	if !webView2Installed() {
 		// 不阻断启动：Wails 自己会给出更准确的错误，这里只提前提示原因。
@@ -98,12 +103,18 @@ func main() {
 		return
 	}
 
+	// 上次更新留下的 .old-* 文件此刻已解锁，顺手清掉。
+	if exe, err := os.Executable(); err == nil {
+		update.CleanupOld(exe)
+	}
+
 	app := &desktopApp{
-		logger:  logger,
-		dataDir: dataDir,
-		host:    *host,
-		port:    *port,
-		web:     web,
+		logger:    logger,
+		dataDir:   dataDir,
+		host:      *host,
+		port:      *port,
+		web:       web,
+		autostart: *fromAutostart,
 	}
 
 	if err := app.launch(); err != nil {
@@ -119,6 +130,8 @@ type desktopApp struct {
 	host    string
 	port    int
 	web     fs.FS
+	// autostart 表示本次是被登录启动项拉起的：窗口不显示，直接收进托盘。
+	autostart bool
 
 	svc  *service.Service
 	ctx  context.Context
@@ -137,16 +150,24 @@ func (a *desktopApp) launch() error {
 	svc, err := a.startService(false)
 	if err != nil {
 		var le *service.ListenError
-		if errors.As(err, &le) && dialogsAvailable() && confirmPortFallback(le.Port, le.Err) {
-			// 先顺序探测：换一个固定端口，客户端配置只要改一次就能长期用；
-			// 探测不到再交给系统分配（端口每次启动都会变，属于最后手段）。
-			if free := findFreePort(le.Host, le.Port+1, 20); free != 0 {
-				a.port = free
-				a.logger.Info("端口被占用，改用顺序探测到的端口", "port", free)
-				svc, err = a.startService(false)
-			} else {
-				a.logger.Info("顺序探测未找到空端口，改由系统分配")
+		if errors.As(err, &le) {
+			switch {
+			case a.autostart:
+				// 自启场景不弹原生确认框：登录时没人盯着屏幕，弹窗只会把
+				// 进程挂在那里等一个永远不会来的点击。直接交给系统分配端口。
+				a.logger.Info("自启启动时端口被占用，改由系统分配", "port", le.Port)
 				svc, err = a.startService(true)
+			case dialogsAvailable() && confirmPortFallback(le.Port, le.Err):
+				// 先顺序探测：换一个固定端口，客户端配置只要改一次就能长期用；
+				// 探测不到再交给系统分配（端口每次启动都会变，属于最后手段）。
+				if free := findFreePort(le.Host, le.Port+1, 20); free != 0 {
+					a.port = free
+					a.logger.Info("端口被占用，改用顺序探测到的端口", "port", free)
+					svc, err = a.startService(false)
+				} else {
+					a.logger.Info("顺序探测未找到空端口，改由系统分配")
+					svc, err = a.startService(true)
+				}
 			}
 		}
 	}
@@ -177,6 +198,9 @@ func (a *desktopApp) launch() error {
 		Height:    900,
 		MinWidth:  1000,
 		MinHeight: 680,
+		// 自启拉起时不显示窗口：用户登录后不该被一个弹窗拦住。
+		// Wails 在 StartHidden 下仍会正常加载 WebView，托盘双击照样能唤出。
+		StartHidden: a.autostart,
 		AssetServer: &assetserver.Options{
 			Assets: bootstrap,
 		},
@@ -194,6 +218,11 @@ func (a *desktopApp) launch() error {
 			tray, err := startTray(showMainWindow, a.quit)
 			if err != nil {
 				a.logger.Warn("创建系统托盘失败", "err", err)
+				// 托盘没建起来就没有任何入口能唤出窗口了。自启场景下必须显式
+				// 把窗口显示出来，否则用户会得到一个「看不见但占着端口」的进程。
+				if a.autostart {
+					runtime.WindowShow(ctx)
+				}
 			} else {
 				a.tray = tray
 			}
@@ -230,7 +259,84 @@ func (a *desktopApp) startService(ephemeral bool) (*service.Service, error) {
 		DesktopMode:     true,
 		PreferEphemeral: ephemeral,
 		ExtraRoutes:     api.Register,
+		Autostart:       a.autostartSpec(),
+		BeforeRestart:   a.prepareRestart,
+		Restart:         a.restartNewVersion,
 	})
+}
+
+// autostartSpec 描述桌面形态的启动项。
+//
+// -data 只在用户显式传过时才写进启动项：留空时 exe 会按「同级 data →
+// %APPDATA%」重新解析，把数据目录焊死在命令行里反而会让用户挪动 exe 后失效。
+func (a *desktopApp) autostartSpec() autostart.Spec {
+	const name = "AIProxy-Desktop"
+	exe, err := os.Executable()
+	if err != nil {
+		return autostart.Spec{Name: name, Reason: "无法确定可执行文件路径"}
+	}
+	if ok, reason := autostart.IsUsableExecutable(exe); !ok {
+		return autostart.Spec{Name: name, Reason: reason}
+	}
+
+	args := []string{"-autostart"}
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "host":
+			args = append(args, "-host", f.Value.String())
+		case "port":
+			args = append(args, "-port", f.Value.String())
+		case "data":
+			// 必须转绝对路径：用户很可能写 `-data data`，而登录时的 CWD 是
+			// System32，相对路径会让新进程在系统目录下建一个空库 ——
+			// 表现就是「自启之后供应商和日志全没了」。
+			if v := f.Value.String(); v != "" {
+				if abs, err := filepath.Abs(v); err == nil {
+					args = append(args, "-data", abs)
+				} else {
+					args = append(args, "-data", v)
+				}
+			}
+		}
+	})
+
+	return autostart.Spec{
+		Name:    name,
+		Command: autostart.CommandLine(exe, args),
+		Backend: autostart.System(),
+	}
+}
+
+// prepareRestart 在替换 exe 之前收摊：停托盘图标、关服务。
+//
+// 托盘图标必须先撤掉：新进程会创建自己的图标，旧进程不撤会留下一个
+// 点不动的幽灵图标，直到用户把鼠标划过去才消失。
+func (a *desktopApp) prepareRestart() {
+	if a.tray != nil {
+		a.tray.stop()
+		a.tray = nil
+	}
+	if a.svc != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = a.svc.Shutdown(ctx)
+		a.svc = nil
+	}
+}
+
+// restartNewVersion 用同样的参数拉起新进程，然后让当前进程退出。
+func (a *desktopApp) restartNewVersion() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if err := update.Restart(exe, os.Args[1:]); err != nil {
+		return err
+	}
+	a.quitting.Store(true)
+	// 服务与托盘已经在 prepareRestart 里收掉了，直接退出即可。
+	os.Exit(0)
+	return nil
 }
 
 // handleClose 处理窗口关闭请求，返回 true 表示允许退出。

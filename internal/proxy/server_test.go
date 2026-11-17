@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -1300,5 +1301,77 @@ func TestForwardModelMappingMissIsTransparent(t *testing.T) {
 	entry := lastLog(t, st)
 	if entry.ModelMapped != "" {
 		t.Errorf("未命中映射时不该记上游模型名，实际 %q", entry.ModelMapped)
+	}
+}
+
+// 端到端：带大图的请求转发后，日志里要能看到压缩张数与节省字节，
+// 且上游收到的请求体确实比客户端发出的更小。
+func TestForwardCompressesInlineImage(t *testing.T) {
+	var upstreamBodyLen int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		upstreamBodyLen = len(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"model":"gpt-4o","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+
+	// 造一张足够大的噪声图，保证超过默认 512 KiB 阈值。
+	raw := noisyPNG(t, 700, 700, false)
+	if len(raw) < model.DefaultSettings().ImageCompress.ThresholdBytes {
+		t.Fatalf("测试图太小（%d 字节）", len(raw))
+	}
+	url := "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-4o",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if upstreamBodyLen >= len(body) {
+		t.Errorf("上游收到的请求体应更小: 原始 %d，实际 %d", len(body), upstreamBodyLen)
+	}
+
+	entry := lastLog(t, st)
+	if entry.ImageCompressed != 1 {
+		t.Errorf("日志应记录压缩 1 张，实际 %d", entry.ImageCompressed)
+	}
+	if entry.ImageSavedBytes <= 0 {
+		t.Errorf("日志应记录节省字节，实际 %d", entry.ImageSavedBytes)
+	}
+	if !entry.RequestModified {
+		t.Error("压缩属于请求体改写，应标记 requestModified")
+	}
+	found := false
+	for _, m := range entry.Modifications {
+		if m == "image_compress" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("改写清单应包含 image_compress，实际 %v", entry.Modifications)
+	}
+	// 改写前原文要留下来，用户才能对照。
+	if entry.ReqBodyOriginal == "" {
+		t.Error("应保留改写前的请求体")
 	}
 }

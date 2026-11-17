@@ -350,6 +350,7 @@ export const MODIFICATION_LABELS: Record<string, string> = {
   strip_input_compaction: '移除 compaction 项',
   strip_reasoning_encrypted: '移除 reasoning 密文',
   prompt_cache_key: '注入缓存键',
+  image_compress: '压缩图片',
 }
 
 export function modificationLabel(key: string): string {

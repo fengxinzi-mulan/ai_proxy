@@ -5,6 +5,7 @@
 
 import type {
   APIFormat,
+  AutostartState,
   DBStats,
   LogPage,
   MetaInfo,
@@ -17,6 +18,7 @@ import type {
   RequestLog,
   Settings,
   TimeSeriesPoint,
+  UpdateState,
   UsageSnapshot,
 } from '@/types'
 
@@ -176,6 +178,40 @@ export const api = {
     request<ProviderStatsRow[]>(`/api/stats/by-provider${query({ range, limit })}`),
 
   live: () => request<import('@/types').LiveRequest[]>('/api/live'),
+
+  /** 开机自启：读写的是系统启动项，不是数据库。 */
+  autostart: {
+    get: () => request<AutostartState>('/api/autostart'),
+    set: (enabled: boolean) =>
+      request<AutostartState>('/api/autostart', {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      }),
+  },
+
+  /** 版本检测与安装。进度通过 SSE 的 update 事件推送。 */
+  update: {
+    get: () => request<UpdateState>('/api/update'),
+    check: () => request<UpdateState>('/api/update/check', { method: 'POST' }),
+    /**
+     * 启动安装，立即返回 202。
+     *
+     * 刻意不返回完整状态：安装线程同时也在推 SSE，若这里回一份「还没开始下载」
+     * 的旧快照，调用方拿它覆盖 store 就会把已收到的进度打回 idle。
+     */
+    install: () =>
+      request<{ accepted: boolean }>('/api/update/download', { method: 'POST' }),
+    skip: (version: string) =>
+      request<UpdateState>('/api/update/skip', {
+        method: 'POST',
+        body: JSON.stringify({ version }),
+      }),
+    clearSkip: () =>
+      request<UpdateState>('/api/update/skip', {
+        method: 'POST',
+        body: JSON.stringify({ clear: true }),
+      }),
+  },
 }
 
 /* ---------- 桌面专属接口 ---------- */

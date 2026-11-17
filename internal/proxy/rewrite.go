@@ -27,7 +27,22 @@ import (
 // 这是唯一会改变「这次请求打的是哪个上游模型」的改动项。
 // （Gemini 的模型名在 URL 路径上而不是请求体里，路径那一段的替换由调用方负责。）
 func rewriteRequestBody(prov model.Provider, st model.Settings, rawBody []byte, modelName string) ([]byte, []string) {
-	return rewriteRequestBodyOpts(prov, st, rawBody, modelName, rewriteOptions{})
+	r := rewriteRequest(prov, st, rawBody, modelName, rewriteOptions{})
+	return r.Body, r.Modifications
+}
+
+// rewriteResult 是改写结果。
+//
+// 比「字节 + 改动清单」多带两个量：图片压缩的张数与省下的字节。
+// 单独成结构体而不是往返回值里再加两个参数，是因为绝大多数调用方
+// （尤其是测试）只关心 body 与 mods，加参数会让几十处调用全部变噪音。
+type rewriteResult struct {
+	Body          []byte
+	Modifications []string
+	// ImageCompressed 是本次被压缩的内联图片张数。
+	ImageCompressed int
+	// ImageSavedBytes 是 base64 串长度的净减少量。
+	ImageSavedBytes int64
 }
 
 // rewriteOptions 承载「不在请求体里、但会决定改写结果」的上下文。
@@ -42,8 +57,14 @@ type rewriteOptions struct {
 
 // rewriteRequestBodyOpts 是带上下文版本的改写入口。
 func rewriteRequestBodyOpts(prov model.Provider, st model.Settings, rawBody []byte, modelName string, opts rewriteOptions) ([]byte, []string) {
+	r := rewriteRequest(prov, st, rawBody, modelName, opts)
+	return r.Body, r.Modifications
+}
+
+// rewriteRequest 是真正的改写实现，返回带图片压缩统计的完整结果。
+func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, modelName string, opts rewriteOptions) rewriteResult {
 	if len(rawBody) == 0 {
-		return rawBody, nil
+		return rewriteResult{Body: rawBody}
 	}
 
 	mappedModel, mapped := prov.MapModel(modelName)
@@ -63,19 +84,22 @@ func rewriteRequestBodyOpts(prov model.Provider, st model.Settings, rawBody []by
 	// thinking / reasoning_content 裁剪则相反：不少兼容网关确实认这些字段，
 	// 替用户做主会悄悄关掉推理或丢掉思维链回放，所以只在供应商显式开启严格兼容时才动。
 	wantStrip := prov.StripUnsupportedParams && isOpenAIStyle(prov.APIFormat) && hasUnsupportedParam(rawBody)
+	// 图片压缩是全局开关，与上游是谁无关：它是纯粹的流量体积优化。
+	wantImageCompress := st.ImageCompress.Enabled && hasInlineImage(rawBody)
 	// prompt_cache_key 同理：不认这个字段的严格网关会 422，必须按供应商显式开启。
 	wantCacheKey := prov.PromptCacheKeyMode == model.PromptCacheKeyAuto && isOpenAIStyle(prov.APIFormat)
 	promptText, promptStrategy, hasPrompt := resolvePromptForModel(prov, st, modelName, mappedModel, mapped)
-	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey {
-		return rawBody, nil
+	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey && !wantImageCompress {
+		return rewriteResult{Body: rawBody}
 	}
 
 	obj, err := decodeJSONObject(rawBody)
 	if err != nil {
-		return rawBody, nil
+		return rewriteResult{Body: rawBody}
 	}
 
 	var mods []string
+	var imgStats compressStats
 	if wantRoleFix && normalizeDeveloperRole(obj) {
 		mods = append(mods, "role_developer_to_system")
 	}
@@ -127,20 +151,33 @@ func rewriteRequestBodyOpts(prov model.Provider, st model.Settings, rawBody []by
 			mods = append(mods, "strip_reasoning_encrypted")
 		}
 	}
+	// 图片压缩排在裁剪之后：被裁掉的项（比如上游不认的 input 项）里可能带着图，
+	// 先裁再压能省掉白压一遍的开销。
+	if wantImageCompress {
+		imgStats = compressImagesInBody(obj, st.ImageCompress)
+		if imgStats.Count > 0 {
+			mods = append(mods, "image_compress")
+		}
+	}
 	if wantCacheKey {
 		if key := derivePromptCacheKey(prov, obj, opts.cacheKeySeed); key != "" && applyPromptCacheKey(obj, key) {
 			mods = append(mods, "prompt_cache_key")
 		}
 	}
 	if len(mods) == 0 {
-		return rawBody, nil
+		return rewriteResult{Body: rawBody}
 	}
 
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return rawBody, nil
+		return rewriteResult{Body: rawBody}
 	}
-	return out, mods
+	return rewriteResult{
+		Body:            out,
+		Modifications:   mods,
+		ImageCompressed: imgStats.Count,
+		ImageSavedBytes: imgStats.SavedBytes,
+	}
 }
 
 // isOpenAIStyle 判断该格式是否建立在 OpenAI 的 messages / input 结构上。

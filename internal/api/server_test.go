@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"ai_proxy/internal/autostart"
 	"ai_proxy/internal/hub"
 	"ai_proxy/internal/model"
 	"ai_proxy/internal/proxy"
@@ -303,5 +304,208 @@ func TestDBStatsAndVacuum(t *testing.T) {
 	}
 	if !strings.Contains(resp, "reclaimed") {
 		t.Errorf("应返回回收字节数，实际 %s", resp)
+	}
+}
+
+// ---------- 开机自启 ----------
+
+// fakeAutostart 是内存后端，避免单测往真实 Run 键里写东西。
+type fakeAutostart struct {
+	supported bool
+	reason    string
+	values    map[string]string
+}
+
+func (f *fakeAutostart) Supported() (bool, string) { return f.supported, f.reason }
+
+func (f *fakeAutostart) Get(name string) (string, bool, error) {
+	v, ok := f.values[name]
+	return v, ok, nil
+}
+
+func (f *fakeAutostart) Set(name, command string) error {
+	f.values[name] = command
+	return nil
+}
+
+func (f *fakeAutostart) Delete(name string) error {
+	delete(f.values, name)
+	return nil
+}
+
+func newAutostartAPI(t *testing.T, spec autostart.Spec) http.Handler {
+	t.Helper()
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("打开测试数据库失败: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	proxySrv := proxy.NewServer(st, hub.New(), logger)
+	srv := New(st, hub.New(), proxySrv, logger, "127.0.0.1", 8080)
+	srv.SetAutostart(spec)
+
+	mux := http.NewServeMux()
+	srv.Register(mux)
+	return mux
+}
+
+func TestAutostartToggle(t *testing.T) {
+	be := &fakeAutostart{supported: true, values: map[string]string{}}
+	h := newAutostartAPI(t, autostart.Spec{
+		Name:    "AIProxy-Desktop",
+		Command: `"C:\a b\x.exe" -autostart`,
+		Backend: be,
+	})
+
+	status, resp := doJSON(t, h, http.MethodGet, "/api/autostart", "")
+	if status != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", status, resp)
+	}
+	var state autostart.State
+	if err := json.Unmarshal([]byte(resp), &state); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v %s", err, resp)
+	}
+	if !state.Supported || state.Enabled {
+		t.Fatalf("初始应为「支持但未开启」，实际 %+v", state)
+	}
+
+	status, resp = doJSON(t, h, http.MethodPut, "/api/autostart", `{"enabled":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("开启应返回 200，实际 %d: %s", status, resp)
+	}
+	if err := json.Unmarshal([]byte(resp), &state); err != nil {
+		t.Fatal(err)
+	}
+	if !state.Enabled || state.Registered != `"C:\a b\x.exe" -autostart` {
+		t.Fatalf("开启后状态不对: %+v", state)
+	}
+	if be.values["AIProxy-Desktop"] == "" {
+		t.Error("应真的写进后端")
+	}
+
+	status, resp = doJSON(t, h, http.MethodPut, "/api/autostart", `{"enabled":false}`)
+	if status != http.StatusOK {
+		t.Fatalf("关闭应返回 200，实际 %d: %s", status, resp)
+	}
+	if err := json.Unmarshal([]byte(resp), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Enabled {
+		t.Errorf("关闭后不该还是开启: %+v", state)
+	}
+	if len(be.values) != 0 {
+		t.Error("应真的从后端删掉")
+	}
+}
+
+func TestAutostartStaleDetection(t *testing.T) {
+	be := &fakeAutostart{supported: true, values: map[string]string{
+		"AIProxy-Desktop": `C:\old\x.exe -autostart`,
+	}}
+	h := newAutostartAPI(t, autostart.Spec{
+		Name:    "AIProxy-Desktop",
+		Command: `C:\new\x.exe -autostart`,
+		Backend: be,
+	})
+
+	_, resp := doJSON(t, h, http.MethodGet, "/api/autostart", "")
+	var state autostart.State
+	if err := json.Unmarshal([]byte(resp), &state); err != nil {
+		t.Fatal(err)
+	}
+	if !state.Enabled || !state.Stale {
+		t.Fatalf("应识别为「已开启但过期」，实际 %+v", state)
+	}
+}
+
+func TestAutostartUnsupported(t *testing.T) {
+	be := &fakeAutostart{supported: false, reason: "仅 Windows 支持", values: map[string]string{}}
+	h := newAutostartAPI(t, autostart.Spec{Name: "x", Command: "y", Backend: be})
+
+	_, resp := doJSON(t, h, http.MethodGet, "/api/autostart", "")
+	var state autostart.State
+	if err := json.Unmarshal([]byte(resp), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Supported || state.Reason != "仅 Windows 支持" {
+		t.Fatalf("不支持时应透传原因，实际 %+v", state)
+	}
+
+	status, resp := doJSON(t, h, http.MethodPut, "/api/autostart", `{"enabled":true}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("不支持时开启应返回 400，实际 %d: %s", status, resp)
+	}
+	if !strings.Contains(resp, "仅 Windows 支持") {
+		t.Errorf("错误信息应说明原因，实际 %s", resp)
+	}
+}
+
+// ---------- 版本更新 ----------
+
+// 没有注入 updater 时，更新接口应明确回报「不提供」，而不是 500。
+func TestUpdateEndpointsWithoutUpdater(t *testing.T) {
+	_, h := newTestAPI(t)
+	for _, path := range []string{"/api/update", "/api/update/check", "/api/update/download", "/api/update/skip"} {
+		method := http.MethodGet
+		if path != "/api/update" {
+			method = http.MethodPost
+		}
+		status, resp := doJSON(t, h, method, path, "")
+		if status != http.StatusNotImplemented {
+			t.Errorf("%s 应返回 501，实际 %d: %s", path, status, resp)
+		}
+	}
+}
+
+// ---------- 设置的向后兼容 ----------
+
+// 省略 imageCompress 的 PUT 不该把用户的「开启」静默改成关闭。
+func TestPutSettingsKeepsImageCompressWhenOmitted(t *testing.T) {
+	_, h := newTestAPI(t)
+
+	// 先显式关掉，再发一个不含 imageCompress 的请求。
+	status, resp := doJSON(t, h, http.MethodPut, "/api/settings",
+		`{"host":"127.0.0.1","port":8080,"imageCompress":{"enabled":false,"thresholdBytes":262144,"maxEdge":1024,"quality":70}}`)
+	if status != http.StatusOK {
+		t.Fatalf("保存失败: %d %s", status, resp)
+	}
+	var saved model.Settings
+	if err := json.Unmarshal([]byte(resp), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.ImageCompress.Enabled {
+		t.Fatal("显式 false 应被保存")
+	}
+
+	// 不带 imageCompress 的请求。
+	status, resp = doJSON(t, h, http.MethodPut, "/api/settings",
+		`{"host":"127.0.0.1","port":8080}`)
+	if status != http.StatusOK {
+		t.Fatalf("保存失败: %d %s", status, resp)
+	}
+	var after model.Settings
+	if err := json.Unmarshal([]byte(resp), &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.ImageCompress.Enabled {
+		t.Error("省略 imageCompress 时不该把 Enabled 顶回 true")
+	}
+	if after.ImageCompress.ThresholdBytes != 262144 || after.ImageCompress.Quality != 70 {
+		t.Errorf("省略时应保持原值，实际 %+v", after.ImageCompress)
+	}
+
+	// 显式开启仍然生效。
+	status, resp = doJSON(t, h, http.MethodPut, "/api/settings",
+		`{"host":"127.0.0.1","port":8080,"imageCompress":{"enabled":true,"thresholdBytes":262144,"maxEdge":1024,"quality":70}}`)
+	if status != http.StatusOK {
+		t.Fatalf("保存失败: %d %s", status, resp)
+	}
+	if err := json.Unmarshal([]byte(resp), &after); err != nil {
+		t.Fatal(err)
+	}
+	if !after.ImageCompress.Enabled {
+		t.Error("显式 true 应被保存")
 	}
 }

@@ -227,6 +227,22 @@ export interface Provider {
   usage?: UsageSnapshot | null
 }
 
+/**
+ * 请求体内联图片压缩配置。
+ *
+ * 触发条件是「或」：字节数超阈值，或者长边超上限。只按字节判断会漏掉
+ * 「体积不大但分辨率极高」的截图 —— 那类图对上游的视觉 token 消耗最大。
+ */
+export interface ImageCompressSettings {
+  enabled: boolean
+  /** 触发压缩的原始图片字节阈值。 */
+  thresholdBytes: number
+  /** 长边上限（像素）。0 表示只按字节判断，不做缩放。 */
+  maxEdge: number
+  /** JPEG 输出质量（1-100），只对不透明图片生效。 */
+  quality: number
+}
+
 export interface Settings {
   host: string
   port: number
@@ -236,6 +252,7 @@ export interface Settings {
   usageInjectDefault: boolean
   defaultTimeoutSeconds: number
   defaultConnectTimeoutSeconds: number
+  imageCompress: ImageCompressSettings
   storeBodies: boolean
   maxBodyBytes: number
   retentionDays: number
@@ -267,6 +284,10 @@ export interface RequestLog {
   continuationMode: string
   continuationReason: string
   savedBytes: number
+  /** 本次请求压缩了多少张内联图片。 */
+  imageCompressed: number
+  /** 压缩省下的请求字节数（base64 串长度差）。 */
+  imageSavedBytes: number
   httpStatus: number
   success: boolean
   errorMsg: string
@@ -430,4 +451,56 @@ export type ProxyEvent =
   | { type: 'settings'; data: Settings }
   | { type: 'providers'; data: unknown }
   | { type: 'logs-cleared'; data: { deleted: number } }
+  | { type: 'update'; data: UpdateState }
   | { type: 'desktop-close-ask'; data: null }
+
+/** 开机自启的真实状态（读的是系统，不是数据库）。 */
+export interface AutostartState {
+  /** false 时 reason 说明原因，开关应禁用。 */
+  supported: boolean
+  reason: string
+  enabled: boolean
+  /** 本进程「应该」写入的启动项名字与命令行。 */
+  name: string
+  command: string
+  /** 系统里当前实际注册的命令；未开启时为空。 */
+  registered: string
+  /** 已开启但注册的命令与当前应有的不一致（例如 exe 被挪了位置）。 */
+  stale: boolean
+}
+
+/** 更新安装阶段。 */
+export type UpdatePhase =
+  | 'idle'
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'applying'
+  | 'restarting'
+  | 'failed'
+
+/** 版本检测与安装的状态快照。 */
+export interface UpdateState {
+  currentVersion: string
+  latestVersion: string
+  hasUpdate: boolean
+  /** 当前是未注入版本号的开发构建，不参与比较。 */
+  dev: boolean
+  /** 用户显式跳过过这个版本：自动弹框不弹，手动检查仍能看见。 */
+  skipped: boolean
+  skippedVersion: string
+  notes: string
+  htmlUrl: string
+  publishedAt: string
+  assetName: string
+  assetSize: number
+  /** false 时界面把主按钮换成「打开下载页」。 */
+  canAutoInstall: boolean
+  checkedAt: string
+
+  phase: UpdatePhase
+  /** 0-100。 */
+  progress: number
+  downloadedBytes: number
+  error: string
+}

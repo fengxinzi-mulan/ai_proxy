@@ -45,8 +45,10 @@ import {
 import { useAppStore } from '@/stores/app'
 import { useEvents } from '@/composables/useEvents'
 import BaseUrlChip from '@/components/BaseUrlChip.vue'
+import UpdateDialog from '@/components/UpdateDialog.vue'
 import { desktopApi, getAccessKey, setAccessKey } from '@/api'
 import { themeOverrides } from '@/theme/naive'
+import type { UpdateState } from '@/types'
 
 const store = useAppStore()
 const route = useRoute()
@@ -136,6 +138,7 @@ const { connected, reconnect } = useEvents({
   onSettingsChanged: (s) => {
     store.settings = s
   },
+  onUpdate: onUpdateEvent,
   onDesktopCloseAsk: showCloseAsk,
 })
 
@@ -216,6 +219,21 @@ function onCloseAskVisibility(v: boolean) {
   }
 }
 
+/* ---------- 版本更新 ---------- */
+
+// 更新弹框抽成子组件（useMessage 需要 NMessageProvider 注入，App 的 setup 里取不到）。
+const updateDialogRef = ref<InstanceType<typeof UpdateDialog> | null>(null)
+
+function onUpdateEvent(s: UpdateState) {
+  updateDialogRef.value?.onState(s)
+}
+
+function showUpdateDialog() {
+  void updateDialogRef.value?.open()
+}
+
+const updateBadge = computed(() => store.updateAvailable)
+
 const routeTitle = computed(() => String(route.meta.title ?? 'AI Proxy'))
 </script>
 
@@ -275,7 +293,16 @@ const routeTitle = computed(() => String(route.meta.title ?? 'AI Proxy'))
                   <span :class="['dot', connected ? 'dot-on' : 'dot-off']" />
                   <span class="sider-status-text">{{ connected ? '实时已连接' : '实时断开' }}</span>
                 </div>
-                <div v-if="store.version" class="sider-version">v{{ store.version }}</div>
+                <button
+                  v-if="store.version"
+                  type="button"
+                  :class="['sider-version', { 'sider-version-new': updateBadge }]"
+                  :title="updateBadge ? `有新版本 ${store.updateState?.latestVersion}，点击查看` : '点击检查更新'"
+                  @click="showUpdateDialog"
+                >
+                  v{{ store.version }}
+                  <span v-if="updateBadge" class="version-dot" />
+                </button>
               </div>
             </NLayoutSider>
 
@@ -469,6 +496,8 @@ const routeTitle = computed(() => String(route.meta.title ?? 'AI Proxy'))
               </div>
             </div>
           </NModal>
+
+          <UpdateDialog ref="updateDialogRef" />
         </NNotificationProvider>
       </NMessageProvider>
     </NDialogProvider>
@@ -556,10 +585,34 @@ const routeTitle = computed(() => String(route.meta.title ?? 'AI Proxy'))
 
 .sider-version {
   margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
   color: var(--text-3);
   white-space: nowrap;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: color 0.15s ease;
+}
+
+.sider-version:hover {
+  color: var(--text);
+}
+
+.sider-version-new {
+  color: var(--accent);
+}
+
+.version-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning, #f0a020);
+  box-shadow: 0 0 0 2px rgba(240, 160, 32, 0.18);
 }
 
 .topbar {

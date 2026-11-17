@@ -405,6 +405,24 @@ func (p *Provider) ApplyDefaults() {
 	}
 }
 
+// ImageCompressSettings 控制「请求体内联图片压缩」。
+//
+// 为什么放在全局设置而不是供应商级：这是纯粹的流量体积优化，与上游是谁无关；
+// 放到供应商级会让用户在几十个供应商里各配一遍，而收益完全一样。
+//
+// 触发条件是「或」的关系：字节数超阈值，或者长边超上限。只按字节判断会漏掉
+// 「体积不大但分辨率极高」的截图（PNG 压缩率高，字节很小但边长 4000px），
+// 这类图对上游的视觉 token 消耗最大，恰恰是最该缩的。
+type ImageCompressSettings struct {
+	Enabled bool `json:"enabled"`
+	// ThresholdBytes 是触发压缩的字节阈值（原始图片字节，不是 base64 后长度）。
+	ThresholdBytes int `json:"thresholdBytes"`
+	// MaxEdge 是长边上限（像素）。0 表示只按字节阈值判断，不做尺寸缩放。
+	MaxEdge int `json:"maxEdge"`
+	// Quality 是 JPEG 输出质量（1-100）。只在输出为 JPEG 时生效。
+	Quality int `json:"quality"`
+}
+
 // Settings 是全局设置，整体以单条 JSON 记录存放。
 type Settings struct {
 	// 服务
@@ -425,6 +443,9 @@ type Settings struct {
 	// AI 请求的生成耗时跨度极大，所以默认给足 10 分钟而不是常见的几十秒。
 	DefaultTimeoutSeconds        int `json:"defaultTimeoutSeconds"`
 	DefaultConnectTimeoutSeconds int `json:"defaultConnectTimeoutSeconds"`
+
+	// 请求体改写：内联图片压缩。默认开启，见 ImageCompressSettings。
+	ImageCompress ImageCompressSettings `json:"imageCompress"`
 
 	// 日志
 	StoreBodies   bool `json:"storeBodies"`   // 是否落库请求/响应报文
@@ -448,10 +469,16 @@ func DefaultSettings() Settings {
 		UsageInjectDefault:           true,
 		DefaultTimeoutSeconds:        600,
 		DefaultConnectTimeoutSeconds: 15,
-		StoreBodies:                  true,
-		MaxBodyBytes:                 64 * 1024,
-		RetentionDays:                30,
-		MaxLogs:                      200000,
+		ImageCompress: ImageCompressSettings{
+			Enabled:        true,
+			ThresholdBytes: 512 * 1024,
+			MaxEdge:        2048,
+			Quality:        85,
+		},
+		StoreBodies:   true,
+		MaxBodyBytes:  64 * 1024,
+		RetentionDays: 30,
+		MaxLogs:       200000,
 	}
 }
 
@@ -482,6 +509,17 @@ func (s *Settings) ApplyDefaults() {
 	}
 	if s.MaxBodyBytes <= 0 {
 		s.MaxBodyBytes = d.MaxBodyBytes
+	}
+	// 图片压缩只修非法值，**不动 Enabled**：Enabled=false 是用户的显式选择，
+	// 用默认值顶回来等于「关掉之后下次启动又自己开了」。
+	if s.ImageCompress.ThresholdBytes <= 0 {
+		s.ImageCompress.ThresholdBytes = d.ImageCompress.ThresholdBytes
+	}
+	if s.ImageCompress.MaxEdge < 0 {
+		s.ImageCompress.MaxEdge = d.ImageCompress.MaxEdge
+	}
+	if s.ImageCompress.Quality <= 0 || s.ImageCompress.Quality > 100 {
+		s.ImageCompress.Quality = d.ImageCompress.Quality
 	}
 }
 
@@ -518,6 +556,12 @@ type RequestLog struct {
 	ContinuationMode   string `json:"continuationMode"`
 	ContinuationReason string `json:"continuationReason"`
 	SavedBytes         int64  `json:"savedBytes"`
+
+	// 图片压缩留痕：本次请求改写了多少张内联图片、省下多少字节。
+	// 单独成列而不是塞进 modifications —— 这两个是可累加的量，
+	// 用户想知道的是「开了这个功能到底省了多少流量」。
+	ImageCompressed int   `json:"imageCompressed"`
+	ImageSavedBytes int64 `json:"imageSavedBytes"`
 
 	HTTPStatus int    `json:"httpStatus"`
 	Success    bool   `json:"success"`

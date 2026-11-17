@@ -144,9 +144,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 会话标识先于改写算好：prompt_cache_key 要用它保持多轮稳定。
-	in.outBody, in.modifications = rewriteRequestBodyOpts(prov, settings, reqBody, in.model, rewriteOptions{
+	rewritten := rewriteRequest(prov, settings, reqBody, in.model, rewriteOptions{
 		cacheKeySeed: sessionCacheSeed(r),
 	})
+	in.outBody = rewritten.Body
+	in.modifications = rewritten.Modifications
+	in.imageCompressed = rewritten.ImageCompressed
+	in.imageSavedBytes = rewritten.ImageSavedBytes
 
 	s.forward(w, r, in)
 }
@@ -168,6 +172,10 @@ type forwardInput struct {
 	outBody       []byte // 改写后实际发出的请求体
 	modifications []string
 	continuation  *continuationAttempt
+	// imageCompressed / imageSavedBytes 是本次请求里内联图片压缩的结果，
+	// 由 rewriteRequest 算出，落进日志供「这个功能到底省了多少」核对。
+	imageCompressed int
+	imageSavedBytes int64
 	// format 是「这次请求实际用的协议」，由请求路径推导（见 effectiveFormat）。
 	// 响应解析、归一化、统计都看它，而不是供应商配置的 apiFormat。
 	format model.APIFormat
@@ -586,6 +594,9 @@ func (s *Server) record(in forwardInput, res logResult) {
 		RequestModified:  len(in.modifications) > 0,
 		ResponseModified: res.responseModified,
 		Modifications:    in.modifications,
+
+		ImageCompressed: in.imageCompressed,
+		ImageSavedBytes: in.imageSavedBytes,
 
 		HTTPStatus: res.status,
 		Cancelled:  res.cancelled,
