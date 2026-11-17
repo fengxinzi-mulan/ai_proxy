@@ -93,7 +93,7 @@ build.bat
 
 ```bash
 go run scripts/gen-icon/main.go                  # 生成 build/windows/app.ico
-go run scripts/gen-rc/main.go -version 0.2.1     # 生成 build/windows/app.rc（含版本号）
+go run scripts/gen-rc/main.go -version 0.2.3     # 生成 build/windows/app.rc（含版本号）
 cd build/windows && windres --target=pe-x86-64 -i app.rc -o ../../internal/winres/rsrc_windows_amd64.syso -O coff -c 65001
 ```
 
@@ -127,8 +127,8 @@ cd web && npm install && npm run build && cd ..
 并自动创建 GitHub Release：
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.3
+git push origin v0.2.3
 ```
 
 也可以在 Actions 页面手动运行 `Release` 工作流，填版本号并勾选 `publish` 来发版；
@@ -347,6 +347,35 @@ node scripts/mock-upstream.mjs 9911
    续传关闭（`off` / `dry-run`）时连 `store` 和 `previous_response_id` 一起裁掉 ——
    Mistral 的 Responses API 是无状态的，`store:true` 会直接 400，
    `previous_response_id` 也引用不到上一轮响应。
+
+   **工具与输入项的类型裁剪**（同一开关，只对 Responses 生效）。Mistral 的
+   Responses 端点只接受「客户端自己执行的函数工具」，其余一律整条 400：
+
+   ```json
+   {"error":{"code":"3051",
+     "message":"tools: Value error, Tool types ['web_search'] are not supported;
+       this endpoint currently supports only client-executed function tools.",
+     "param":"tools","type":"invalid_request_error"}}
+   ```
+
+   Codex 默认就带 `web_search`，于是每一轮都打穿。代理的处理：
+
+   - `tools[]` 里的内置工具（`web_search` / `web_search_preview` / `file_search` /
+     `code_interpreter` / `image_generation` / `computer_use_preview` / `mcp` /
+     `custom` / `local_shell`）整项移除，日志记 `strip_tool_<类型>`；
+   - `namespace` 分组是 Codex 的工具包装（内层仍是 `function`），只删内层的内置工具，
+     删空则整组去掉 —— 空分组会被判成 `tools.N.FunctionTool.type` 错误；
+   - 工具被裁空时删掉 `tools` 键，并把 `tool_choice:"required"` 回落 `auto`
+     （`required` 要求至少有一个工具）；点名的函数不存在时同样回落，
+     日志记 `strip_tool_choice`；
+   - `input[]` 里 `web_search_call` / `item_reference` / `compaction` / `mcp_call`
+     这类回放项整项移除（上游只认 `message` / `reasoning` / `function_call` /
+     `function_call_output`），日志记 `strip_input_<类型>`；
+   - reasoning 项里**有值**的 `encrypted_content` 删掉（`null` 上游能接受，不动），
+     日志记 `strip_reasoning_encrypted`。明文 `summary` / `content` 保留，
+     多轮推理的连贯性不受影响。
+
+   函数工具本身一个字段都不改，客户端侧的工具调用照常往返。
 
 5. **注入 `prompt_cache_key`**（供应商「高级」页开启，默认关闭）
    上游的缓存亲和提示。Mistral 官方文档：同一会话用同一个 `prompt_cache_key`

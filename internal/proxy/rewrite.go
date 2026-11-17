@@ -109,6 +109,23 @@ func rewriteRequestBodyOpts(prov model.Provider, st model.Settings, rawBody []by
 		for _, key := range stripChatMessageExtraFields(obj) {
 			mods = append(mods, "strip_"+key)
 		}
+		// 工具定义与 Responses 输入项的类型校验：严格上游只认「客户端自己执行的
+		// 函数工具」，内置工具（web_search 等）整条 400。见 stripStrictTools。
+		for _, name := range stripStrictTools(obj) {
+			mods = append(mods, "strip_tool_"+name)
+		}
+		// 必须排在工具裁剪之后：required 要求至少有一个工具、点名的函数必须在
+		// tools 里，裁完之后这些组合才可能变成非法。只修真正非法的组合，
+		// 合法的 tool_choice 一个都不动。
+		if fixToolChoice(obj) {
+			mods = append(mods, "strip_tool_choice")
+		}
+		for _, name := range stripStrictResponsesInput(obj) {
+			mods = append(mods, "strip_input_"+name)
+		}
+		if stripReasoningEncryptedContent(obj) {
+			mods = append(mods, "strip_reasoning_encrypted")
+		}
 	}
 	if wantCacheKey {
 		if key := derivePromptCacheKey(prov, obj, opts.cacheKeySeed); key != "" && applyPromptCacheKey(obj, key) {
@@ -167,12 +184,18 @@ var chatMessageExtraFields = []string{
 	"refusal", "annotations", "audio", "function_call",
 }
 
-// prefilterParams 是 hasUnsupportedParam 的字节预筛清单（顶层 ∪ 消息级 ∪ name）。
+// prefilterParams 是 hasUnsupportedParam 的字节预筛清单
+// （顶层 ∪ 消息级 ∪ name ∪ 严格上游不认的工具/输入项类型）。
 var prefilterParams = func() []string {
-	out := make([]string, 0, len(chatUnsupportedTopLevelParams)+len(chatMessageExtraFields)+2)
+	out := make([]string, 0, len(chatUnsupportedTopLevelParams)+len(chatMessageExtraFields)+16)
 	out = append(out, chatUnsupportedTopLevelParams...)
 	out = append(out, chatMessageExtraFields...)
-	return append(out, "name", "previous_response_id")
+	out = append(out, "name", "previous_response_id")
+	// 内置工具与 Responses 输入项的类型名：命中才值得把 body 解析成 JSON。
+	out = append(out, "web_search", "namespace", "local_shell", "file_search",
+		"code_interpreter", "image_generation", "item_reference", "compaction",
+		"mcp_call", "encrypted_content")
+	return out
 }()
 
 // isResponsesShaped 按 body 结构判断这是不是一次 Responses 请求。
@@ -308,6 +331,286 @@ func stripChatMessageExtraFields(obj map[string]any) []string {
 		}
 	}
 	return removed
+}
+
+// ---------- 严格上游的工具与输入项裁剪 ----------
+//
+// 严格上游（Mistral 的 Responses API 就是）只接受「客户端自己执行的函数工具」，
+// 其余一律整条 400：
+//
+//	{"error":{"code":"3051","message":"tools: Value error, Tool types ['web_search']
+//	 are not supported; this endpoint currently supports only client-executed
+//	 function tools.","param":"tools","type":"invalid_request_error"}}
+//
+// 而 Codex 这类客户端默认就带 web_search（服务端内置工具），于是整轮对话直接
+// 打穿。这些内置工具本来也轮不到我们执行 —— 代理只做转发，不会替上游跑搜索 ——
+// 所以按供应商开关裁掉是无损的：函数工具一个不动，客户端侧的工具调用照常往返。
+
+// strictUnsupportedToolTypes 是严格上游不认的工具类型（顶层与 namespace 内层都算）。
+//
+// 只收 OpenAI 定义的内置工具：function 是唯一被接受的类型，namespace 是 Codex
+// 的分组包装（内层仍然是 function），其余都需要上游自己执行。
+var strictUnsupportedToolTypes = map[string]bool{
+	"web_search":                    true,
+	"web_search_preview":            true,
+	"web_search_preview_2025_03_11": true,
+	"local_shell":                   true,
+	"file_search":                   true,
+	"code_interpreter":              true,
+	"image_generation":              true,
+	"computer_use_preview":          true,
+	"mcp":                           true,
+	"custom":                        true,
+}
+
+// stripStrictTools 删除 tools[] 里严格上游不认的工具，返回被删掉的类型名（去重）。
+//
+// namespace 分组要单独处理：内层全是 function 时整组保留（Mistral 认这个包装，
+// 实测能正常返回带 namespace 的 function_call），内层混了内置工具就把那一项删掉；
+// 删空的分组整个移除 —— 空 namespace 会被判成 tools.N.FunctionTool.type 错误。
+func stripStrictTools(obj map[string]any) []string {
+	tools, ok := obj["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return nil
+	}
+
+	var removed []string
+	seen := map[string]bool{}
+	mark := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			removed = append(removed, name)
+		}
+	}
+
+	kept := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		typ, _ := tool["type"].(string)
+		if typ == "namespace" {
+			if pruned, dropped := pruneNamespaceTools(tool); len(dropped) > 0 {
+				for _, name := range dropped {
+					mark(name)
+				}
+				if pruned {
+					continue // 内层被删空，整组丢弃
+				}
+			}
+			kept = append(kept, tool)
+			continue
+		}
+		if strictUnsupportedToolTypes[typ] {
+			mark(typ)
+			continue
+		}
+		kept = append(kept, tool)
+	}
+
+	if len(removed) == 0 {
+		return nil
+	}
+	if len(kept) == 0 {
+		// 一个工具都不剩时把 tools 整个删掉：空数组本身能被接受，但留着会让
+		// tool_choice:"required" 变成非法组合，不如彻底不带。
+		delete(obj, "tools")
+		return removed
+	}
+	obj["tools"] = kept
+	return removed
+}
+
+// pruneNamespaceTools 原地裁掉 namespace 内层的非 function 工具。
+// 返回「分组是否已被删空」与「被删掉的类型名」。
+func pruneNamespaceTools(tool map[string]any) (bool, []string) {
+	inner, ok := tool["tools"].([]any)
+	if !ok {
+		return false, nil
+	}
+	var dropped []string
+	kept := make([]any, 0, len(inner))
+	for _, raw := range inner {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		if typ, _ := item["type"].(string); strictUnsupportedToolTypes[typ] {
+			dropped = append(dropped, typ)
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if len(dropped) == 0 {
+		return false, nil
+	}
+	tool["tools"] = kept
+	return len(kept) == 0, dropped
+}
+
+// fixToolChoice 在工具被裁掉之后修正 tool_choice，返回是否真的改动了。
+//
+// 严格上游对 tool_choice 的校验很死：required 要求至少有一个工具、点名的函数
+// 必须在 tools 里、custom 类型直接拒。裁掉内置工具后这几种组合都会变成 400，
+// 所以统一回落到 auto —— 语义上就是「本来想强制用某个工具，那个工具没了」。
+func fixToolChoice(obj map[string]any) bool {
+	choice, ok := obj["tool_choice"]
+	if !ok {
+		return false
+	}
+	tools, _ := obj["tools"].([]any)
+
+	switch c := choice.(type) {
+	case string:
+		if c == "required" && len(tools) == 0 {
+			obj["tool_choice"] = "auto"
+			return true
+		}
+		return false
+	case map[string]any:
+		typ, _ := c["type"].(string)
+		if typ == "custom" {
+			obj["tool_choice"] = "auto"
+			return true
+		}
+		if typ == "function" {
+			// Responses 把函数名放在顶层，chat/completions 包在 function 里，
+			// 两种形状都要认。
+			name, _ := c["name"].(string)
+			if name == "" {
+				if fn, ok := c["function"].(map[string]any); ok {
+					name, _ = fn["name"].(string)
+				}
+			}
+			if name != "" && !toolNameExists(tools, name) {
+				obj["tool_choice"] = "auto"
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// toolNameExists 报告 tools[] 里（含 namespace 内层）是否有这个名字的函数。
+//
+// 两种工具形状都认：Responses 用顶层 name，chat/completions 包一层 function。
+func toolNameExists(tools []any, name string) bool {
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if n, _ := tool["name"].(string); n == name {
+			return true
+		}
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if n, _ := fn["name"].(string); n == name {
+				return true
+			}
+		}
+		if inner, ok := tool["tools"].([]any); ok && toolNameExists(inner, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// strictUnsupportedInputTypes 是严格上游不认的 Responses input 项类型。
+//
+// function_call / function_call_output / message / reasoning 是它认的四种，
+// 其余（web_search_call、item_reference、compaction、mcp_call 等）都会整条 400：
+//
+//	{"error":{"code":"3051","message":"input: Value error, Input items of type
+//	 'web_search_call' are not supported.","param":"input"}}
+//
+// 这些项本身也没有可回放的内容 —— 它们记录的是上游内置工具的执行轨迹。
+var strictUnsupportedInputTypes = map[string]bool{
+	"web_search_call":         true,
+	"file_search_call":        true,
+	"code_interpreter_call":   true,
+	"image_generation_call":   true,
+	"computer_call":           true,
+	"computer_call_output":    true,
+	"local_shell_call":        true,
+	"mcp_call":                true,
+	"mcp_list_tools":          true,
+	"mcp_approval_request":    true,
+	"mcp_approval_response":   true,
+	"custom_tool_call":        true,
+	"custom_tool_call_output": true,
+	"item_reference":          true,
+	"compaction":              true,
+}
+
+// stripStrictResponsesInput 删除 Responses input[] 里严格上游不认的项类型，
+// 返回被删掉的类型名（去重）。只对 Responses 形态的 body 生效。
+func stripStrictResponsesInput(obj map[string]any) []string {
+	if !isResponsesShaped(obj) {
+		return nil
+	}
+	input, ok := obj["input"].([]any)
+	if !ok {
+		return nil
+	}
+
+	var removed []string
+	seen := map[string]bool{}
+	kept := make([]any, 0, len(input))
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		if typ, _ := item["type"].(string); strictUnsupportedInputTypes[typ] {
+			if !seen[typ] {
+				seen[typ] = true
+				removed = append(removed, typ)
+			}
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	obj["input"] = kept
+	return removed
+}
+
+// stripReasoningEncryptedContent 删除 reasoning 项里的 encrypted_content，返回是否改动。
+//
+// 客户端（Codex）会带 include:["reasoning.encrypted_content"]，把上一轮拿到的
+// 密文原样回放。严格上游明确拒绝：
+//
+//	{"error":{"code":"3051","message":"input: Value error, Reasoning items with
+//	 encrypted_content are not supported; replay reasoning as plaintext content."}}
+//
+// 注意只删「有值」的：null 能被接受，空串和非空串都会 400。删掉密文后
+// summary/content 里的明文思维链仍然保留，多轮推理的连贯性不受影响。
+func stripReasoningEncryptedContent(obj map[string]any) bool {
+	input, ok := obj["input"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := item["type"].(string); typ != "reasoning" {
+			continue
+		}
+		if v, has := item["encrypted_content"]; has && v != nil {
+			delete(item, "encrypted_content")
+			changed = true
+		}
+	}
+	return changed
 }
 
 // applyPromptCacheKey 把一个稳定的不透明 key 写进请求体顶层。

@@ -892,6 +892,17 @@ function remove() {
             <code class="mono">audio</code>、旧 <code class="mono">function_call</code>，
             以及非 <code class="mono">tool</code> 消息上的 <code class="mono">name</code>
             —— 这些都是 Mistral 这类「多一个字段就 422」schema 不认的。
+            <br />
+            Responses 格式还会裁掉<strong>上游不执行的工具</strong>：
+            <code class="mono">web_search</code>、<code class="mono">file_search</code>、
+            <code class="mono">code_interpreter</code>、<code class="mono">image_generation</code>、
+            <code class="mono">mcp</code>、<code class="mono">custom</code> 等内置工具整项移除
+            （<code class="mono">namespace</code> 分组只删内层的这类工具，删空则整组去掉），
+            函数工具一个不动；工具被裁到没有时 <code class="mono">tool_choice:"required"</code>
+            回落 <code class="mono">auto</code>。同时移除
+            <code class="mono">web_search_call</code>、<code class="mono">item_reference</code>
+            这类回放项，以及 reasoning 项里有值的
+            <code class="mono">encrypted_content</code>（明文思维链保留）。
             如果上游本来就认这些字段（部分国产网关），别开，否则推理会被悄悄关掉。
             另外 <code class="mono">role:"developer"</code> 会无条件归一化成
             <code class="mono">system</code>，不受此开关影响。

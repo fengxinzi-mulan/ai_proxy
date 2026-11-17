@@ -934,10 +934,10 @@ func TestMetrics(t *testing.T) {
 // 两个条件同时成立，样本取自 data/ai_proxy.db 的真实记录。
 func TestComputeTPSKeepsRealFastStreams(t *testing.T) {
 	cases := []struct {
-		name             string
-		tokens           int
-		ttftMs, totalMs  int64
-		wantTPS          float64
+		name              string
+		tokens            int
+		ttftMs, totalMs   int64
+		wantTPS           float64
 		wantApproximately bool
 	}{
 		// 21980 个 token 在 32 秒里持续到达：684 t/s 是真实吐字速度。
@@ -1313,6 +1313,211 @@ func TestRewritePromptRuleMatchesMappedModelName(t *testing.T) {
 	msgs := obj["messages"].([]any)
 	if len(msgs) != 2 {
 		t.Fatalf("应追加一条 system 消息，实际 %v", msgs)
+	}
+}
+
+// ---------- 严格上游的工具与输入项裁剪 ----------
+
+// strictResponsesProvider 是开了「剔除非标准字段」的 Responses 供应商。
+func strictResponsesProvider() model.Provider {
+	p := responsesProvider()
+	p.StripUnsupportedParams = true
+	return p
+}
+
+// 真实踩到的载荷：Codex 带 web_search 内置工具，Mistral 整条 400
+// （code 3051，tools: Tool types ['web_search'] are not supported）。
+func TestStripStrictToolsDropsBuiltinTools(t *testing.T) {
+	p := strictResponsesProvider()
+	body := []byte(`{"model":"m","input":"hi","tool_choice":"auto","tools":[` +
+		`{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{}}},` +
+		`{"type":"namespace","name":"multi_agent_v1","description":"sub","tools":[` +
+		`{"type":"function","name":"close_agent","parameters":{"type":"object","properties":{}}}]},` +
+		`{"type":"web_search","external_web_access":false}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_tool_web_search" {
+		t.Fatalf("应只记录 strip_tool_web_search，实际 %v", mods)
+	}
+
+	tools := decode(t, out)["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("函数工具与 namespace 都该保留，实际 %d 项: %s", len(tools), out)
+	}
+	if got := tools[0].(map[string]any)["name"]; got != "exec_command" {
+		t.Errorf("函数工具被误删: %v", got)
+	}
+	ns := tools[1].(map[string]any)
+	if ns["type"] != "namespace" || len(ns["tools"].([]any)) != 1 {
+		t.Errorf("namespace 分组应原样保留: %v", ns)
+	}
+}
+
+func TestStripStrictToolsPrunesNamespaceInner(t *testing.T) {
+	p := strictResponsesProvider()
+	// 内层混了内置工具：只删那一项，分组留下来。
+	body := []byte(`{"model":"m","input":"hi","tools":[` +
+		`{"type":"namespace","name":"ns","description":"d","tools":[` +
+		`{"type":"function","name":"keep","parameters":{"type":"object","properties":{}}},` +
+		`{"type":"web_search"}]}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_tool_web_search" {
+		t.Fatalf("应记录内层 web_search 被删，实际 %v", mods)
+	}
+	inner := decode(t, out)["tools"].([]any)[0].(map[string]any)["tools"].([]any)
+	if len(inner) != 1 || inner[0].(map[string]any)["name"] != "keep" {
+		t.Errorf("内层应只剩函数工具，实际 %v", inner)
+	}
+}
+
+func TestStripStrictToolsRemovesEmptiedNamespace(t *testing.T) {
+	p := strictResponsesProvider()
+	// 内层全是内置工具：分组删空后整组丢弃，否则上游会报
+	// tools.N.FunctionTool.type 错误。
+	body := []byte(`{"model":"m","input":"hi","tools":[` +
+		`{"type":"namespace","name":"ns","description":"d","tools":[{"type":"web_search"}]},` +
+		`{"type":"function","name":"f","parameters":{"type":"object","properties":{}}}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_tool_web_search" {
+		t.Fatalf("应记录 strip_tool_web_search，实际 %v", mods)
+	}
+	tools := decode(t, out)["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "f" {
+		t.Errorf("空 namespace 应被整组删除，实际 %v", tools)
+	}
+}
+
+func TestStripStrictToolsRemovesToolsKeyWhenEmpty(t *testing.T) {
+	p := strictResponsesProvider()
+	body := []byte(`{"model":"m","input":"hi","tools":[{"type":"web_search"}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_tool_web_search" {
+		t.Fatalf("应记录 strip_tool_web_search，实际 %v", mods)
+	}
+	if _, ok := decode(t, out)["tools"]; ok {
+		t.Errorf("工具被删空后不应留下空数组: %s", out)
+	}
+}
+
+func TestStripStrictToolsResetsToolChoice(t *testing.T) {
+	p := strictResponsesProvider()
+	cases := []struct {
+		name  string
+		body  string
+		check func(t *testing.T, obj map[string]any)
+	}{
+		{
+			// required 要求至少一个工具，裁空之后必须回落 auto。
+			name: "required 无工具",
+			body: `{"model":"m","input":"hi","tools":[{"type":"web_search"}],"tool_choice":"required"}`,
+			check: func(t *testing.T, obj map[string]any) {
+				if obj["tool_choice"] != "auto" {
+					t.Errorf("tool_choice 应回落 auto，实际 %v", obj["tool_choice"])
+				}
+			},
+		},
+		{
+			// 点名的函数被裁掉了，保留点名只会 400。
+			name: "点名的函数不存在",
+			body: `{"model":"m","input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{}}}],` +
+				`"tool_choice":{"type":"function","name":"gone"}}`,
+			check: func(t *testing.T, obj map[string]any) {
+				if obj["tool_choice"] != "auto" {
+					t.Errorf("tool_choice 应回落 auto，实际 %v", obj["tool_choice"])
+				}
+			},
+		},
+		{
+			// 点名的函数还在，不能动。
+			name: "点名的函数存在",
+			body: `{"model":"m","input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{}}}],` +
+				`"tool_choice":{"type":"function","name":"f"}}`,
+			check: func(t *testing.T, obj map[string]any) {
+				choice, _ := obj["tool_choice"].(map[string]any)
+				if choice["name"] != "f" {
+					t.Errorf("合法 tool_choice 不该被改动: %v", obj["tool_choice"])
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, _ := rewriteRequestBody(p, model.DefaultSettings(), []byte(c.body), modelNameFromBody([]byte(c.body)))
+			c.check(t, decode(t, out))
+		})
+	}
+}
+
+func TestStripStrictResponsesInputDropsUnsupportedItems(t *testing.T) {
+	p := strictResponsesProvider()
+	body := []byte(`{"model":"m","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},` +
+		`{"type":"web_search_call","id":"ws1","status":"completed"},` +
+		`{"type":"reasoning","id":"rs1","summary":[]},` +
+		`{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"ok"},` +
+		`{"type":"item_reference","id":"msg_1"}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	want := map[string]bool{"strip_input_web_search_call": true, "strip_input_item_reference": true}
+	if len(mods) != len(want) {
+		t.Fatalf("应记录两项输入裁剪，实际 %v", mods)
+	}
+	for _, m := range mods {
+		if !want[m] {
+			t.Errorf("意外的改动标记: %s", m)
+		}
+	}
+
+	items := responsesInput(t, out)
+	if len(items) != 4 {
+		t.Fatalf("应剩 4 项，实际 %d: %s", len(items), out)
+	}
+	for _, raw := range items {
+		typ, _ := raw.(map[string]any)["type"].(string)
+		if typ == "web_search_call" || typ == "item_reference" {
+			t.Errorf("不支持的输入项没删干净: %v", raw)
+		}
+	}
+}
+
+func TestStripReasoningEncryptedContent(t *testing.T) {
+	p := strictResponsesProvider()
+	// Codex 会回放上一轮的密文，严格上游直接拒：
+	// "Reasoning items with encrypted_content are not supported"。
+	body := []byte(`{"model":"m","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},` +
+		`{"type":"reasoning","id":"rs1","summary":[],"encrypted_content":"gAAAA-secret"},` +
+		`{"type":"reasoning","id":"rs2","summary":[],"encrypted_content":null}]}`)
+
+	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 1 || mods[0] != "strip_reasoning_encrypted" {
+		t.Fatalf("应记录 strip_reasoning_encrypted，实际 %v", mods)
+	}
+
+	items := responsesInput(t, out)
+	if _, has := items[1].(map[string]any)["encrypted_content"]; has {
+		t.Error("有值的 encrypted_content 应被删除")
+	}
+	// null 本来就能被接受，不必改动，也不该被记成改动。
+	if v, has := items[2].(map[string]any)["encrypted_content"]; !has || v != nil {
+		t.Errorf("null 的 encrypted_content 应原样保留，实际 %v", items[2])
+	}
+}
+
+func TestStrictToolStripDisabledByDefault(t *testing.T) {
+	// 开关关着时一律不动：认 web_search 的上游（OpenAI 官方）不能被误伤。
+	body := []byte(`{"model":"m","input":"hi","tools":[{"type":"web_search"}]}`)
+
+	out, mods := rewriteRequestBody(responsesProvider(), model.DefaultSettings(), body, modelNameFromBody(body))
+	if len(mods) != 0 {
+		t.Errorf("默认不该裁剪工具，实际 %v", mods)
+	}
+	if string(out) != string(body) {
+		t.Error("未发生改写时应原样返回原始字节")
 	}
 }
 
