@@ -29,3 +29,6 @@ Thumbs.db
 # 智能编码工具的工作目录（方案草稿等），不属于项目源码
 .zcode/
 *.exe~
+
+# 提交信息临时文件
+/.git-commit-msg.txt
