@@ -463,6 +463,65 @@ func TestCheckRestoresPersistedStateWithinInterval(t *testing.T) {
 	}
 }
 
+// 更新成功并重启后，库里存的还是「旧版本看到有新版本」的结论。
+// 节流期内恢复状态时必须按当前版本重算，否则界面会一直提示升级。
+func TestRestoreRecomputesHasUpdateAfterUpgrade(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	f := newFakeGitHub(t)
+	f.assets[assetDesktop] = []byte("x")
+
+	fetch := func(c *http.Client, repo, cur string) (Release, error) {
+		resp, err := c.Get(f.srv.URL + "/releases/latest")
+		if err != nil {
+			return Release{}, err
+		}
+		defer resp.Body.Close()
+		var rel Release
+		_ = json.NewDecoder(resp.Body).Decode(&rel)
+		return rel, nil
+	}
+
+	// 0.2.3 的实例查一次：发现 v9.9.9，结果落库。
+	m1 := New(Options{
+		Repo: "test/repo", CurrentVersion: "0.2.3", Desktop: true,
+		Store: st, Hub: hub.New(),
+		ClientFactory: func() (*http.Client, error) { return &http.Client{}, nil },
+	})
+	m1.fetch = fetch
+	if _, err := m1.Check(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if !m1.State().HasUpdate {
+		t.Fatal("0.2.3 应发现更新")
+	}
+
+	// 升级到 v9.9.9 后重启：节流期内恢复状态，不该再提示有更新。
+	m2 := New(Options{
+		Repo: "test/repo", CurrentVersion: "9.9.9", Desktop: true,
+		Store: st, Hub: hub.New(),
+		ClientFactory: func() (*http.Client, error) { return &http.Client{}, nil },
+	})
+	m2.fetch = func(*http.Client, string, string) (Release, error) {
+		t.Fatal("节流期内不该请求 GitHub")
+		return Release{}, nil
+	}
+	got, err := m2.Check(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HasUpdate {
+		t.Errorf("已经是最新版本（9.9.9 >= v9.9.9），不该再提示更新: %+v", got)
+	}
+	if got.LatestVersion != "v9.9.9" {
+		t.Errorf("最新版本号仍应恢复，实际 %q", got.LatestVersion)
+	}
+}
+
 // Skip 与 Check 并发时不能互相覆盖（各自改 persist 的不同字段）。
 func TestSkipAndCheckDoNotClobberEachOther(t *testing.T) {
 	st, err := store.Open(t.TempDir())

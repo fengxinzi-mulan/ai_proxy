@@ -354,19 +354,24 @@ func (m *Manager) Check(ctx context.Context, force bool) (State, error) {
 //
 // 只用于「节流期内不该重新请求」的场景；CanAutoInstall 现算，
 // 因为它取决于当前 exe 位置与平台，不该跟着库里的旧值走。
+//
+// HasUpdate 也必须**按当前版本现算**，不能直接搬库里的值：
+// 刚更新成功并重启时，库里存的还是「旧版本看到有新版本」的结论，
+// 直接搬过来会让界面在已经是最新版本的情况下继续提示升级。
 func (m *Manager) restoreFromPersist(p persist) {
 	if p.LatestVersion == "" {
 		return
 	}
+	hasUpdate := !m.State().Dev && CompareVersions(p.LatestVersion, m.current) > 0
 	m.setState(func(s *State) {
 		s.LatestVersion = p.LatestVersion
-		s.HasUpdate = p.HasUpdate
+		s.HasUpdate = hasUpdate
 		s.Notes = p.Notes
 		s.HTMLURL = p.HTMLURL
 		s.PublishedAt = p.PublishedAt
 		s.CheckedAt = p.LastCheckAt
 		s.SkippedVersion = p.SkippedVersion
-		s.Skipped = p.HasUpdate && p.SkippedVersion != "" &&
+		s.Skipped = hasUpdate && p.SkippedVersion != "" &&
 			CompareVersions(p.SkippedVersion, p.LatestVersion) == 0
 		s.AssetName = p.AssetName
 		s.AssetSize = p.AssetSize
