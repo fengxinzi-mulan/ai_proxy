@@ -53,6 +53,9 @@ type rewriteOptions struct {
 	// cacheKeySeed 是会话级标识（如客户端 X-Session-Id）；空串时改写函数
 	// 会退化为按「首条消息 + tools」的指纹派生，保证多轮之间仍然稳定。
 	cacheKeySeed string
+	// clientPath 是客户端请求的路径（已去掉 /p/<供应商> 前缀）。
+	// prompt_cache_key 只被部分端点接受，必须按路径判定，见 cacheKeyEndpoints。
+	clientPath string
 }
 
 // rewriteRequestBodyOpts 是带上下文版本的改写入口。
@@ -84,12 +87,20 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 	// thinking / reasoning_content 裁剪则相反：不少兼容网关确实认这些字段，
 	// 替用户做主会悄悄关掉推理或丢掉思维链回放，所以只在供应商显式开启严格兼容时才动。
 	wantStrip := prov.StripUnsupportedParams && isOpenAIStyle(prov.APIFormat) && hasUnsupportedParam(rawBody)
+	// max_tokens 与 max_completion_tokens 是两个「同一个意思的名字」。有的上游只认前者
+	// （Mistral 的 ChatCompletionRequest 只有 max_tokens），有的只认后者（OpenAI 新模型），
+	// 同时带上就是非法输入。这是纯粹的同义重复，不涉及用户意图取舍，所以无条件下消解。
+	wantMergeMaxTokens := bytes.Contains(rawBody, []byte(`"max_completion_tokens"`)) &&
+		bytes.Contains(rawBody, []byte(`"max_tokens"`))
 	// 图片压缩是全局开关，与上游是谁无关：它是纯粹的流量体积优化。
 	wantImageCompress := st.ImageCompress.Enabled && hasInlineImage(rawBody)
 	// prompt_cache_key 同理：不认这个字段的严格网关会 422，必须按供应商显式开启。
-	wantCacheKey := prov.PromptCacheKeyMode == model.PromptCacheKeyAuto && isOpenAIStyle(prov.APIFormat)
+	// 光看供应商还不够 —— 同一个 Mistral key 下，只有生成类端点认这个字段，
+	// embeddings / moderations / ocr 一律 422，所以还要按路径判定。
+	wantCacheKey := prov.PromptCacheKeyMode == model.PromptCacheKeyAuto &&
+		isOpenAIStyle(prov.APIFormat) && cacheKeyApplies(opts.clientPath)
 	promptText, promptStrategy, hasPrompt := resolvePromptForModel(prov, st, modelName, mappedModel, mapped)
-	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey && !wantImageCompress {
+	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey && !wantImageCompress && !wantMergeMaxTokens {
 		return rewriteResult{Body: rawBody}
 	}
 
@@ -102,6 +113,13 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 	var imgStats compressStats
 	if wantRoleFix && normalizeDeveloperRole(obj) {
 		mods = append(mods, "role_developer_to_system")
+	}
+	// 同义字段的冲突消解排在其它改写之前：它改变的是「这次请求带不带得出上游」，
+	// 后面那些注入/裁剪都应该作用在一个已经合法的请求体上。
+	if wantMergeMaxTokens {
+		if mark, ok := resolveMaxTokenParams(obj); ok {
+			mods = append(mods, mark)
+		}
 	}
 	if wantUsageInject {
 		if injectIncludeUsage(obj) {
@@ -131,6 +149,11 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 			mods = append(mods, "strip_"+key)
 		}
 		for _, key := range stripChatMessageExtraFields(obj) {
+			mods = append(mods, "strip_"+key)
+		}
+		// Responses 上取值被钉死的那几个顶层字段（truncation / background /
+		// metadata）：字段名合法、只有某些值非法，所以按值判，不能无条件删。
+		for _, key := range stripResponsesFixedValueParams(obj) {
 			mods = append(mods, "strip_"+key)
 		}
 		// 工具定义与 Responses 输入项的类型校验：严格上游只认「客户端自己执行的
@@ -224,10 +247,13 @@ var chatMessageExtraFields = []string{
 // prefilterParams 是 hasUnsupportedParam 的字节预筛清单
 // （顶层 ∪ 消息级 ∪ name ∪ 严格上游不认的工具/输入项类型）。
 var prefilterParams = func() []string {
-	out := make([]string, 0, len(chatUnsupportedTopLevelParams)+len(chatMessageExtraFields)+16)
+	out := make([]string, 0, len(chatUnsupportedTopLevelParams)+len(chatMessageExtraFields)+20)
 	out = append(out, chatUnsupportedTopLevelParams...)
 	out = append(out, chatMessageExtraFields...)
 	out = append(out, "name", "previous_response_id")
+	// Responses 上「只认固定值」的几个顶层字段：值不合规就是整条 400，但字段名本身
+	// 是合法的，所以不能无条件删，只能按值判断（见 stripResponsesFixedValueParams）。
+	out = append(out, "truncation", "background", "metadata")
 	// 内置工具与 Responses 输入项的类型名：命中才值得把 body 解析成 JSON。
 	out = append(out, "web_search", "namespace", "local_shell", "file_search",
 		"code_interpreter", "image_generation", "item_reference", "compaction",
@@ -368,6 +394,123 @@ func stripChatMessageExtraFields(obj map[string]any) []string {
 		}
 	}
 	return removed
+}
+
+// ---------- Responses 上「只认固定值」的顶层字段 ----------
+//
+// 这几个字段在 Mistral 的 CreateResponseRequest 里是合法的，但取值被钉死，
+// 传不对就是整条 400 —— 它们不是「多余字段」，所以不能像 store 那样无条件删，
+// 只能按值判断：合规的值原样保留（用户本来的意图），不合规的才动。
+//
+// 实测（2026-11-18，api.mistral.ai）：
+//
+//	truncation:"auto"    → 400 truncation: Input should be 'disabled'
+//	truncation:null      → 400 truncation: Input should be 'disabled'   ← null 也不行
+//	background:true      → 400 background: Input should be False
+//	background:null      → 400 background: Input should be False        ← null 也不行
+//	metadata:{"a":1}     → 400 metadata value must be a string, got <class 'int'>
+//	metadata:null        → 200（这个可以留）
+//
+// Codex 这类客户端默认就带 truncation/background，于是每一轮都打穿。
+
+// responsesDisabledOnlyParams 是「只接受 disabled」的字段：值是 "disabled" 时保留。
+var responsesDisabledOnlyParams = []string{"truncation"}
+
+// stripResponsesFixedValueParams 修正 Responses 请求体里取值受限的顶层字段，
+// 返回被改动过的字段名（去重）。只对 Responses 形态的 body 生效。
+func stripResponsesFixedValueParams(obj map[string]any) []string {
+	if !isResponsesShaped(obj) {
+		return nil
+	}
+	var changed []string
+
+	for _, key := range responsesDisabledOnlyParams {
+		v, has := obj[key]
+		if !has {
+			continue
+		}
+		// 只有 "disabled" 能过。null 也会 400（实测），所以不放过 nil。
+		if s, ok := v.(string); ok && s == "disabled" {
+			continue
+		}
+		delete(obj, key)
+		changed = append(changed, key)
+	}
+
+	// background 只接受 false（const: false）。true 与 null 都会 400（实测）。
+	if v, has := obj["background"]; has {
+		if b, ok := v.(bool); !ok || b {
+			delete(obj, "background")
+			changed = append(changed, "background")
+		}
+	}
+
+	if stripResponsesNonStringMetadata(obj) {
+		changed = append(changed, "metadata")
+	}
+	return changed
+}
+
+// stripResponsesNonStringMetadata 删掉 metadata 里值不是字符串的键，返回是否改动。
+//
+// Responses 的 metadata 是 map<string,string>；chat 那边是任意对象，所以只对
+// Responses 生效。整个对象被删空时连 metadata 一起删 —— 空对象虽然合法，
+// 但留着会让人以为上游收到了一份元数据。
+func stripResponsesNonStringMetadata(obj map[string]any) bool {
+	raw, has := obj["metadata"]
+	if !has {
+		return false
+	}
+	// null 上游接受（实测 200），不动它。
+	if raw == nil {
+		return false
+	}
+	md, ok := raw.(map[string]any)
+	if !ok {
+		// 不是对象（比如数组或字符串）反而是上游会拒的形态，整项删掉。
+		delete(obj, "metadata")
+		return true
+	}
+	changed := false
+	for key, v := range md {
+		if _, isString := v.(string); !isString {
+			delete(md, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	if len(md) == 0 {
+		delete(obj, "metadata")
+	}
+	return true
+}
+
+// ---------- 同义字段的冲突消解 ----------
+
+// resolveMaxTokenParams 消解 max_tokens 与 max_completion_tokens 同时出现的情况。
+//
+// 这两个字段语义完全相同（都表示「输出 token 上限」），只是名字分属两代 OpenAI 协议：
+// 老的是 max_tokens，新模型改用 max_completion_tokens 并要求两者不得并存。所以当客户端
+// 把两个都塞进请求体时，没有任何一个上游会接受 —— Mistral 直接判非法输入：
+//
+//	{"detail":[{"type":"extra_forbidden","loc":["body","max_completion_tokens"],
+//	 "msg":"Extra inputs are not permitted"}]}
+//
+// 取值的判断依据：两个值相同时删哪个都无损；不同时用 max_tokens —— 它是 Mistral 的
+// 原生字段（ChatCompletionRequest 里只有它），而能收 max_completion_tokens 的上游
+// 基本也都兼容 max_tokens。
+//
+// 返回日志标记与是否真的改动了（只有一个字段时是空操作）。
+func resolveMaxTokenParams(obj map[string]any) (string, bool) {
+	_, hasMaxTokens := obj["max_tokens"]
+	_, hasMaxCompletion := obj["max_completion_tokens"]
+	if !hasMaxTokens || !hasMaxCompletion {
+		return "", false
+	}
+	delete(obj, "max_completion_tokens")
+	return "merge_max_tokens", true
 }
 
 // ---------- 严格上游的工具与输入项裁剪 ----------
@@ -648,6 +791,45 @@ func stripReasoningEncryptedContent(obj map[string]any) bool {
 		}
 	}
 	return changed
+}
+
+// ---------- prompt_cache_key 的端点适用范围 ----------
+
+// cacheKeyEndpoints 是「接受 prompt_cache_key 的请求路径」。
+//
+// 以 Mistral 为例（实测 + 官方 openapi.yaml）：这个字段只出现在四个请求 schema 里
+// —— ChatCompletionRequest、FIMCompletionRequest、CreateResponseRequest、
+// AgentsCompletionRequest。其余端点（EmbeddingsRequest、ModerationRequest、
+// OCRRequest、ClassificationRequest）都是 additionalProperties=false 且没这个字段，
+// 带上就是整条 422：
+//
+//	{"detail":[{"type":"extra_forbidden","loc":["body","EmbeddingRequest",
+//	 "prompt_cache_key"],"msg":"Extra inputs are not permitted"}]}
+//
+// 所以按路径末段判定，只对生成类端点注入。注意 paths 用的是「末段匹配」而不是
+// 完整相等：客户端可能带自定义前缀（/api/openai/v1/chat/completions）。
+var cacheKeyEndpoints = []string{
+	"/chat/completions",
+	"/fim/completions",
+	"/agents/completions",
+	"/responses",
+}
+
+// cacheKeyApplies 报告本次请求的路径是否接受 prompt_cache_key。
+//
+// 路径为空时返回 false（宁可不注入，也不制造一个 422）：调用方没传路径说明
+// 它不在转发主链路上，那种场景本就无从判断端点形状。
+func cacheKeyApplies(clientPath string) bool {
+	path := strings.TrimSuffix(strings.TrimSpace(clientPath), "/")
+	if path == "" {
+		return false
+	}
+	for _, suffix := range cacheKeyEndpoints {
+		if strings.HasSuffix(path, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyPromptCacheKey 把一个稳定的不透明 key 写进请求体顶层。

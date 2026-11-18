@@ -371,11 +371,17 @@ node scripts/mock-upstream.mjs 9911
    这只是改名、不改变语义，所以不设开关；Responses 格式的 `input[]` 同样处理。
    日志里记 `role_developer_to_system`。
 
-4. **剔除非标准字段**（供应商「高级」页开启，默认关闭）
+4. **`max_tokens` / `max_completion_tokens` 冲突消解**（始终生效）
+   这两个字段语义完全相同，只是分属两代 OpenAI 协议；同时出现时没有任何上游接受
+   （Mistral 直接判 422 `extra_forbidden`）。代理检测到两者并存时删掉
+   `max_completion_tokens`、保留 `max_tokens` —— 后者是 Mistral 的原生字段，
+   而能收前者的上游基本也认后者。日志里记 `merge_max_tokens`。
+   只在一个字段存在时是空操作，不会凭空补字段。
+
+5. **剔除非标准字段**（供应商「高级」页开启，默认关闭）
    开启后，OpenAI / Responses 请求体顶层的 `thinking`、`enable_thinking`、
    `thinking_budget` 会在转发前移除；OpenAI Chat 格式还会额外移除 `store`，
    对应日志里的 `strip_*`。
-
    消息级字段同样会裁掉 —— 这些都不在 Mistral 的 `messages` schema 里
    （`SystemMessage` / `UserMessage` / `AssistantMessage` 都是
    `additionalProperties: false`）：
@@ -402,6 +408,20 @@ node scripts/mock-upstream.mjs 9911
    续传关闭（`off` / `dry-run`）时连 `store` 和 `previous_response_id` 一起裁掉 ——
    Mistral 的 Responses API 是无状态的，`store:true` 会直接 400，
    `previous_response_id` 也引用不到上一轮响应。
+
+   **Responses 上「字段合法、取值被钉死」的三个**（同一开关）。这几个字段本身在
+   schema 里，但只接受一个固定值，传别的就是整条 400：
+
+   | 字段 | 上游接受的值 | 处理 |
+   |---|---|---|
+   | `truncation` | 只接受 `"disabled"` | 别的值删掉，`"disabled"` 保留 |
+   | `background` | 只接受 `false` | `true` 删掉 |
+   | `metadata` | 值必须是字符串 | 删掉非字符串的键；删空则整个字段移除 |
+
+   日志里记 `strip_truncation` / `strip_background` / `strip_metadata`。
+   Codex 默认就带 `truncation` 和 `background`，不开这个开关时每一轮都会 400。
+   chat 形态不受影响 —— 那边的 `metadata` 收任意对象，`truncation`/`background`
+   只是多余字段，本来就走上面的常规裁剪。
 
    **工具与输入项的类型裁剪**（同一开关，只对 Responses 生效）。Mistral 的
    Responses 端点只接受「客户端自己执行的函数工具」，其余一律整条 400：
@@ -432,19 +452,26 @@ node scripts/mock-upstream.mjs 9911
 
    函数工具本身一个字段都不改，客户端侧的工具调用照常往返。
 
-5. **注入 `prompt_cache_key`**（供应商「高级」页开启，默认关闭）
+6. **注入 `prompt_cache_key`**（供应商「高级」页开启，默认关闭）
    上游的缓存亲和提示。Mistral 官方文档：同一会话用同一个 `prompt_cache_key`
    能提高前缀缓存命中率，缓存输入按标准输入价的 10% 计费，但**不保证命中**；
    缓存按 64 token 的块命中，所以 `usage.prompt_tokens_details.cached_tokens`
    永远是 64 的倍数（看到 512 就是只命中了 8 个块）。
 
+   **只对生成类端点注入。** 同一个 key 下，`/v1/chat/completions`、`/v1/fim/completions`、
+   `/v1/agents/completions`、`/v1/responses` 接受这个字段；`/v1/embeddings`、
+   `/v1/moderations`、`/v1/ocr`、`/v1/classifications` 的 schema 里根本没有它，
+   带上就是整条 422。所以代理按请求路径判定，路径认不出时一律不注入 ——
+   宁可少一次缓存亲和，也不制造一个 422。日志里没有 `prompt_cache_key` 标记时，
+   先看这次请求的端点在不在上面那四个里面。
+
    选「自动派生」后，代理优先用客户端会话头（`X-Session-Id` /
    `X-Opencode-Session` / `Session_id`），没有就用「首条消息 + tools」的指纹，
-   SHA-256 成 `aipx-…` 再注入 —— 多轮请求里这两部分不变，只有尾部增长，
+   SHA-256 成 `aipx-…` 再注入 —— 多轮 requests 里这两部分不变，只有尾部增长，
    所以同一会话的 key 稳定、不同会话自然分开。客户端自己带了 key 时不覆盖。
    不认这个字段的严格网关会 422，所以默认关闭，按供应商开启。
 
-6. **压缩内联图片**（全局开关，默认开启）
+7. **压缩内联图片**（全局开关，默认开启）
    多模态请求里图片常以 base64 内联在请求体里，一张手机截图动辄 2–4 MB，
    而模型侧真正消费的分辨率远低于原始像素。压到长边 2048、重编码成 JPEG 后
    通常只剩原来的 10%–20%，首字节延迟和上行带宽都跟着降。
@@ -500,9 +527,15 @@ node scripts/mock-upstream.mjs 9911
   一概不动。
 
 Mistral 预设包含 5 项：开启严格上游兼容、自动注入 `prompt_cache_key`、
-关闭 `include_usage` 注入（Mistral 的流式响应自带 usage，schema 里也没有
-`stream_options`）、关闭 Responses 续传（无状态）、总超时提到 900 秒
-（该模型支持 128k 输出与高推理档，300 秒容易被我们自己截断）。
+关闭 `include_usage` 注入（**Mistral 的流式响应每个 chunk 自带 usage**，`stream_options`
+这个字段它其实收，只是没必要带）、关闭 Responses 续传（无状态，`store` 只接受 `false`）、
+总超时提到 900 秒（它的模型支持 1M 上下文与 `xhigh` / `max` 推理档，长上下文预填充
+本身就要好几分钟，300 秒容易被我们自己截断 —— 实测库里最长一次 168 秒）。
+
+Mistral 还有两处「字段合法、取值受限」的地方不做自动改写，只在文档里记着：
+`service_tier` 只接受 `auto` / `standard_only`，`reasoning_effort` 的模型级子集
+比 spec 的七值枚举窄（`deepseek-v4-1-*` 只认 `none` / `low` / `high` / `xhigh` / `max`，
+传 `minimal` / `medium` 会 400 并回一份 supported values 清单）。
 
 ## 响应归一化
 
@@ -543,10 +576,25 @@ Mistral 预设包含 5 项：开启严格上游兼容、自动注入 `prompt_cac
 | `GET /alpha/billing/subscriptions` | 计划、状态、计费周期起止 |
 | `GET /alpha/usage/summary` | 周期内花费、请求数、成功率、输入/输出 token |
 
-另外还有两个模板：
+另外还有三个模板：
 
 **DeepSeek**（官方公开接口 `GET /user/balance`）读取总余额、充值余额、赠金余额；
 金额与币种（CNY/USD）跟着上游返回走 —— 人民币余额不会被当成美元显示。
+
+**Mistral** 的数据分两处，认证也分两套：
+
+| 数据 | 接口 | 认证 | 是否必需 |
+|---|---|---|---|
+| API / Vibe 预算与重置时间 | `GET /v1/billing/budget` | 供应商 API key | 必需 |
+| 订阅计划（FREE/INDIVIDUAL/EDU/TEAM） | `GET /v1/billing/subscription` | 供应商 API key | 必需 |
+| 本月限额状态 | `https://admin.mistral.ai/api/billing/limits` | 账号密码换来的会话 token | 可选 |
+| 本月输入/输出/缓存 token | `https://admin.mistral.ai/api/billing/v2/usage` | 同上 | 可选 |
+
+前两个是**官方公开接口**（`beta.billing`，认普通 API key）。后两个还挂在网页后台，
+普通 API key 读不到（`/v1/admin/usage` 会 401），所以要额外填 `admin.mistral.ai`
+的登录邮箱与密码 —— 程序用 Ory 的登录 API 换会话 token 并缓存，过期自动重登，
+不需要手工维护 Cookie。**不填也能用**：预算与计划照常显示，只是少了 token 明细，
+界面上会给一条「未填写账号密码，已跳过…」的提示。密码与 API 密钥同等对待，明文存本地库。
 
 **OpenCode Go**（`GET https://opencode.ai/zen/go/v1/usage`）读取 Go 订阅的三个配额窗口
 （5 小时 / 每周 / 每月）的用量百分比与重置时间。两点要知道：它只对**已订阅 OpenCode Go**
@@ -745,3 +793,4 @@ scripts/gen-rc/            生成 Windows 资源脚本（含版本号）
 - **自动更新只支持 Windows**，且 `go run` 调试形态会退回「打开下载页」。
   自动更新依赖 Release 里固定的两个文件名（`ai_proxy-desktop.exe` / `ai_proxy-server.exe`），
   改名会让老版本客户端找不到升级包。
+

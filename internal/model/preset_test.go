@@ -35,12 +35,12 @@ func TestMistralPresetAppliesOnlyListedFields(t *testing.T) {
 	}
 
 	prov := Provider{
-		ID:         11,
-		Name:       "fagun",
-		BaseURL:    "https://api.mistral.ai/v1",
-		APIFormat:  FormatOpenAI,
-		TimeoutSeconds: 0,
-		UsageInjectMode: ModeInherit,
+		ID:               11,
+		Name:             "fagun",
+		BaseURL:          "https://api.mistral.ai/v1",
+		APIFormat:        FormatOpenAI,
+		TimeoutSeconds:   0,
+		UsageInjectMode:  ModeInherit,
 		ContinuationMode: ContinuationOff,
 	}
 	prov.Keys = []APIKey{{ID: "k1", Key: "sk-secret"}}

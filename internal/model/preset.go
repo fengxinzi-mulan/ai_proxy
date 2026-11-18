@@ -55,22 +55,22 @@ var providerPresets = []ProviderPreset{
 			{
 				Field:  "prompt_cache_key",
 				Value:  "自动注入",
-				Reason: "官方文档：同一会话用稳定 key 提高前缀缓存命中率，缓存输入按标准输入价的 10% 计费",
+				Reason: "官方文档：同一会话用稳定 key 提高前缀缓存命中率，缓存输入按标准输入价的 10% 计费（只对 chat/fim/agents/responses 四个端点生效）",
 			},
 			{
 				Field:  "usage 注入",
 				Value:  "关闭",
-				Reason: "Mistral 的流式响应自带 usage，且 chat schema 里没有 stream_options 这个字段",
+				Reason: "Mistral 的流式响应每个 chunk 自带 usage，不需要 stream_options.include_usage；这里关掉的只是多余参数，统计照样精确",
 			},
 			{
 				Field:  "Responses 续传",
 				Value:  "关闭",
-				Reason: "Mistral 的 Responses API 是无状态的，store 只能为 false",
+				Reason: "Mistral 的 Responses API 是无状态的（store 只接受 false），引用不到上一轮响应",
 			},
 			{
 				Field:  "总超时",
 				Value:  "900 秒",
-				Reason: "该模型支持 128k 输出与高推理档，300 秒的总超时容易被我们自己截断",
+				Reason: "它的模型支持 1M 上下文与 xhigh/max 推理档，长上下文的预填充本身就要好几分钟，300 秒的默认值容易被我们自己截断",
 			},
 		},
 		StripUnsupportedParams: boolPtr(true),

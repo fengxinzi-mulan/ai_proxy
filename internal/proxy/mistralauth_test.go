@@ -37,7 +37,8 @@ type mistralAuthMock struct {
 
 func (m *mistralAuthMock) start(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {		switch {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
 		case r.Method == http.MethodGet && r.URL.Path == mistralLoginAPIPath:
 			m.flowCalls.Add(1)
 			writeJSON(w, map[string]any{"id": "flow-1", "type": "api"})

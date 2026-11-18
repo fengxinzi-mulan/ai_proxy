@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -36,11 +35,20 @@ type usageClient struct {
 	// origin 是 scheme://host 形式的站点根，供「额度接口固定在站点根某个绝对路径下」的模板使用
 	// （例如 OpenCode 的额度接口固定挂在 /zen/go/v1/usage，与 BaseURL 推导出来的路径基准无关）。
 	origin string
-	// bearer 非空时用它做 Authorization: Bearer 认证，替代 probeHeaders 里的上游密钥。
-	// 目前只有 Mistral 模板用：它的额度挂在网页后台，认证靠登录换来的会话 token，
-	// 与生成接口的 API key 完全是两套（见 mistralauth.go）。
-	bearer string
-	get    func(ctx context.Context, path string, query url.Values) (int, []byte, error)
+	// get 用供应商密钥发 GET（生成接口那套身份）。
+	get func(ctx context.Context, path string, query url.Values) (int, []byte, error)
+	// sessionGet 用网页会话 token 发 GET，未配置（或登录失败）时为 nil。
+	//
+	// 单独一个函数而不是让 get 自己猜认证方式：同一个模板里可能要同时用两种身份
+	// —— Mistral 的预算接口认 API key，token 明细认网页会话。混在一个函数里
+	// 就只能按 host 猜，那种隐式规则以后没人看得懂。
+	sessionGet func(ctx context.Context, path string, query url.Values) (int, []byte, error)
+	// sessionAttempted 记录「填了账号密码、尝试过登录」。
+	//
+	// 它与 sessionGet == nil 不是一回事：后者既可能是没填凭据，也可能是填了但登录失败。
+	// 模板要给用户看的降级说明必须分清这两种，否则会同时冒出「登录失败」和
+	// 「未填写账号密码」两条互相矛盾的提示。
+	sessionAttempted bool
 }
 
 // usageTemplate 描述一种「向上游查询套餐余量」的协议实现。
@@ -119,14 +127,18 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 	}
 	snap.TemplateName = tmpl.info.Name
 
-	// Mistral 的额度挂在网页后台，认证靠账号密码登录换来的会话 token，
-	// 与生成接口的 API key 无关 —— 所以它既不要求供应商密钥，也不走 BaseURL 推导。
+	// Mistral 的账号密码是**可选**的：预算与计划走官方 API（认 API key），
+	// 只有 token 明细还挂在网页后台（要会话 token）。所以这里不再强制要求账号密码，
+	// 也不再把 BaseURL 推导当作非致命错误 —— 预算接口就在 BaseURL 那个站点上。
 	// 其它模板仍然只认账号密钥（客户端持钥时代理手上没有密钥，查不了额度）。
-	var bearer string
-	if tmpl.info.ID == mistralTemplateID {
-		account, password := mistralCredentials(prov)
-		if account == "" || password == "" {
-			snap.Error = "Mistral 用量查询需要账号密码，请在「用量」页填写 admin.mistral.ai 的登录账号与密码"
+	isMistral := tmpl.info.ID == mistralTemplateID
+	var mistralAccount, mistralPassword string
+	if isMistral {
+		mistralAccount, mistralPassword = mistralCredentials(prov)
+		// 一个密钥都没有时，预算接口也读不了；只有账号密码也还能查 token 明细。
+		if _, hasKey := firstProviderKey(prov); !hasKey && (mistralAccount == "" || mistralPassword == "") {
+			snap.Error = "Mistral 用量查询需要供应商密钥（读预算与计划）；" +
+				"想额外看本月 token 明细，再在「用量」页填 admin.mistral.ai 的登录账号与密码"
 			return finish()
 		}
 	} else if _, ok := firstProviderKey(prov); !ok {
@@ -136,13 +148,10 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 
 	base, err := deriveUsageBaseURL(prov)
 	if err != nil {
-		// Mistral 的额度接口在 admin.mistral.ai，与生成接口不同域，
-		// 不依赖 BaseURL 推导，所以推导失败不算致命。
-		if tmpl.info.ID != mistralTemplateID {
-			snap.Error = err.Error()
-			return finish()
-		}
-		base = mistralAdminOrigin
+		// 预算接口就在 BaseURL 的站点根上，推导不出来就查不了 ——
+		// 这对所有模板（含 Mistral）都一样了，不再有「Mistral 可以回落写死地址」的分支。
+		snap.Error = err.Error()
+		return finish()
 	}
 
 	netcfg := resolveNet(prov, settings)
@@ -152,15 +161,20 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 		return finish()
 	}
 
-	// 登录要拿到会话 token 之后模板才能发请求，所以放在构造 cli 之前。
-	if tmpl.info.ID == mistralTemplateID {
-		account, password := mistralCredentials(prov)
-		token, loginErr := s.mistral.Token(ctx, client, account, password, false)
+	// 网页会话是可选的：只有填了账号密码才登录，登录失败也不该拖垮预算那部分。
+	var sessionGet func(context.Context, string, url.Values) (int, []byte, error)
+	sessionAttempted := false
+	if isMistral && mistralAccount != "" && mistralPassword != "" {
+		sessionAttempted = true
+		token, loginErr := s.mistral.Token(ctx, client, mistralAccount, mistralPassword, false)
 		if loginErr != nil {
-			snap.Error = loginErr.Error()
-			return finish()
+			// 不 return：预算走 API key，仍然能查。把原因留成警告。
+			snap.Warnings = append(snap.Warnings,
+				"账号密码登录失败，已跳过本月 token 明细："+loginErr.Error())
+		} else {
+			// 用变量而不是常量：测试要把站点根指向 httptest，生产路径上两者相同。
+			sessionGet = newUsageSessionGetter(client, mistralAdminOrigin, token)
 		}
-		bearer = token
 	}
 
 	// 模板会并发发请求，所以原始响应与地址清单要加锁。
@@ -168,10 +182,40 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 		rawMu    sync.Mutex
 		rawStore = map[string]any{}
 	)
+	// record 把一次响应登记进快照，供界面折叠查看。raw 里只放可读的结构，
+	// 非 JSON（HTML 登录页之类）只留长度 —— 几十万字符的页面既看不了也不该落库。
+	record := func(path, target string, body []byte) {
+		var decoded any
+		if json.Unmarshal(body, &decoded) != nil {
+			decoded = fmt.Sprintf("<非 JSON 响应，%d 字节>", len(body))
+		}
+		rawMu.Lock()
+		snap.UsedURLs = append(snap.UsedURLs, target)
+		rawStore[path] = decoded
+		rawMu.Unlock()
+	}
+
+	rawSessionGet := sessionGet // 保留原函数，包装后仍要能调用它
+
+	// 包装后的会话 getter：nil 时必须保持 nil。
+	// 模板靠「cli.sessionGet == nil」判断要不要发 admin 请求，包一层非 nil 的
+	// 闭包会让它以为有会话可用，进而打出「未配置网页会话」这种误导性警告。
+	var recordedSessionGet func(context.Context, string, url.Values) (int, []byte, error)
+	if rawSessionGet != nil {
+		recordedSessionGet = func(ctx context.Context, path string, query url.Values) (int, []byte, error) {
+			st, body, err := rawSessionGet(ctx, path, query)
+			// 会话请求同样要登记到 UsedURLs / Raw：界面上「查了哪些地址」必须完整，
+			// 否则排查时会以为 admin 那两个接口从来没被调用过。
+			if err == nil {
+				record(path, mistralAdminOrigin+path, body)
+			}
+			return st, body, err
+		}
+	}
+
 	cli := &usageClient{
 		baseURL: base,
 		origin:  originOf(base),
-		bearer:  bearer,
 		get: func(ctx context.Context, path string, query url.Values) (int, []byte, error) {
 			// path 以 http:// 或 https:// 开头时视为完整地址（模板用 cli.origin 自行拼绝对路径），
 			// 否则拼到推导出来的 base 上。
@@ -187,12 +231,6 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 			// 每次请求单独构造头：同一个 http.Header 并发复用会被上游写坏
 			// （Transport 会往里塞 Host 之类的字段）。
 			headers := probeHeaders(prov)
-			if bearer != "" {
-				// 网页后台认的是登录换来的会话 token，不是上游 API key。
-				headers = http.Header{}
-				headers.Set("Authorization", "Bearer "+bearer)
-				headers.Set("Accept", "application/json")
-			}
 			req, err := buildRequest(ctx, http.MethodGet, target, nil, headers)
 			if err != nil {
 				return 0, nil, err
@@ -203,20 +241,11 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 			}
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-
-			var decoded any
-			if json.Unmarshal(body, &decoded) != nil {
-				// HTML 响应（Mistral 的订阅页）不塞进 Raw：几十万字符的页面
-				// 既看不了也不该落库，只留一个长度提示。
-				decoded = fmt.Sprintf("<非 JSON 响应，%d 字节>", len(body))
-			}
-			rawMu.Lock()
-			snap.UsedURLs = append(snap.UsedURLs, target)
-			rawStore[path] = decoded
-			rawMu.Unlock()
-
+			record(path, target, body)
 			return resp.StatusCode, body, nil
 		},
+		sessionGet:       recordedSessionGet,
+		sessionAttempted: sessionAttempted,
 	}
 
 	result, err := tmpl.fetch(ctx, cli)
@@ -301,6 +330,34 @@ func originOf(raw string) string {
 		return ""
 	}
 	return u.Scheme + "://" + u.Host
+}
+
+// newUsageSessionGetter 构造「用网页会话 token 发 GET」的取数函数。
+//
+// 只给 Mistral 的 token 明细用：那一份数据还挂在网页后台（admin.mistral.ai），
+// 认的是账号密码登录换来的会话 token，与生成接口的 API key 完全是两套身份。
+// 站点根写死 —— 这些接口与生成接口不同域，没法从 BaseURL 推导。
+func newUsageSessionGetter(client *http.Client, origin, token string) func(context.Context, string, url.Values) (int, []byte, error) {
+	return func(ctx context.Context, path string, query url.Values) (int, []byte, error) {
+		target := strings.TrimRight(origin, "/") + path
+		if len(query) > 0 {
+			target += "?" + query.Encode()
+		}
+		headers := http.Header{}
+		headers.Set("Authorization", "Bearer "+token)
+		headers.Set("Accept", "application/json")
+		req, err := buildRequest(ctx, http.MethodGet, target, nil, headers)
+		if err != nil {
+			return 0, nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return resp.StatusCode, body, nil
+	}
 }
 
 // ---------- commandcode 模板 ----------
@@ -990,23 +1047,30 @@ func parseMoneyString(s string) (float64, bool) {
 }
 
 // ---------- Mistral 模板 ----------
-
-// Mistral 的额度挂在网页后台，与生成接口（api.mistral.ai）不同域。
 //
-// 认证也不一样：普通 API key 访问 Admin 端点会被直接拒绝
-// （2026-11-15 实测 /v1/admin/usage 返回 401 Invalid API Key），只能用账号密码
-// 登录换来的会话 token（见 mistralauth.go）。所以这个模板不读供应商密钥，
-// 也不依赖 BaseURL 推导 —— 地址写死在 admin.mistral.ai。
+// 数据分两处，认证也分两套：
+//
+//   - 预算（API / Vibe 额度与重置时间）与订阅计划在官方 API 上：GET /v1/billing/budget
+//     与 GET /v1/billing/subscription，认普通 API key。2026-11-18 实测均返回 200，
+//     结构稳定且带 OpenAPI 定义（beta.billing 标签）。
+//   - 本月 token 明细与限额状态还挂在网页后台（admin.mistral.ai），只认账号密码
+//     登录换来的会话 token（见 mistralauth.go）。这一部分是可选的。
+//
+// 早先整份数据都靠抓 admin 的 SSR 页面（解析 RSC flight 里内嵌的 budget JSON），
+// 那套做法的脆弱点很明显：页面改版就失效、还得让用户把网页密码明文交出来。
+// 现在预算与计划改走官方接口，账号密码只在「想额外看 token 明细」时才需要填。
+
+// Mistral 官方接口路径。
 const (
 	mistralTemplateID = "mistral"
 
-	// /subscription 是服务端渲染的 HTML 页面，PRO 计划的预算就嵌在里面的
-	// RSC flight 数据中（不是 __NEXT_DATA__，是 self.__next_f.push）。
-	mistralPathSubscription = "/subscription"
-	// /api/billing/limits 给本月用量与限额状态。
-	mistralPathLimits = "/api/billing/limits"
-	// /api/billing/v2/usage 给按模型的 token 明细，这里只汇总出输入/输出/缓存总量。
-	mistralPathUsage = "/api/billing/v2/usage"
+	// 官方 API：预算与计划。挂在生成接口同一个站点根上（api.mistral.ai）。
+	mistralPathBudget       = "/v1/billing/budget"
+	mistralPathSubscription = "/v1/billing/subscription"
+
+	// 网页后台：token 明细与限额状态。挂在 admin.mistral.ai 上，需要会话 token。
+	mistralAdminPathLimits = "/api/billing/limits"
+	mistralAdminPathUsage  = "/api/billing/v2/usage"
 )
 
 // mistralAdminOrigin 是网页后台的站点根。写成变量是为了让测试能指向 httptest；
@@ -1018,15 +1082,15 @@ func mistralTemplate() usageTemplate {
 		info: model.UsageTemplateInfo{
 			ID:   mistralTemplateID,
 			Name: "Mistral",
-			Description: "用账号密码登录 admin.mistral.ai，读取 PRO 计划的额度窗口" +
-				"（API / Vibe 预算与重置时间）、本月用量统计与订阅计划信息",
+			Description: "用 API key 读取官方 /v1/billing 的预算窗口（API / Vibe）与订阅计划；" +
+				"再填 admin.mistral.ai 的账号密码可额外读到本月 token 明细与限额状态",
 		},
 		fetch: fetchMistralUsage,
 	}
 }
 
 // mistralBudget 是一条预算额度。usage_percentage 是 0-100 的百分数
-// （实测 vibe_budget 返回 0.9771，表示已用 0.9771%），与 UsageWindow.Percent 同口径。
+// （实测 vibe_budget 返回 20.81，表示已用 20.81%），与 UsageWindow.Percent 同口径。
 type mistralBudget struct {
 	UsagePercentage float64 `json:"usage_percentage"`
 	InitialBudget   float64 `json:"initial_budget"`
@@ -1034,11 +1098,22 @@ type mistralBudget struct {
 	ResetAt         string  `json:"reset_at"`
 }
 
-// mistralBudgetRoot 是订阅页里 budget 对象的结构。
+// mistralBudgetRoot 是 /v1/billing/budget 的响应结构。
+//
+// 顶层的 usage_percentage / initial_budget / reset_at 与 api_budget 是同一份数据
+// （实测两者完全一致），保留内嵌是为了 api_budget 缺失时能回退。
 type mistralBudgetRoot struct {
 	mistralBudget
 	APIBudget  *mistralBudget `json:"api_budget"`
 	VibeBudget *mistralBudget `json:"vibe_budget"`
+}
+
+// mistralSubscriptionInfo 是 /v1/billing/subscription 的响应结构。
+type mistralSubscriptionInfo struct {
+	PlanName        string `json:"plan_name"`         // FREE / INDIVIDUAL / EDU / TEAM
+	PaygEnabled     bool   `json:"payg_enabled"`      // 是否开通按量付费（API 订阅）
+	VibePaygEnabled bool   `json:"vibe_payg_enabled"` // Vibe Code 的按量付费
+	Enterprise      bool   `json:"enterprise"`        // 是否企业版
 }
 
 // mistralResult 是一次接口调用的结果。
@@ -1051,123 +1126,155 @@ type mistralResult struct {
 func fetchMistralUsage(ctx context.Context, cli *usageClient) (*model.UsageSnapshot, error) {
 	snap := &model.UsageSnapshot{}
 
-	// 三个接口互不依赖，任何一个失败都不该让其它两个白跑。
-	fetch := func(path string, query url.Values) mistralResult {
-		st, body, err := cli.get(ctx, mistralAdminOrigin+path, query)
+	// 认 API key 的那两个（官方接口），拼在 cli.baseURL 上。
+	apiGet := func(path string) mistralResult {
+		st, body, err := cli.get(ctx, path, nil)
 		return mistralResult{status: st, body: body, err: err}
 	}
+	// 认网页会话的那两个（admin 后台）。没配账号密码时 cli.sessionGet 为 nil。
+	adminGet := func(path string, query url.Values) (mistralResult, bool) {
+		if cli.sessionGet == nil {
+			return mistralResult{}, false
+		}
+		st, body, err := cli.sessionGet(ctx, path, query)
+		return mistralResult{status: st, body: body, err: err}, true
+	}
+	budget := apiGet(mistralPathBudget)
+	sub := apiGet(mistralPathSubscription)
 
-	now := time.Now().UTC()
-	usageQuery := url.Values{}
-	usageQuery.Set("month", strconv.Itoa(int(now.Month())))
-	usageQuery.Set("year", strconv.Itoa(now.Year()))
-
-	sub := fetch(mistralPathSubscription, nil)
-	limits := fetch(mistralPathLimits, nil)
-	usage := fetch(mistralPathUsage, usageQuery)
-
-	// 认证失效时三个接口会一起 401/403，这时报一条明确的错就够了。
-	if isMistralAuthFailure(sub) || isMistralAuthFailure(limits) || isMistralAuthFailure(usage) {
-		return nil, errors.New("Mistral 登录会话无效（HTTP 401/403），请检查账号密码是否仍然有效")
+	// 两个官方接口都 401/403 时，用户最需要知道的是「这把 key 不对」，
+	// 而不是两条「HTTP 401」的泛化警告。
+	if isHTTPAuthFailure(budget) && isHTTPAuthFailure(sub) {
+		return nil, errors.New("Mistral 拒绝了这把 API 密钥（HTTP 401/403），请检查供应商密钥是否正确")
 	}
 
 	okCount := 0
 
-	// ---------- 额度窗口 + 计划信息 ----------
+	// ---------- 额度窗口 ----------
+	if budget.err != nil {
+		snap.Warnings = append(snap.Warnings,
+			fmt.Sprintf("预算接口不可用（无法连接）：%v", budget.err))
+	} else if budget.status < 200 || budget.status >= 300 {
+		snap.Warnings = append(snap.Warnings,
+			fmt.Sprintf("预算接口不可用（HTTP %d）", budget.status))
+	} else if windows, err := parseMistralBudget(budget.body); err != nil {
+		snap.Warnings = append(snap.Warnings, "预算结构无法识别："+err.Error())
+	} else {
+		okCount++
+		snap.Windows = append(snap.Windows, windows...)
+	}
+
+	// ---------- 订阅计划 ----------
 	if sub.err != nil {
 		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("订阅页不可用（无法连接 admin.mistral.ai）：%v", sub.err))
+			fmt.Sprintf("订阅接口不可用（无法连接）：%v", sub.err))
 	} else if sub.status < 200 || sub.status >= 300 {
 		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("订阅页不可用（HTTP %d）", sub.status))
-	} else if parsed, err := parseMistralSubscription(sub.body); err != nil {
-		snap.Warnings = append(snap.Warnings, "订阅页结构无法识别："+err.Error())
+			fmt.Sprintf("订阅接口不可用（HTTP %d）", sub.status))
+	} else if info, err := parseMistralSubscription(sub.body); err != nil {
+		snap.Warnings = append(snap.Warnings, "订阅结构无法识别："+err.Error())
 	} else {
 		okCount++
-		snap.Windows = append(snap.Windows, parsed.windows...)
-		snap.PlanName = parsed.planName
-		snap.Status = parsed.status
-		snap.Warnings = append(snap.Warnings, parsed.warnings...)
+		snap.PlanName, snap.Status = info.planName, info.status
+		snap.Warnings = append(snap.Warnings, info.warnings...)
 	}
 
-	// ---------- 周期统计：限额 ----------
-	if limits.err != nil {
+	// ---------- 可选：本月限额状态 ----------
+	limits, hasSession := adminGet(mistralAdminPathLimits, nil)
+	switch {
+	case !hasSession:
+		// 只有「本来就没填凭据」才这么说。填了但登录失败的情况在 QueryUsage 里
+		// 已经记过一条明确的警告，这里不能再冒一句「未填写」自相矛盾。
+		if !cli.sessionAttempted {
+			snap.Warnings = append(snap.Warnings,
+				"未填写账号密码，已跳过本月限额状态与 token 明细（预算与计划不受影响）")
+		}
+	case limits.err != nil:
 		snap.Warnings = append(snap.Warnings,
 			fmt.Sprintf("限额接口不可用（无法连接）：%v", limits.err))
-	} else if limits.status < 200 || limits.status >= 300 {
+	case limits.status < 200 || limits.status >= 300:
 		snap.Warnings = append(snap.Warnings,
 			fmt.Sprintf("限额接口不可用（HTTP %d）", limits.status))
-	} else if stats, warnings, err := parseMistralLimits(limits.body); err != nil {
-		snap.Warnings = append(snap.Warnings, "限额结构无法识别："+err.Error())
-	} else {
-		okCount++
-		snap.Period = append(snap.Period, stats...)
-		snap.Warnings = append(snap.Warnings, warnings...)
+	default:
+		if stats, warnings, err := parseMistralLimits(limits.body); err != nil {
+			snap.Warnings = append(snap.Warnings, "限额结构无法识别："+err.Error())
+		} else {
+			okCount++
+			snap.Period = append(snap.Period, stats...)
+			snap.Warnings = append(snap.Warnings, warnings...)
+		}
 	}
 
-	// ---------- 周期统计：token 汇总 ----------
-	if usage.err != nil {
-		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("用量接口不可用（无法连接）：%v", usage.err))
-	} else if usage.status < 200 || usage.status >= 300 {
-		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("用量接口不可用（HTTP %d）", usage.status))
-	} else if stats, err := parseMistralUsageTokens(usage.body); err != nil {
-		snap.Warnings = append(snap.Warnings, "用量结构无法识别："+err.Error())
-	} else {
-		okCount++
-		snap.Period = append(snap.Period, stats...)
+	// ---------- 可选：本月 token 明细 ----------
+	if hasSession {
+		now := time.Now().UTC()
+		query := url.Values{}
+		query.Set("month", strconv.Itoa(int(now.Month())))
+		query.Set("year", strconv.Itoa(now.Year()))
+
+		usage, _ := adminGet(mistralAdminPathUsage, query)
+		switch {
+		case usage.err != nil:
+			snap.Warnings = append(snap.Warnings,
+				fmt.Sprintf("用量接口不可用（无法连接）：%v", usage.err))
+		case usage.status < 200 || usage.status >= 300:
+			snap.Warnings = append(snap.Warnings,
+				fmt.Sprintf("用量接口不可用（HTTP %d）", usage.status))
+		default:
+			if stats, err := parseMistralUsageTokens(usage.body); err != nil {
+				snap.Warnings = append(snap.Warnings, "用量结构无法识别："+err.Error())
+			} else {
+				okCount++
+				snap.Period = append(snap.Period, stats...)
+			}
+		}
 	}
 
 	if okCount == 0 {
-		return nil, errors.New("Mistral 的三个接口都没能读到数据，请检查账号密码与网络代理")
+		return nil, errors.New("Mistral 的所有接口都没能读到数据，请检查密钥、账号密码与网络代理")
 	}
 	snap.OK = true
 	return snap, nil
 }
 
-// isMistralAuthFailure 判断响应是不是认证失败。
-func isMistralAuthFailure(r mistralResult) bool {
+// isHTTPAuthFailure 判断一次调用是不是被认证拒绝（网络错误不算）。
+func isHTTPAuthFailure(r mistralResult) bool {
 	return r.err == nil && (r.status == http.StatusUnauthorized || r.status == http.StatusForbidden)
 }
 
-// mistralSubscription 是从订阅页解析出来的内容。
-type mistralSubscription struct {
-	windows  []model.UsageWindow
-	planName string
-	status   string
-	warnings []string
-}
-
-// parseMistralSubscription 从订阅页 HTML 里取出预算与计划信息。
+// parseMistralBudget 把官方 /v1/billing/budget 的响应映射成额度窗口。//
+// 实测响应（2026-11-18）：
 //
-// 页面是 Next.js 的 RSC flight 输出，数据被塞在 self.__next_f.push([1,"..."]) 里，
-// 字符串层做过转义。解析分三步：整体反转义 → 定位 "budget":{ → 括号平衡截出对象。
-func parseMistralSubscription(html []byte) (mistralSubscription, error) {
-	var out mistralSubscription
-	// 未登录时后台返回的是 Ory 的登录流程对象，别把它当成数据。
-	if bytes.Contains(html, []byte("self-service/login")) && !bytes.Contains(html, []byte(`"budget"`)) {
-		return out, errors.New("返回的是登录页而非订阅页，账号密码可能已失效")
-	}
-
-	unescaped := unescapeMistralFlight(html)
-
-	rawBudget := extractJSONObject(unescaped, `"budget":`)
-	if rawBudget == "" {
-		return out, errors.New("没有找到 budget 字段")
-	}
+//	{"vibe_budget":{"usage_percentage":20.81,"initial_budget":300.0,"currency":"USD",
+//	  "reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},
+//	 "api_budget":{"usage_percentage":0.0,"initial_budget":30.0,"currency":"USD",
+//	  "reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},
+//	 "usage_percentage":0.0,"initial_budget":30.0,"currency":"USD","reset_at":"..."}
+func parseMistralBudget(body []byte) ([]model.UsageWindow, error) {
 	var root mistralBudgetRoot
-	if err := json.Unmarshal([]byte(rawBudget), &root); err != nil {
-		return out, errors.New("budget 字段不是合法的 JSON")
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, errors.New("响应不是合法的 JSON")
 	}
 
 	// 顶层 budget 与 api_budget 实测是同一份数据，优先用 api_budget，
 	// 缺了再退回顶层，免得同一条额度重复展示。
+	//
+	// 回退要有条件：顶层那三个字段全为空值时说明响应里根本没有预算数据，
+	// 这时不能造一条「额度 0 / 已用 0」出来 —— 把「读不到」显示成「额度为 0」
+	// 会直接误导用户（见 model.UsageSnapshot 的设计约束）。
 	api := root.APIBudget
 	if api == nil {
-		b := root.mistralBudget
-		api = &b
+		if root.InitialBudget == 0 && root.ResetAt == "" && root.Currency == "" {
+			return nil, errors.New("没有 api_budget / vibe_budget")
+		}
+		fallback := root.mistralBudget
+		api = &fallback
 	}
+	if api == nil && root.VibeBudget == nil {
+		return nil, errors.New("没有 api_budget / vibe_budget")
+	}
+
+	var windows []model.UsageWindow
 	for _, item := range []struct {
 		label string
 		node  *mistralBudget
@@ -1191,204 +1298,56 @@ func parseMistralSubscription(html []byte) (mistralSubscription, error) {
 		if item.node.Currency != "" {
 			w.Hint += "（" + strings.ToUpper(item.node.Currency) + "）"
 		}
-		out.windows = append(out.windows, w)
+		windows = append(windows, w)
 	}
-	if len(out.windows) == 0 {
-		return out, errors.New("budget 里没有 api_budget / vibe_budget")
+	if len(windows) == 0 {
+		return nil, errors.New("没有 api_budget / vibe_budget")
+	}
+	return windows, nil
+}
+
+// parseMistralSubscription 解析官方 /v1/billing/subscription。
+//
+// 实测响应：{"plan_name":"INDIVIDUAL","payg_enabled":false,
+// "vibe_payg_enabled":false,"enterprise":false}
+func parseMistralSubscription(body []byte) (mistralSubscription, error) {
+	var out mistralSubscription
+	var info mistralSubscriptionInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return out, errors.New("响应不是合法的 JSON")
+	}
+	if info.PlanName == "" {
+		return out, errors.New("没有 plan_name 字段")
 	}
 
-	out.planName, out.status = parseMistralPlan(unescaped)
+	out.planName = mistralPlanText(info.PlanName, info)
+	out.status = "活跃"
+	if info.PlanName == "FREE" {
+		out.status = "免费版"
+	}
+	if info.PaygEnabled {
+		out.warnings = append(out.warnings, "已开通按量付费（API 用量超出预算后继续计费）")
+	}
 	return out, nil
 }
 
-// unescapeMistralFlight 把 RSC flight 里的转义还原成可解析的 JSON 文本。
-//
-// 页面里数据长这样：self.__next_f.push([1,"...\"budget\":{\"usage_percentage\":0...\"..."])
-// 所以 \" 要还原成 "，\\ 还原成 \。顺序不能反：先还原 \\ 会把 \" 变成 " 的转义关系弄乱。
-func unescapeMistralFlight(html []byte) string {
-	s := string(html)
-	s = strings.ReplaceAll(s, `\"`, `"`)
-	s = strings.ReplaceAll(s, `\\`, `\`)
-	return s
+// mistralPlanText 把上游的计划名渲染成一句人话，顺带带上企业与按量付费标记。
+func mistralPlanText(planName string, info mistralSubscriptionInfo) string {
+	parts := []string{planName}
+	if info.Enterprise {
+		parts = append(parts, "企业版")
+	}
+	if info.VibePaygEnabled {
+		parts = append(parts, "Vibe 按量付费")
+	}
+	return strings.Join(parts, " / ")
 }
 
-// extractJSONObject 在 s 里找到 key 之后紧跟的 JSON 对象，返回其原文。
-//
-// 用括号平衡扫描而不是正则：budget 里嵌着 api_budget / vibe_budget 两层对象，
-// 正则很难写对，而且对象里的字符串还可能含 { }。
-func extractJSONObject(s, key string) string {
-	idx := strings.Index(s, key)
-	if idx < 0 {
-		return ""
-	}
-	start := idx + len(key)
-	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
-		start++
-	}
-	return balancedJSONObject(s[start:])
-}
-
-// balancedJSONObject 从 s 的开头截取一个括号平衡的 JSON 对象。
-//
-// 必须区分「结构括号」与「字符串里的括号」，否则遇到 markdown 或文案里的
-// { } 就会提前截断。s 不以 { 开头时返回空串。
-func balancedJSONObject(s string) string {
-	if s == "" || s[0] != '{' {
-		return ""
-	}
-	depth := 0
-	inString := false
-	escaped := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			switch c {
-			case '\\':
-				escaped = true
-			case '"':
-				inString = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inString = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return s[:i+1]
-			}
-		}
-	}
-	// 括号没闭合说明数据被截断了，宁可当作没找到。
-	return ""
-}
-
-// parseMistralPlan 从订阅页里取计划名与状态。
-//
-// 实测结构：{"type":"CHAT","subscription":{"plan":"INDIVIDUAL",
-// "periodicity":"MONTHLY","status":"A",...}}。取不到就留空，不影响额度展示。
-//
-// 注意 "subscriptions" 这个 key 在页面里出现三次：前两次是 i18n 文案
-// （"subscriptions":"Subscriptions" 与 "subscriptions":{"title":...}），
-// 只有最后一次是真正的数据数组。所以这里必须逐个候选往下试，
-// 取第一个能解析成「数组」的那个，而不是取第一个字符串匹配。
-func parseMistralPlan(s string) (planName, status string) {
-	for _, raw := range extractAllJSONArrays(s, `"subscriptions":`) {
-		var list []struct {
-			Type         string `json:"type"`
-			Subscription *struct {
-				Plan        string `json:"plan"`
-				Periodicity string `json:"periodicity"`
-				Status      string `json:"status"`
-			} `json:"subscription"`
-		}
-		if err := json.Unmarshal([]byte(raw), &list); err != nil {
-			continue
-		}
-		for _, item := range list {
-			if !strings.EqualFold(item.Type, "CHAT") || item.Subscription == nil {
-				continue
-			}
-			sub := item.Subscription
-			parts := make([]string, 0, 2)
-			if sub.Plan != "" {
-				parts = append(parts, sub.Plan)
-			}
-			if sub.Periodicity != "" {
-				parts = append(parts, sub.Periodicity)
-			}
-			return strings.Join(parts, " / "), mistralStatusText(sub.Status)
-		}
-	}
-	return "", ""
-}
-
-// extractAllJSONArrays 返回 key 之后所有能截出的 JSON 数组。
-//
-// 页面里同名 key 会重复出现（文案与数据都用同一个词），调用方需要逐个试。
-func extractAllJSONArrays(s, key string) []string {
-	var out []string
-	offset := 0
-	for {
-		idx := strings.Index(s[offset:], key)
-		if idx < 0 {
-			return out
-		}
-		start := offset + idx + len(key)
-		for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
-			start++
-		}
-		if start < len(s) && s[start] == '[' {
-			if raw := balancedJSONArray(s[start:]); raw != "" {
-				out = append(out, raw)
-			}
-		}
-		offset = offset + idx + len(key)
-		if offset >= len(s) {
-			return out
-		}
-	}
-}
-
-// balancedJSONArray 从 s 的开头截取一个括号平衡的 JSON 数组。
-func balancedJSONArray(s string) string {
-	if s == "" || s[0] != '[' {
-		return ""
-	}
-	depth := 0
-	inString := false
-	escaped := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			switch c {
-			case '\\':
-				escaped = true
-			case '"':
-				inString = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inString = true
-		case '[':
-			depth++
-		case ']':
-			depth--
-			if depth == 0 {
-				return s[:i+1]
-			}
-		}
-	}
-	return ""
-}
-
-// mistralStatusText 把上游的单字母状态码翻成人话。认不出的原样返回。
-func mistralStatusText(raw string) string {
-	switch strings.ToUpper(strings.TrimSpace(raw)) {
-	case "A":
-		return "活跃"
-	case "C", "S":
-		return "已取消"
-	case "P":
-		return "待支付"
-	case "":
-		return ""
-	default:
-		return raw
-	}
+// mistralSubscription 是订阅计划解析出来的内容。
+type mistralSubscription struct {
+	planName string
+	status   string
+	warnings []string
 }
 
 // mistralResetTime 解析重置时间（实测是 RFC3339，如 2026-12-01T00:00:00Z）。
@@ -1471,16 +1430,24 @@ func parseMistralUsageTokens(body []byte) ([]model.UsageStat, error) {
 	// 只统计对话类与 Vibe 的 token；OCR / 音频 / 微调按页、秒、小时计费，
 	// 混进 token 总量会得出一个没有意义的数。
 	type modelUsage struct {
-		Input  []struct{ Value float64 `json:"value"` } `json:"input"`
-		Output []struct{ Value float64 `json:"value"` } `json:"output"`
-		Cached []struct{ Value float64 `json:"value"` } `json:"cached"`
+		Input []struct {
+			Value float64 `json:"value"`
+		} `json:"input"`
+		Output []struct {
+			Value float64 `json:"value"`
+		} `json:"output"`
+		Cached []struct {
+			Value float64 `json:"value"`
+		} `json:"cached"`
 	}
 	type category struct {
 		Models map[string]modelUsage `json:"models"`
 	}
 
 	var input, output, cached float64
-	total := func(entries []struct{ Value float64 `json:"value"` }) float64 {
+	total := func(entries []struct {
+		Value float64 `json:"value"`
+	}) float64 {
 		var sum float64
 		for _, e := range entries {
 			sum += e.Value

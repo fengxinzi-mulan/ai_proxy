@@ -433,7 +433,112 @@ func TestRewriteKeepsReasoningFieldsInResponsesInput(t *testing.T) {
 	}
 }
 
-// ---------- prompt_cache_key ----------
+// ---------- max_tokens / max_completion_tokens 冲突消解 ----------
+
+// 两个同义字段同时出现时必须只留一个，否则 Mistral 判 422 extra_forbidden。
+func TestRewriteMergesMaxTokenParams(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantMods bool
+		// 改写后应当保留的字段与值
+		wantMaxTokens any
+		wantMCT       any
+	}{
+		{
+			name:          "两者并存时删掉 max_completion_tokens",
+			body:          `{"model":"m","max_tokens":100,"max_completion_tokens":200,"messages":[]}`,
+			wantMods:      true,
+			wantMaxTokens: float64(100),
+			wantMCT:       nil, // 键应被删除
+		},
+		{
+			name:          "只有 max_tokens 时不动",
+			body:          `{"model":"m","max_tokens":100,"messages":[]}`,
+			wantMods:      false,
+			wantMaxTokens: float64(100),
+			wantMCT:       nil,
+		},
+		{
+			name:          "只有 max_completion_tokens 时不动",
+			body:          `{"model":"m","max_completion_tokens":200,"messages":[]}`,
+			wantMods:      false,
+			wantMaxTokens: nil,
+			wantMCT:       float64(200),
+		},
+		{
+			name:          "两者值相同时仍以 max_tokens 为准",
+			body:          `{"model":"m","max_tokens":64,"max_completion_tokens":64,"messages":[]}`,
+			wantMods:      true,
+			wantMaxTokens: float64(64),
+			wantMCT:       nil,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 用 Anthropic 格式排除 usage 注入等其它改写的干扰：这个消解与格式无关。
+			p := baseProvider()
+			p.APIFormat = model.FormatAnthropic
+			out, mods := rewriteRequestBody(p, model.DefaultSettings(), []byte(c.body), "m")
+			obj := decode(t, out)
+
+			if c.wantMods {
+				if !containsMod(mods, "merge_max_tokens") {
+					t.Errorf("应记录 merge_max_tokens，实际 %v", mods)
+				}
+			} else if containsMod(mods, "merge_max_tokens") {
+				t.Errorf("不该记录 merge_max_tokens，实际 %v", mods)
+			}
+
+			if c.wantMaxTokens == nil {
+				if _, has := obj["max_tokens"]; has {
+					t.Errorf("不该出现 max_tokens，实际 %v", obj["max_tokens"])
+				}
+			} else if obj["max_tokens"] != c.wantMaxTokens {
+				t.Errorf("max_tokens 期望 %v，实际 %v", c.wantMaxTokens, obj["max_tokens"])
+			}
+
+			if c.wantMCT == nil {
+				if _, has := obj["max_completion_tokens"]; has {
+					t.Errorf("max_completion_tokens 应被删除，实际 %v", obj["max_completion_tokens"])
+				}
+			} else if obj["max_completion_tokens"] != c.wantMCT {
+				t.Errorf("max_completion_tokens 期望 %v，实际 %v", c.wantMCT, obj["max_completion_tokens"])
+			}
+		})
+	}
+}
+
+// 消解只管同义字段，不能顺手把别的参数动了。
+func TestRewriteMaxTokenMergeKeepsOtherParams(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":100,"max_completion_tokens":200,` +
+		`"temperature":0.3,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}`)
+	p := baseProvider()
+	p.APIFormat = model.FormatAnthropic
+
+	out, _ := rewriteRequestBody(p, model.DefaultSettings(), body, "m")
+	obj := decode(t, out)
+	if obj["temperature"] != 0.3 || obj["top_p"] != 0.9 {
+		t.Errorf("其它采样参数被改动了: %v", obj)
+	}
+	if msgs, ok := obj["messages"].([]any); !ok || len(msgs) != 1 {
+		t.Errorf("messages 被改动了: %v", obj["messages"])
+	}
+}
+
+// testChatPath 是测试里默认使用的请求路径。
+//
+// prompt_cache_key 只对生成类端点注入（见 cacheKeyApplies），所以凡是关心
+// 「有没有注入」的用例都必须带上一个真实路径，否则测到的是「路径未知不注入」。
+const testChatPath = "/v1/chat/completions"
+
+// rewriteAtPath 是带路径的改写入口，供关心 prompt_cache_key 的用例使用。
+func rewriteAtPath(t *testing.T, p model.Provider, path string, body []byte) ([]byte, []string) {
+	t.Helper()
+	return rewriteRequestBodyOpts(p, model.DefaultSettings(), body, modelNameFromBody(body),
+		rewriteOptions{clientPath: path})
+}
 
 func TestRewriteInjectsPromptCacheKey(t *testing.T) {
 	p := baseProvider()
@@ -443,7 +548,7 @@ func TestRewriteInjectsPromptCacheKey(t *testing.T) {
 		{"role":"user","content":"你好"}
 	]}`)
 
-	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	out, mods := rewriteAtPath(t, p, testChatPath, body)
 	if len(mods) != 1 || mods[0] != "prompt_cache_key" {
 		t.Fatalf("应记录 prompt_cache_key 改动，实际 %v", mods)
 	}
@@ -481,7 +586,7 @@ func TestPromptCacheKeyUsesSessionSeed(t *testing.T) {
 
 	mk := func(seed string) string {
 		out, _ := rewriteRequestBodyOpts(p, model.DefaultSettings(), body, modelNameFromBody(body),
-			rewriteOptions{cacheKeySeed: seed})
+			rewriteOptions{cacheKeySeed: seed, clientPath: testChatPath})
 		return cacheKeyOf(t, out)
 	}
 	if mk("session-a") != mk("session-a") {
@@ -500,7 +605,7 @@ func TestRewriteKeepsClientPromptCacheKey(t *testing.T) {
 	p.PromptCacheKeyMode = model.PromptCacheKeyAuto
 	body := []byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}],"prompt_cache_key":"client-key"}`)
 
-	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	out, mods := rewriteAtPath(t, p, testChatPath, body)
 	if len(mods) != 0 {
 		t.Errorf("客户端自带的 key 不该被覆盖，实际 %v", mods)
 	}
@@ -528,12 +633,119 @@ func TestRewritePromptCacheKeyOnResponses(t *testing.T) {
 	// Responses 的请求体顶层同样有 prompt_cache_key（内置 input.type 修正也要一起生效）。
 	body := []byte(`{"model":"m","input":[{"role":"user","content":"hi"}]}`)
 
-	out, mods := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	out, mods := rewriteAtPath(t, p, "/v1/responses", body)
 	if !containsMod(mods, "prompt_cache_key") {
 		t.Fatalf("Responses 也应注入 key，实际 %v", mods)
 	}
 	if cacheKeyOf(t, out) == "" {
 		t.Error("body 里没写进 key")
+	}
+}
+
+// prompt_cache_key 只对生成类端点合法。embeddings / moderations / ocr 这些
+// 端点上的 schema 是 additionalProperties=false 且没有这个字段，注入就是整条 422。
+// 这里按「端点 × 该不该注入」列全，避免以后再加新端点时漏判。
+func TestPromptCacheKeyOnlyOnGenerationEndpoints(t *testing.T) {
+	cases := []struct {
+		path      string
+		wantApply bool
+		why       string
+	}{
+		{"/v1/chat/completions", true, "ChatCompletionRequest 有 prompt_cache_key"},
+		{"/v1/fim/completions", true, "FIMCompletionRequest 有 prompt_cache_key"},
+		{"/v1/agents/completions", true, "AgentsCompletionRequest 有 prompt_cache_key"},
+		{"/v1/responses", true, "CreateResponseRequest 有 prompt_cache_key"},
+		{"/v1/embeddings", false, "EmbeddingsRequest 没有这个字段"},
+		{"/v1/moderations", false, "ModerationRequest 没有这个字段"},
+		{"/v1/chat/moderations", false, "ModerationRequest 没有这个字段"},
+		{"/v1/classifications", false, "ClassificationRequest 没有这个字段"},
+		{"/v1/chat/classifications", false, "ClassificationRequest 没有这个字段"},
+		{"/v1/ocr", false, "OCRRequest 没有这个字段"},
+		{"/v1/models", false, "模型列表是 GET，没有请求体字段"},
+		{"", false, "路径未知时不注入，宁少一次缓存亲和也不制造 422"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			p := baseProvider()
+			p.PromptCacheKeyMode = model.PromptCacheKeyAuto
+			body := []byte(`{"model":"m","input":["hi"],"messages":[{"role":"user","content":"hi"}]}`)
+
+			out, mods := rewriteAtPath(t, p, c.path, body)
+			injected := containsMod(mods, "prompt_cache_key")
+			if injected != c.wantApply {
+				t.Fatalf("%s: 期望注入=%v（%s），实际 mods=%v", c.path, c.wantApply, c.why, mods)
+			}
+			_, has := decode(t, out)["prompt_cache_key"]
+			if has != c.wantApply {
+				t.Errorf("%s: 请求体里 key 的存在性与预期不符，实际有=%v", c.path, has)
+			}
+		})
+	}
+}
+
+// 带自定义前缀的路径同样要认出来：网关常见 /api/openai/v1/chat/completions 这种形态。
+func TestPromptCacheKeyMatchesSuffixedPath(t *testing.T) {
+	p := baseProvider()
+	p.PromptCacheKeyMode = model.PromptCacheKeyAuto
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+
+	out, mods := rewriteAtPath(t, p, "/api/openai/v1/chat/completions", body)
+	if !containsMod(mods, "prompt_cache_key") {
+		t.Fatalf("带前缀的 chat 路径也应注入，实际 %v", mods)
+	}
+	if cacheKeyOf(t, out) == "" {
+		t.Error("body 里没写进 key")
+	}
+}
+
+// 后缀匹配的边界：容易误命中的路径不能算进来。
+//
+// 尤其是 /v1/responses 的兄弟端点（input_tokens）与 /v1/agents 本身 —— 后者是
+// 管理接口、要的是 agent_id 而不是 messages，注入 key 只会制造 422。
+func TestCacheKeyAppliesEdges(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/v1/chat/completions", true},
+		{"/v1/responses", true},
+		{"/v1/responses/", true},
+		{"/v1/agents/completions", true},
+		{"/p/fagun/v1/chat/completions", true},
+		{"/v1/agents", false},
+		{"/v1/responses/input_tokens", false},
+		{"/v1/chat/moderations", false},
+		{"/v1/batch/jobs", false},
+		{"/v1/admin/usage/query", false},
+		{"/v1/conversations", false},
+		{"/v1/audio/speech", false},
+		{"/v1/ocr", false},
+	}
+	for _, c := range cases {
+		if got := cacheKeyApplies(c.path); got != c.want {
+			t.Errorf("%s: 期望 %v，实际 %v", c.path, c.want, got)
+		}
+	}
+}
+
+// CustomPath 接管上游路径时，端点判定要看 CustomPath 而不是客户端打过来的路径。
+func TestUpstreamEndpointPathPrefersCustomPath(t *testing.T) {
+	p := baseProvider()
+	p.CustomPath = "/v1/chat/completions"
+	// 客户端打的是 embeddings，配置却把所有请求都改发到 chat/completions。
+	if got := upstreamEndpointPath(p, "/v1/embeddings"); got != "/v1/chat/completions" {
+		t.Errorf("应优先用 CustomPath，实际 %q", got)
+	}
+	// 没配 CustomPath 时用转发路径。
+	p.CustomPath = ""
+	if got := upstreamEndpointPath(p, "/v1/embeddings"); got != "/v1/embeddings" {
+		t.Errorf("未配 CustomPath 时应返回上游路径，实际 %q", got)
+	}
+	// 空白 CustomPath 视同未配置。
+	p.CustomPath = "   "
+	if got := upstreamEndpointPath(p, "/v1/responses"); got != "/v1/responses" {
+		t.Errorf("空白的 CustomPath 应被忽略，实际 %q", got)
 	}
 }
 
@@ -544,9 +756,13 @@ func cacheKeyOf(t *testing.T, body []byte) string {
 	return key
 }
 
+// mustRewrite 用默认的 chat 路径做一次改写。
+//
+// 带路径是必需的：prompt_cache_key 只对生成类端点注入，不带路径会被判成
+// 「端点未知」而跳过，那几条关于 key 稳定性的断言就测不到东西了。
 func mustRewrite(t *testing.T, p model.Provider, body []byte) []byte {
 	t.Helper()
-	out, _ := rewriteRequestBody(p, model.DefaultSettings(), body, modelNameFromBody(body))
+	out, _ := rewriteAtPath(t, p, testChatPath, body)
 	return out
 }
 
@@ -1061,7 +1277,164 @@ func TestBuildUpstreamHeadersStripsProxyAccessKey(t *testing.T) {
 	}
 }
 
-// ---------- responses input 规范化 ----------
+// ---------- Responses 取值受限的顶层字段 ----------
+
+// truncation / background / metadata 在 Responses 上是合法字段，但取值被钉死。
+// 传不对是整条 400，而 Codex 默认就带 truncation/background —— 每一轮都会打穿。
+func TestStripResponsesFixedValueParams(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantMod bool
+		// 改写后请求体里应当出现的键（不校验值）；wantAbsent 是应当消失的键。
+		wantAbsent []string
+		wantKeep   map[string]any
+	}{
+		{
+			name:       "truncation=auto 要删",
+			body:       `{"model":"m","input":"hi","truncation":"auto"}`,
+			wantMod:    true,
+			wantAbsent: []string{"truncation"},
+		},
+		{
+			name:     "truncation=disabled 保留（本来就是上游唯一接受的值）",
+			body:     `{"model":"m","input":"hi","truncation":"disabled"}`,
+			wantMod:  false,
+			wantKeep: map[string]any{"truncation": "disabled"},
+		},
+		{
+			name:       "background=true 要删",
+			body:       `{"model":"m","input":"hi","background":true}`,
+			wantMod:    true,
+			wantAbsent: []string{"background"},
+		},
+		{
+			name:     "background=false 保留",
+			body:     `{"model":"m","input":"hi","background":false}`,
+			wantMod:  false,
+			wantKeep: map[string]any{"background": false},
+		},
+		{
+			name:       "truncation=null 也要删（实测 400，不是可接受值）",
+			body:       `{"model":"m","input":"hi","truncation":null}`,
+			wantMod:    true,
+			wantAbsent: []string{"truncation"},
+		},
+		{
+			name:       "truncation=0（非字符串）要删",
+			body:       `{"model":"m","input":"hi","truncation":0}`,
+			wantMod:    true,
+			wantAbsent: []string{"truncation"},
+		},
+		{
+			name:       "background=null 也要删（实测 400）",
+			body:       `{"model":"m","input":"hi","background":null}`,
+			wantMod:    true,
+			wantAbsent: []string{"background"},
+		},
+		{
+			name:     "metadata=null 保留（实测 200）",
+			body:     `{"model":"m","input":"hi","metadata":null}`,
+			wantMod:  false,
+			wantKeep: map[string]any{"metadata": nil},
+		},
+		{
+			name:       "metadata 里的非字符串值要删掉，字符串值保留",
+			body:       `{"model":"m","input":"hi","metadata":{"ok":"v","n":1,"b":true}}`,
+			wantMod:    true,
+			wantKeep:   map[string]any{"metadata": map[string]any{"ok": "v"}},
+			wantAbsent: []string{},
+		},
+		{
+			name:       "metadata 全是非字符串值时整个对象删掉",
+			body:       `{"model":"m","input":"hi","metadata":{"n":1,"b":false}}`,
+			wantMod:    true,
+			wantAbsent: []string{"metadata"},
+		},
+		{
+			name:     "metadata 全是字符串时不动",
+			body:     `{"model":"m","input":"hi","metadata":{"a":"x","b":"y"}}`,
+			wantMod:  false,
+			wantKeep: map[string]any{"metadata": map[string]any{"a": "x", "b": "y"}},
+		},
+		{
+			name:       "metadata 不是对象时整项删",
+			body:       `{"model":"m","input":"hi","metadata":["x"]}`,
+			wantMod:    true,
+			wantAbsent: []string{"metadata"},
+		},
+		{
+			name:     "没有这些字段时是空操作",
+			body:     `{"model":"m","input":"hi"}`,
+			wantMod:  false,
+			wantKeep: map[string]any{},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := strictResponsesProvider()
+			out, mods := rewriteAtPath(t, p, "/v1/responses", []byte(c.body))
+			obj := decode(t, out)
+
+			gotMod := containsMod(mods, "strip_truncation") ||
+				containsMod(mods, "strip_background") ||
+				containsMod(mods, "strip_metadata")
+			if gotMod != c.wantMod {
+				t.Errorf("期望改动=%v，实际 mods=%v", c.wantMod, mods)
+			}
+
+			for _, key := range c.wantAbsent {
+				if _, has := obj[key]; has {
+					t.Errorf("%s 应被删除，实际 %v", key, obj[key])
+				}
+			}
+			for key, want := range c.wantKeep {
+				got, has := obj[key]
+				if !has {
+					t.Errorf("%s 应保留，实际缺失", key)
+					continue
+				}
+				// 只比较本用例关心的分量：map 逐键比，标量直接比。
+				if wantMap, ok := want.(map[string]any); ok {
+					gotMap, ok := got.(map[string]any)
+					if !ok || len(gotMap) != len(wantMap) {
+						t.Errorf("%s 期望 %v，实际 %v", key, wantMap, got)
+						continue
+					}
+					for k, v := range wantMap {
+						if gotMap[k] != v {
+							t.Errorf("%s.%s 期望 %v，实际 %v", key, k, v, gotMap[k])
+						}
+					}
+					continue
+				}
+				if got != want {
+					t.Errorf("%s 期望 %v，实际 %v", key, want, got)
+				}
+			}
+		})
+	}
+}
+
+// chat 形态的 metadata 收任意值（实测 200），不能被 Responses 那条规则连带影响。
+func TestStripResponsesFixedValueParamsIgnoresChat(t *testing.T) {
+	p := baseProvider()
+	p.StripUnsupportedParams = true
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],` +
+		`"metadata":{"n":1},"truncation":"auto","background":true}`)
+
+	out, _ := rewriteAtPath(t, p, testChatPath, body)
+	obj := decode(t, out)
+	// truncation / background 在 chat schema 里根本不存在，属于多余字段，该删；
+	// 但 metadata 是合法的任意对象，必须保留原值。
+	if _, has := obj["metadata"]; !has {
+		t.Errorf("chat 的 metadata 不该被删: %v", obj)
+	}
+	if md, ok := obj["metadata"].(map[string]any); !ok || md["n"] != float64(1) {
+		t.Errorf("chat 的 metadata 值不该被改: %v", obj["metadata"])
+	}
+}
 
 func responsesProvider() model.Provider {
 	p := baseProvider()

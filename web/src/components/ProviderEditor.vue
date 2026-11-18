@@ -903,6 +903,12 @@ function remove() {
             <code class="mono">web_search_call</code>、<code class="mono">item_reference</code>
             这类回放项，以及 reasoning 项里有值的
             <code class="mono">encrypted_content</code>（明文思维链保留）。
+            <br />
+            还有三个「字段合法、取值被钉死」的 Responses 顶层字段也会按值修正：
+            <code class="mono">truncation</code> 只留 <code class="mono">"disabled"</code>、
+            <code class="mono">background</code> 只留 <code class="mono">false</code>、
+            <code class="mono">metadata</code> 只留字符串值（删空则整项移除）。
+            Codex 默认就带前两个，不开这个开关会每一轮都 400。
             如果上游本来就认这些字段（部分国产网关），别开，否则推理会被悄悄关掉。
             另外 <code class="mono">role:"developer"</code> 会无条件归一化成
             <code class="mono">system</code>，不受此开关影响。
@@ -914,6 +920,11 @@ function remove() {
             （<code class="mono">X-Session-Id</code> 等），没有就用「首条消息 + tools」的指纹，
             哈希成 <code class="mono">aipx-…</code> 再注入；客户端自己带了 key 时不覆盖。
             不认这个字段的严格网关会 422，所以默认关闭。
+            <br />
+            只对<strong>生成类端点</strong>注入（<code class="mono">/chat/completions</code>、
+            <code class="mono">/fim/completions</code>、<code class="mono">/agents/completions</code>、
+            <code class="mono">/responses</code>）。embeddings、moderations、ocr、classifications
+            的 schema 里没有这个字段，带上就是 422，所以代理按路径判定，认不出路径时不注入。
           </NAlert>
 
           <NDivider title-placement="left" style="font-size: 12px">Responses 会话续传</NDivider>
@@ -1046,13 +1057,13 @@ function remove() {
               />
             </NFormItem>
             <template v-if="form.usageQuery.template === 'mistral'">
-              <NFormItem label="账号">
+              <NFormItem label="账号（可选）">
                 <NInput
                   v-model:value="form.usageQuery.account"
                   placeholder="admin.mistral.ai 的登录邮箱"
                 />
               </NFormItem>
-              <NFormItem label="密码">
+              <NFormItem label="密码（可选）">
                 <NInput
                   v-model:value="form.usageQuery.password"
                   type="password"
@@ -1062,9 +1073,10 @@ function remove() {
               </NFormItem>
               <NFormItem :show-label="false">
                 <span class="muted" style="font-size: 12px; line-height: 1.6">
-                  Mistral 的订阅额度只挂在网页后台，普通 API key 读不到。程序会用这里的账号密码
-                  自动登录 admin.mistral.ai 并缓存会话，过期后自动重登，无需手工维护 Cookie。
-                  密码与 API 密钥同等对待，明文存在本地数据库里。
+                  预算与订阅计划走官方 API，用供应商密钥就能读，<strong>这两项不填也能用</strong>。
+                  填了才能额外读到本月 token 明细与限额状态 —— 那部分还挂在网页后台，
+                  程序会用这里的账号密码自动登录 admin.mistral.ai 并缓存会话，
+                  过期后自动重登，无需手工维护 Cookie。密码与 API 密钥同等对待，明文存在本地数据库里。
                 </span>
               </NFormItem>
             </template>

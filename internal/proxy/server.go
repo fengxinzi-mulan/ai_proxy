@@ -3,7 +3,7 @@
 // 核心承诺：除了用户显式开启的请求体改写（usage 注入、提示词注入、严格上游
 // 字段裁剪）之外，请求按原字节转发；响应只在两种情况下动字节——用户开启的
 // 「剥离 usage 块」，以及把非标准的 chat/completions content 数组拍平成字符串
-//（不改内容的语义，只为让按 OpenAI 规范校验的客户端能正常解析）。
+// （不改内容的语义，只为让按 OpenAI 规范校验的客户端能正常解析）。
 package proxy
 
 import (
@@ -144,8 +144,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 会话标识先于改写算好：prompt_cache_key 要用它保持多轮稳定。
+	// 端点判定也要用「真正发往上游的那条路径」：配了 CustomPath 时客户端路径被完全
+	// 接管，按客户端路径判会误判成「不知道是不是生成端点」而漏注入。
 	rewritten := rewriteRequest(prov, settings, reqBody, in.model, rewriteOptions{
 		cacheKeySeed: sessionCacheSeed(r),
+		clientPath:   upstreamEndpointPath(prov, in.upstreamPath),
 	})
 	in.outBody = rewritten.Body
 	in.modifications = rewritten.Modifications
@@ -725,6 +728,18 @@ func (s *Server) resolveProvider(r *http.Request) (model.Provider, string, error
 		return model.Provider{}, "", fmt.Errorf("当前生效的供应商 %q 已禁用", prov.DisplayName)
 	}
 	return prov, path, nil
+}
+
+// upstreamEndpointPath 返回判定「上游端点形状」时该看的路径。
+//
+// 配了 CustomPath 的供应商，客户端路径被完全接管 —— 发出去的是 CustomPath，
+// 客户端打的是什么路径都无关紧要。这时必须看 CustomPath，否则
+// prompt_cache_key 的端点判定会按一个根本没被使用的路径下结论。
+func upstreamEndpointPath(prov model.Provider, upstreamPath string) string {
+	if p := strings.TrimSpace(prov.CustomPath); p != "" {
+		return p
+	}
+	return upstreamPath
 }
 
 // buildUpstreamURL 把 BaseURL 与客户端请求路径拼成上游地址。
