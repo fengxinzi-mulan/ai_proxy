@@ -43,6 +43,8 @@ type rewriteResult struct {
 	ImageCompressed int
 	// ImageSavedBytes 是 base64 串长度的净减少量。
 	ImageSavedBytes int64
+	// ImagesDropped 是被占位文本替换掉的图片张数（供应商配了单请求上限且超限）。
+	ImagesDropped int
 }
 
 // rewriteOptions 承载「不在请求体里、但会决定改写结果」的上下文。
@@ -94,13 +96,15 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 		bytes.Contains(rawBody, []byte(`"max_tokens"`))
 	// 图片压缩是全局开关，与上游是谁无关：它是纯粹的流量体积优化。
 	wantImageCompress := st.ImageCompress.Enabled && hasInlineImage(rawBody)
+	// 图片数量上限是供应商级的上游能力：超了整条请求就是 400，只能裁。
+	wantImageLimit := prov.MaxImagesPerRequest > 0 && looksLikeItHasImages(rawBody)
 	// prompt_cache_key 同理：不认这个字段的严格网关会 422，必须按供应商显式开启。
 	// 光看供应商还不够 —— 同一个 Mistral key 下，只有生成类端点认这个字段，
 	// embeddings / moderations / ocr 一律 422，所以还要按路径判定。
 	wantCacheKey := prov.PromptCacheKeyMode == model.PromptCacheKeyAuto &&
 		isOpenAIStyle(prov.APIFormat) && cacheKeyApplies(opts.clientPath)
 	promptText, promptStrategy, hasPrompt := resolvePromptForModel(prov, st, modelName, mappedModel, mapped)
-	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey && !wantImageCompress && !wantMergeMaxTokens {
+	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey && !wantImageCompress && !wantMergeMaxTokens && !wantImageLimit {
 		return rewriteResult{Body: rawBody}
 	}
 
@@ -111,6 +115,7 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 
 	var mods []string
 	var imgStats compressStats
+	var imagesDropped int
 	if wantRoleFix && normalizeDeveloperRole(obj) {
 		mods = append(mods, "role_developer_to_system")
 	}
@@ -174,8 +179,15 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 			mods = append(mods, "strip_reasoning_encrypted")
 		}
 	}
-	// 图片压缩排在裁剪之后：被裁掉的项（比如上游不认的 input 项）里可能带着图，
-	// 先裁再压能省掉白压一遍的开销。
+	// 图片数量裁剪排在压缩之前：先裁再压，省掉对即将被丢弃的图片做解码/重编码。
+	// 两者都排在裁剪项之后 —— 被裁掉的项（比如上游不认的 input 项）里可能带着图，
+	// 先裁字段再数图，才不会把马上要消失的图算进上限里。
+	if wantImageLimit {
+		if n := trimExcessImages(obj, prov.MaxImagesPerRequest, prov.ImageTrimBatch); n > 0 {
+			imagesDropped = n
+			mods = append(mods, "image_limit_trim")
+		}
+	}
 	if wantImageCompress {
 		imgStats = compressImagesInBody(obj, st.ImageCompress)
 		if imgStats.Count > 0 {
@@ -200,6 +212,7 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 		Modifications:   mods,
 		ImageCompressed: imgStats.Count,
 		ImageSavedBytes: imgStats.SavedBytes,
+		ImagesDropped:   imagesDropped,
 	}
 }
 

@@ -3,7 +3,7 @@
 BINARY := ai_proxy.exe
 WEB_DIR := web
 DIST_DIR := dist
-VERSION := 0.3.0
+VERSION := 0.5.0
 
 # PATH 上的 go 往往是旧版：g 用 ...\g\go 这个指针表示「当前版本」，而它可能停在 1.19；
 # 机器级 GOROOT 也跟着指到那棵旧的源码树，于是 go build 会拿错标准库。这里固定用版本

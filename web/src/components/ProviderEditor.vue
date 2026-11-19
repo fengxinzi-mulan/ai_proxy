@@ -97,6 +97,8 @@ function blank(): Provider {
     stripUsageChunk: false,
     stripUnsupportedParams: false,
     promptCacheKeyMode: 'off',
+    maxImagesPerRequest: 0,
+    imageTrimBatch: 0,
     customUsage: null,
     usageQuery: { template: '', baseUrl: '', autoRefreshSeconds: 0, account: '', password: '' },
     tags: [],
@@ -213,6 +215,8 @@ function applyPreset(preset: ProviderPreset) {
   if (preset.usageInjectMode !== undefined) form.usageInjectMode = preset.usageInjectMode
   if (preset.continuationMode !== undefined) form.continuationMode = preset.continuationMode
   if (preset.timeoutSeconds !== undefined) form.timeoutSeconds = preset.timeoutSeconds
+  if (preset.maxImagesPerRequest !== undefined) form.maxImagesPerRequest = preset.maxImagesPerRequest
+  if (preset.imageTrimBatch !== undefined) form.imageTrimBatch = preset.imageTrimBatch
   dismissPreset(preset)
   message.success('已应用优化配置，保存后生效')
 }
@@ -308,6 +312,11 @@ function collect(): ProviderPayload {
     ...rest,
     continuationCooldownSeconds: form.continuationCooldownSeconds ?? 3600,
     continuationInvalidCooldownSeconds: form.continuationInvalidCooldownSeconds ?? 300,
+    // NInputNumber 清空后值是 null，直接提交会让后端收到 null。Go 侧会当零值处理
+    // （0 = 不限制 / 逐张，语义上正好），但前端类型声明是 number，null 会让
+    // presetApplied 把「已应用」误判成「未应用」。这里统一收敛成 0。
+    maxImagesPerRequest: form.maxImagesPerRequest ?? 0,
+    imageTrimBatch: form.imageTrimBatch ?? 0,
     extraHeaders,
     // 只提交填写完整的映射行：空行（用户点了「添加」还没填）不该落库。
     modelMap: form.modelMap
@@ -877,6 +886,27 @@ function remove() {
                 <NRadioButton value="auto">自动派生</NRadioButton>
               </NRadioGroup>
             </NFormItem>
+            <NFormItem label="单请求图片上限">
+              <NInputNumber
+                v-model:value="form.maxImagesPerRequest"
+                :min="0"
+                :max="10000"
+                placeholder="0 = 不限制"
+                style="width: 180px"
+              />
+              <span class="field-hint">张，0 表示不限制</span>
+            </NFormItem>
+            <NFormItem label="成批替换">
+              <NInputNumber
+                v-model:value="form.imageTrimBatch"
+                :min="0"
+                :max="1000"
+                placeholder="0 = 逐张"
+                :disabled="!form.maxImagesPerRequest"
+                style="width: 180px"
+              />
+              <span class="field-hint">张一批，0/1 表示逐张（逐张会让缓存每轮失效）</span>
+            </NFormItem>
           </NForm>
           <NAlert type="info" :bordered="false" style="margin-bottom: 12px; font-size: 12px">
             开启后，OpenAI / Responses 请求体顶层的
@@ -925,6 +955,18 @@ function remove() {
             <code class="mono">/fim/completions</code>、<code class="mono">/agents/completions</code>、
             <code class="mono">/responses</code>）。embeddings、moderations、ocr、classifications
             的 schema 里没有这个字段，带上就是 422，所以代理按路径判定，认不出路径时不注入。
+          </NAlert>
+          <NAlert type="info" :bordered="false" style="margin-bottom: 12px; font-size: 12px">
+            <strong>单请求图片上限</strong>：上游按「整个请求里的图片总数」硬性拒绝，
+            Mistral 超过就整条 400（<code class="mono">Total number of images exceeds
+            the maximum allowed of 20.</code>）。而客户端每一轮都把历史消息连同其中的图片
+            原样回放，图片数量随会话自然增长、代理管不着 —— 攒够上限之后这个会话就再也
+            发不出去。
+            <br />
+            填上这里的上限后，超限时<strong>更早的图片</strong>会被就地替换成一行占位文本
+            （数组长度与位置不变），会话继续可用；模型看不到那几张图，但知道自己漏了东西。
+            日志里记 <code class="mono">image_limit_trim</code>，详情页能看到裁了几张。
+            填 0 表示不限制。
           </NAlert>
 
           <NDivider title-placement="left" style="font-size: 12px">Responses 会话续传</NDivider>

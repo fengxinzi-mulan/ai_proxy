@@ -53,6 +53,15 @@ export function presetApplied(preset: ProviderPreset, p: Partial<Provider>): boo
   if (preset.timeoutSeconds !== undefined && p.timeoutSeconds !== preset.timeoutSeconds) {
     return false
   }
+  if (
+    preset.maxImagesPerRequest !== undefined &&
+    p.maxImagesPerRequest !== preset.maxImagesPerRequest
+  ) {
+    return false
+  }
+  if (preset.imageTrimBatch !== undefined && p.imageTrimBatch !== preset.imageTrimBatch) {
+    return false
+  }
   return true
 }
 

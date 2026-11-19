@@ -215,13 +215,15 @@ func TestApplyProviderPreset(t *testing.T) {
 	if err := json.Unmarshal([]byte(resp), &result); err != nil {
 		t.Fatalf("结果不是合法 JSON: %v %s", err, resp)
 	}
-	if len(result.Applied) != 4 {
-		t.Errorf("应改动四项，实际 %v", result.Applied)
+	if len(result.Applied) != 6 {
+		t.Errorf("应改动六项，实际 %v", result.Applied)
 	}
 	if !result.Provider.StripUnsupportedParams ||
 		result.Provider.PromptCacheKeyMode != model.PromptCacheKeyAuto ||
 		result.Provider.UsageInjectMode != "off" ||
-		result.Provider.TimeoutSeconds != 900 {
+		result.Provider.TimeoutSeconds != 900 ||
+		result.Provider.MaxImagesPerRequest != 20 ||
+		result.Provider.ImageTrimBatch != 5 {
 		t.Errorf("预设未正确落库: %+v", result.Provider)
 	}
 

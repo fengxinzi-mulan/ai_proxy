@@ -260,6 +260,31 @@ type Provider struct {
 	// 只对 OpenAI 系格式生效；客户端自己带了 key 时不覆盖。
 	PromptCacheKeyMode string `json:"promptCacheKeyMode"`
 
+	// MaxImagesPerRequest 是单次请求允许携带的图片张数上限，0 表示不限制。
+	//
+	// 上游按「整个请求里的图片总数」硬性拒绝，Mistral 超过就直接整条 400：
+	//
+	//	{"message":"Total number of images exceeds the maximum allowed of 20."}
+	//
+	// 而客户端（DSH、Codex）每一轮都把历史消息连同其中的图片原样回放，图片
+	// 数量随会话自然增长、完全不受代理控制 —— 攒够上限之后这个会话就再也发不出去，
+	// 只能靠手工清历史自救。所以由代理按上游能力兜底：超出部分里更早的图片
+	// 替换成一行占位文本（见 proxy.trimExcessImages）。
+	//
+	// 放在供应商级而不是全局：这是上游能力，不是流量体积优化 —— 不同厂商、
+	// 同一厂商的不同模型，上限都不一样。
+	MaxImagesPerRequest int `json:"maxImagesPerRequest"`
+
+	// ImageTrimBatch 是「一批丢几张」：超出上限时按这个步长成批替换，而不是
+	// 每多一张图就往前挪一格。0 或 1 表示逐张（最简单但缓存代价最高）。
+	//
+	// 为什么需要它：客户端每轮重发全量历史，如果丢弃边界随图片数逐张前移，
+	// 那么「第一张保留下来的图」的位置每轮都在变 —— 前缀缓存从那里断开，
+	// 该轮就得把后面十几张图全价重算一遍。成批替换把边界钉在一个窗口里：
+	// 图片数从 max+1 长到 max+batch 的过程中，丢的是同一批、位置也相同，
+	// 前缀逐字节一致，缓存照常命中。每长满一批才失效一次。
+	ImageTrimBatch int `json:"imageTrimBatch"`
+
 	// 自定义用量映射（apiFormat=custom 时使用）
 	CustomUsage *CustomUsageMapping `json:"customUsage"`
 
@@ -396,6 +421,17 @@ func (p *Provider) ApplyDefaults() {
 	case PromptCacheKeyOff, PromptCacheKeyAuto:
 	default:
 		p.PromptCacheKeyMode = PromptCacheKeyOff
+	}
+	// 图片上限：0 是「不限制」这个有效取值，只有负数才视为非法。
+	if p.MaxImagesPerRequest < 0 {
+		p.MaxImagesPerRequest = 0
+	}
+	// 批大小：负数归一成 0（= 逐张），上限 1000 防手滑填成天文数字把整段历史丢光。
+	if p.ImageTrimBatch < 0 {
+		p.ImageTrimBatch = 0
+	}
+	if p.ImageTrimBatch > 1000 {
+		p.ImageTrimBatch = 1000
 	}
 	if p.Prompt.Strategy == "" {
 		p.Prompt.Strategy = StrategyAppend
@@ -562,6 +598,12 @@ type RequestLog struct {
 	// 用户想知道的是「开了这个功能到底省了多少流量」。
 	ImageCompressed int   `json:"imageCompressed"`
 	ImageSavedBytes int64 `json:"imageSavedBytes"`
+
+	// ImagesDropped 是本次请求里被占位文本替换掉的图片张数（供应商配了
+	// MaxImagesPerRequest 且请求超限时才会非 0）。与 ImageCompressed 分开记：
+	// 一个是「为了过上游而丢掉的内容」，一个是「为了省流量而缩小的字节」，
+	// 排查 400 时只关心前者。
+	ImagesDropped int `json:"imagesDropped"`
 
 	HTTPStatus int    `json:"httpStatus"`
 	Success    bool   `json:"success"`

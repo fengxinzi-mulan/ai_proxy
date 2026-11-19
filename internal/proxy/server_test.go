@@ -1304,6 +1304,99 @@ func TestForwardModelMappingMissIsTransparent(t *testing.T) {
 	}
 }
 
+// 端到端：图片超过供应商上限时，上游收到的张数必须收敛到上限，
+// 日志里能看出裁了几张；未配置上限时请求体逐字节透传。
+func TestForwardTrimsExcessImages(t *testing.T) {
+	var upstreamBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"model":"m","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	prov := addProvider(t, st, upstream.URL, model.FormatOpenAI)
+	prov.MaxImagesPerRequest = 20
+	if _, err := st.UpdateProvider(prov); err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	// 小图不触发压缩（阈值 512 KiB），这样能单独看清「数量裁剪」这一项。
+	saveSettings(t, st, func(s *model.Settings) { s.ImageCompress.Enabled = false })
+
+	body := `{"model":"m","messages":[{"role":"user","content":[` +
+		strings.Repeat(`{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},`, 24) +
+		`{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if n := strings.Count(string(upstreamBody), `"type":"image_url"`); n != 20 {
+		t.Errorf("上游应只收到 20 张图，实际 %d", n)
+	}
+	if n := strings.Count(string(upstreamBody), "omitted"); n != 5 {
+		t.Errorf("应有 5 个占位块，实际 %d", n)
+	}
+	entry := lastLog(t, st)
+	if entry.ImagesDropped != 5 {
+		t.Errorf("日志应记录裁掉 5 张，实际 %d", entry.ImagesDropped)
+	}
+	if entry.ImageCompressed != 0 {
+		t.Errorf("压缩是关的，不该记录压缩张数，实际 %d", entry.ImageCompressed)
+	}
+	if !entry.RequestModified {
+		t.Error("裁剪属于请求体改写，应标记 requestModified")
+	}
+	found := false
+	for _, m := range entry.Modifications {
+		if m == "image_limit_trim" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("改写清单应包含 image_limit_trim，实际 %v", entry.Modifications)
+	}
+	if entry.ReqBodyOriginal == "" {
+		t.Error("应保留改写前的请求体")
+	}
+}
+
+// 没配上限（默认 0）时，即使图很多也必须逐字节透传 —— 老库升级后不能突然开始裁图。
+func TestForwardWithoutImageLimitIsTransparent(t *testing.T) {
+	var upstreamBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"model":"m","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	addProvider(t, st, upstream.URL, model.FormatOpenAI)
+	saveSettings(t, st, func(s *model.Settings) { s.ImageCompress.Enabled = false })
+
+	body := `{"model":"m","messages":[{"role":"user","content":[` +
+		strings.Repeat(`{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},`, 24) +
+		`{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应返回 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if string(upstreamBody) != body {
+		t.Errorf("未配置上限时请求体必须原样转发\n发出: %s\n收到: %s", body, upstreamBody)
+	}
+	if entry := lastLog(t, st); entry.ImagesDropped != 0 {
+		t.Errorf("未配置上限时不该裁图，实际 %d", entry.ImagesDropped)
+	}
+}
+
 // 端到端：带大图的请求转发后，日志里要能看到压缩张数与节省字节，
 // 且上游收到的请求体确实比客户端发出的更小。
 func TestForwardCompressesInlineImage(t *testing.T) {

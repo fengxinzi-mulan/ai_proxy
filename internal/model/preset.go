@@ -37,6 +37,11 @@ type ProviderPreset struct {
 	UsageInjectMode        *string `json:"usageInjectMode,omitempty"`
 	ContinuationMode       *string `json:"continuationMode,omitempty"`
 	TimeoutSeconds         *int    `json:"timeoutSeconds,omitempty"`
+	// MaxImagesPerRequest 是单请求图片数量上限；0 表示不限制（预设里不会出现 0，
+	// 想让上限「不限制」就别列这一项）。
+	MaxImagesPerRequest *int `json:"maxImagesPerRequest,omitempty"`
+	// ImageTrimBatch 是一批丢几张；0/1 表示逐张。
+	ImageTrimBatch *int `json:"imageTrimBatch,omitempty"`
 }
 
 // providerPresets 是内置预设表。新增厂商时只加条目，不动应用逻辑。
@@ -72,12 +77,24 @@ var providerPresets = []ProviderPreset{
 				Value:  "900 秒",
 				Reason: "它的模型支持 1M 上下文与 xhigh/max 推理档，长上下文的预填充本身就要好几分钟，300 秒的默认值容易被我们自己截断",
 			},
+			{
+				Field:  "单请求图片上限",
+				Value:  "20 张",
+				Reason: "上游按请求内的图片总数硬性拒绝，超过 20 张整条 400（错误原文 \"Total number of images exceeds the maximum allowed of 20.\"）；客户端每轮回放全部历史图片，数量不可控，超出的更早图片会被替换成占位文本",
+			},
+			{
+				Field:  "成批替换",
+				Value:  "每 5 张一批",
+				Reason: "逐张推进时丢弃边界每轮前移一格，「第一张保留下来的图」的位置跟着变，前缀缓存从那里断开、整段保留区全价重算；按 5 张一批推进后，图片数在 21~25 这段窗口里发出的是同一份 body，缓存照常命中，只有每长满 5 张才失效一次",
+			},
 		},
 		StripUnsupportedParams: boolPtr(true),
 		PromptCacheKeyMode:     strPtr(PromptCacheKeyAuto),
 		UsageInjectMode:        strPtr("off"),
 		ContinuationMode:       strPtr(ContinuationOff),
 		TimeoutSeconds:         intPtr(900),
+		MaxImagesPerRequest:    intPtr(20),
+		ImageTrimBatch:         intPtr(5),
 	},
 }
 
@@ -159,6 +176,14 @@ func (p ProviderPreset) Apply(prov *Provider) []string {
 		prov.TimeoutSeconds = *p.TimeoutSeconds
 		changed = append(changed, "timeoutSeconds")
 	}
+	if p.MaxImagesPerRequest != nil && prov.MaxImagesPerRequest != *p.MaxImagesPerRequest {
+		prov.MaxImagesPerRequest = *p.MaxImagesPerRequest
+		changed = append(changed, "maxImagesPerRequest")
+	}
+	if p.ImageTrimBatch != nil && prov.ImageTrimBatch != *p.ImageTrimBatch {
+		prov.ImageTrimBatch = *p.ImageTrimBatch
+		changed = append(changed, "imageTrimBatch")
+	}
 	return changed
 }
 
@@ -177,6 +202,12 @@ func (p ProviderPreset) Applied(prov Provider) bool {
 		return false
 	}
 	if p.TimeoutSeconds != nil && prov.TimeoutSeconds != *p.TimeoutSeconds {
+		return false
+	}
+	if p.MaxImagesPerRequest != nil && prov.MaxImagesPerRequest != *p.MaxImagesPerRequest {
+		return false
+	}
+	if p.ImageTrimBatch != nil && prov.ImageTrimBatch != *p.ImageTrimBatch {
 		return false
 	}
 	return true

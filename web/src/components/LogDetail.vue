@@ -197,6 +197,19 @@ const prettyResp = computed(() => prettyJSON(log.value?.respBody))
                 </div>
               </template>
 
+              <template v-if="log.imagesDropped > 0">
+                <h4 class="section">图片上限</h4>
+                <div class="cont-verdict">
+                  <NTag type="warning" size="small" :bordered="false">
+                    已省略 {{ log.imagesDropped }} 张更早的图片
+                  </NTag>
+                  <span class="cont-detail">
+                    超出发往上游的接口上限，这些位置被替换成了占位文本；模型看不到它们，
+                    但会话不会因此被拒
+                  </span>
+                </div>
+              </template>
+
               <template v-if="log.modifications?.length">
                 <h4 class="section">本次改写</h4>
                 <NSpace :size="6">

@@ -47,8 +47,8 @@ func TestMistralPresetAppliesOnlyListedFields(t *testing.T) {
 	prov.Prompt.Text = "自定义提示词"
 
 	applied := preset.Apply(&prov)
-	if len(applied) != 4 {
-		t.Fatalf("应改动四项（严格兼容/缓存键/用量注入/超时），实际 %v", applied)
+	if len(applied) != 6 {
+		t.Fatalf("应改动六项（严格兼容/缓存键/用量注入/超时/图片上限/成批替换），实际 %v", applied)
 	}
 	if !prov.StripUnsupportedParams {
 		t.Error("严格兼容应被打开")
@@ -61,6 +61,12 @@ func TestMistralPresetAppliesOnlyListedFields(t *testing.T) {
 	}
 	if prov.TimeoutSeconds != 900 {
 		t.Errorf("超时应为 900，实际 %d", prov.TimeoutSeconds)
+	}
+	if prov.MaxImagesPerRequest != 20 {
+		t.Errorf("单请求图片上限应为 20，实际 %d", prov.MaxImagesPerRequest)
+	}
+	if prov.ImageTrimBatch != 5 {
+		t.Errorf("成批替换的批大小应为 5，实际 %d", prov.ImageTrimBatch)
 	}
 	// 预设不该碰这些。
 	if len(prov.Keys) != 1 || prov.Keys[0].Key != "sk-secret" {
@@ -86,13 +92,18 @@ func TestMistralPresetAppliesOnlyListedFields(t *testing.T) {
 	if preset.Applied(prov) {
 		t.Error("有一项不符时 Applied 应为 false")
 	}
+	prov.UsageInjectMode = "off"
+	prov.MaxImagesPerRequest = 0
+	if preset.Applied(prov) {
+		t.Error("图片上限被改回 0（不限制）时 Applied 也应为 false")
+	}
 }
 
 func TestProviderPresetChangesMatchFields(t *testing.T) {
 	preset, _ := LookupProviderPreset("mistral")
 	// 界面靠 Changes 展示「改什么」，字段数量必须与要改的项对得上。
-	if len(preset.Changes) != 5 {
-		t.Errorf("应给出五条变更说明，实际 %d", len(preset.Changes))
+	if len(preset.Changes) != 7 {
+		t.Errorf("应给出七条变更说明，实际 %d", len(preset.Changes))
 	}
 	for _, c := range preset.Changes {
 		if c.Field == "" || c.Value == "" || c.Reason == "" {

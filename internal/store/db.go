@@ -340,6 +340,29 @@ var migrations = []migration{
 			`ALTER TABLE request_logs ADD COLUMN image_saved_bytes INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
+	{
+		// 单请求图片数量上限（供应商级）与被裁掉的张数（日志级）。
+		//
+		// 上游按请求内图片总数硬性拒绝（Mistral 超过 20 张整条 400），而客户端
+		// 每轮回放全部历史图片，数量不受代理控制。默认 0 表示不限制 ——
+		// 老库升级上来时所有供应商保持今天的行为，不会突然开始裁图。
+		version: 11,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN max_images_per_request INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE request_logs ADD COLUMN images_dropped INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		// 成批替换的步长。
+		//
+		// 逐张推进时，丢弃边界每轮都往前挪一格，「第一张保留下来的图」的位置
+		// 随之变化，前缀缓存在那里断开、该轮后面十几张图全价重算。按批推进能
+		// 让边界在一段窗口内固定，缓存照常命中。默认 0（逐张），老库行为不变。
+		version: 12,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN image_trim_batch INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
 }
 
 func (s *Store) migrate() error {

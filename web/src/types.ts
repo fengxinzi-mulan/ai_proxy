@@ -212,6 +212,24 @@ export interface Provider {
    */
   promptCacheKeyMode: 'off' | 'auto'
 
+  /**
+   * 单次请求允许携带的图片张数上限，0 表示不限制。
+   *
+   * 上游按「整个请求里的图片总数」硬性拒绝（Mistral 超限整条 400），
+   * 而客户端每轮回放全部历史图片、数量不受代理控制。超限时更早的图片
+   * 会被替换成一行占位文本，让会话继续可用。
+   */
+  maxImagesPerRequest: number
+
+  /**
+   * 一批丢几张：0/1 表示逐张，>1 表示成批替换。
+   *
+   * 逐张推进会让丢弃边界每轮前移一格，前缀缓存从「第一张保留下来的图」
+   * 那里断开、整段保留区全价重算。按批推进可把边界钉在窗口内，
+   * 只有每长满一批才失效一次。
+   */
+  imageTrimBatch: number
+
   customUsage: CustomUsageMapping | null
 
   usageQuery: UsageQueryConfig
@@ -288,6 +306,8 @@ export interface RequestLog {
   imageCompressed: number
   /** 压缩省下的请求字节数（base64 串长度差）。 */
   imageSavedBytes: number
+  /** 超出供应商图片数量上限、被占位文本替换掉的张数。与压缩张数分开记。 */
+  imagesDropped: number
   httpStatus: number
   success: boolean
   errorMsg: string
@@ -416,6 +436,10 @@ export interface ProviderPreset {
   usageInjectMode?: 'inherit' | 'on' | 'off'
   continuationMode?: 'off' | 'dry-run' | 'on'
   timeoutSeconds?: number
+  /** 单请求图片数量上限（0 表示不限制；预设里不会出现 0）。 */
+  maxImagesPerRequest?: number
+  /** 一批丢几张（0/1 = 逐张）。 */
+  imageTrimBatch?: number
 }
 
 /** 数据库页级占用，用来展示「回收空间」能腾出多少。 */

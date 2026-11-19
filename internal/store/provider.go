@@ -29,7 +29,8 @@ const providerColumns = `id, name, display_name, remark, enabled, active, sort_o
 	model_map_json, continuation_mode, continuation_models_json,
 	continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
 	usage_inject_mode, strip_usage_chunk, strip_unsupported_params, prompt_cache_key_mode,
-		custom_usage_json, usage_query_json, usage_account, usage_password, tags_json,
+	max_images_per_request, image_trim_batch,
+	custom_usage_json, usage_query_json, usage_account, usage_password, tags_json,
 	created_at, updated_at`
 
 func boolToInt(b bool) int {
@@ -125,9 +126,10 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		model_map_json, continuation_mode, continuation_models_json,
 		continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
 		usage_inject_mode, strip_usage_chunk, strip_unsupported_params, prompt_cache_key_mode,
+		max_images_per_request, image_trim_batch,
 		custom_usage_json, usage_query_json, usage_account, usage_password, tags_json,
 		created_at, updated_at
-	) VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?,?,?,?,?,?,?, ?,?)`,
+	) VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)`,
 		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), boolToInt(p.Active), p.SortOrder,
 		p.BaseURL, string(p.APIFormat), p.CustomPath, p.AuthHeader, p.AuthPrefix,
 		keysJSON, headersJSON,
@@ -137,6 +139,8 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), boolToInt(p.StripUnsupportedParams),
 		p.PromptCacheKeyMode,
+		p.MaxImagesPerRequest,
+		p.ImageTrimBatch,
 		customUsageJSON, usageQueryJSON, p.UsageQuery.Account, p.UsageQuery.Password, tagsJSON,
 		tsToDB(p.CreatedAt), tsToDB(p.UpdatedAt),
 	)
@@ -190,6 +194,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		model_map_json=?, continuation_mode=?, continuation_models_json=?,
 		continuation_cooldown_seconds=?, continuation_invalid_cooldown_seconds=?,
 		usage_inject_mode=?, strip_usage_chunk=?, strip_unsupported_params=?, prompt_cache_key_mode=?,
+		max_images_per_request=?, image_trim_batch=?,
 		custom_usage_json=?, usage_query_json=?, usage_account=?, usage_password=?, tags_json=?,
 		updated_at=?
 		WHERE id=?`,
@@ -202,6 +207,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), boolToInt(p.StripUnsupportedParams),
 		p.PromptCacheKeyMode,
+		p.MaxImagesPerRequest, p.ImageTrimBatch,
 		customUsageJSON, usageQueryJSON, p.UsageQuery.Account, p.UsageQuery.Password, tagsJSON,
 		tsToDB(p.UpdatedAt), p.ID,
 	)
@@ -360,6 +366,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		&modelMapJSON, &p.ContinuationMode, &contModelsJSON,
 		&p.ContinuationCooldownSeconds, &p.ContinuationInvalidCooldownSeconds,
 		&p.UsageInjectMode, &stripUsage, &stripUnsupported, &p.PromptCacheKeyMode,
+		&p.MaxImagesPerRequest, &p.ImageTrimBatch,
 		&customUsageJSON, &usageQueryJSON, &p.UsageQuery.Account, &p.UsageQuery.Password, &tagsJSON,
 		&createdAt, &updatedAt,
 	)

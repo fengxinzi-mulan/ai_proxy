@@ -18,7 +18,7 @@ setlocal
 cd /d "%~dp0"
 
 set "SYS=%SystemRoot%\System32"
-set "VER=0.4.0"
+set "VER=0.5.0"
 
 echo [1/4] Checking toolchain...
 "%SYS%\where.exe" npm >nul 2>nul || (echo   ERROR: "npm" not found in PATH. & goto :fail)

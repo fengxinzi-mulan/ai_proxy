@@ -154,6 +154,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	in.modifications = rewritten.Modifications
 	in.imageCompressed = rewritten.ImageCompressed
 	in.imageSavedBytes = rewritten.ImageSavedBytes
+	in.imagesDropped = rewritten.ImagesDropped
 
 	s.forward(w, r, in)
 }
@@ -179,6 +180,8 @@ type forwardInput struct {
 	// 由 rewriteRequest 算出，落进日志供「这个功能到底省了多少」核对。
 	imageCompressed int
 	imageSavedBytes int64
+	// imagesDropped 是超出供应商图片数量上限、被占位文本替换掉的张数。
+	imagesDropped int
 	// format 是「这次请求实际用的协议」，由请求路径推导（见 effectiveFormat）。
 	// 响应解析、归一化、统计都看它，而不是供应商配置的 apiFormat。
 	format model.APIFormat
@@ -600,6 +603,7 @@ func (s *Server) record(in forwardInput, res logResult) {
 
 		ImageCompressed: in.imageCompressed,
 		ImageSavedBytes: in.imageSavedBytes,
+		ImagesDropped:   in.imagesDropped,
 
 		HTTPStatus: res.status,
 		Cancelled:  res.cancelled,

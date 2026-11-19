@@ -946,3 +946,137 @@ func TestProviderModelMapRoundTrip(t *testing.T) {
 		t.Fatalf("清空模型映射未生效: %+v", cleared.ModelMap)
 	}
 }
+
+// 单请求图片上限与「被裁掉的张数」都要能往返。
+//
+// 上限是供应商配置（0 = 不限制，是有效取值，不能被默认值顶掉）；
+// images_dropped 是日志列，写错位置会让整份日志错位。
+func TestProviderMaxImagesPerRequestRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+
+	p := newProvider("limit")
+	p.MaxImagesPerRequest = 20
+	p.ImageTrimBatch = 5
+	created, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+	got, err := st.GetProvider(created.ID)
+	if err != nil {
+		t.Fatalf("读取供应商失败: %v", err)
+	}
+	if got.MaxImagesPerRequest != 20 {
+		t.Fatalf("图片上限未正确往返: %+v", got.MaxImagesPerRequest)
+	}
+	if got.ImageTrimBatch != 5 {
+		t.Fatalf("批大小未正确往返: %+v", got.ImageTrimBatch)
+	}
+
+	// 改回 0（不限制）也要能存住 —— 这是有效取值，不能回落成默认。
+	got.MaxImagesPerRequest = 0
+	got.ImageTrimBatch = 0
+	updated, err := st.UpdateProvider(got)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if updated.MaxImagesPerRequest != 0 {
+		t.Fatalf("清空图片上限未生效: %+v", updated.MaxImagesPerRequest)
+	}
+	if updated.ImageTrimBatch != 0 {
+		t.Fatalf("清空批大小未生效: %+v", updated.ImageTrimBatch)
+	}
+}
+
+// 升级不能改变行为：v10 的库存量供应商升上来之后，图片上限必须是 0（不限制）。
+//
+// 这条用例单独存在而不是靠 TestProviderMaxImagesPerRequestRoundTrip：那条走的是
+// 「从零建库跑全部迁移」，拿不到「已有数据的表上 ADD COLUMN」这个真实场景 ——
+// 而用户最担心的正是「升级之后突然开始裁图」。所以这里手工造一个 v10 的库、
+// 塞一行供应商，再用 Open 走完剩余迁移。
+func TestMigrateV10KeepsImageLimitUnlimited(t *testing.T) {
+	dir := t.TempDir()
+
+	// 先建到 v10，再把 v11 的记录抹掉，模拟一个老版本留下的库。
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatalf("初始化失败: %v", err)
+	}
+	if _, err := st.CreateProvider(newProvider("legacy")); err != nil {
+		t.Fatalf("写入供应商失败: %v", err)
+	}
+	// 升级前先插一条日志：这样 images_dropped 的 ADD COLUMN 才会被真正覆盖到
+	// （否则 ListLogs 返回空切片，下面的循环体一次都不执行，等于没测）。
+	insertLog(t, st, func(l *model.RequestLog) { l.ImagesDropped = 0 })
+	// 回滚到「v10 的时刻」：删列 + 删迁移记录。SQLite 3.35+ 支持 DROP COLUMN。
+	// 注意要连同更高版本（v12 的 image_trim_batch）一起回滚，否则 Open 只会补
+	// version > 10 的那几条，v11 的列永远补不回来。
+	for _, stmt := range []string{
+		`ALTER TABLE providers DROP COLUMN image_trim_batch`,
+		`ALTER TABLE providers DROP COLUMN max_images_per_request`,
+		`ALTER TABLE request_logs DROP COLUMN images_dropped`,
+		`DELETE FROM schema_migrations WHERE version >= 11`,
+	} {
+		if _, err := st.db.Exec(stmt); err != nil {
+			t.Fatalf("回滚到 v10 失败（%s）: %v", stmt, err)
+		}
+	}
+	st.Close()
+
+	// 重新打开：迁移会把 v11 补上。
+	upgraded, err := Open(dir)
+	if err != nil {
+		t.Fatalf("升级失败: %v", err)
+	}
+	defer upgraded.Close()
+
+	list, err := upgraded.ListProviders()
+	if err != nil {
+		t.Fatalf("读取供应商失败: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("应有 1 个供应商，实际 %d", len(list))
+	}
+	if list[0].MaxImagesPerRequest != 0 {
+		t.Errorf("存量供应商升级后图片上限应为 0（不限制），实际 %d —— 不能让它突然开始裁图",
+			list[0].MaxImagesPerRequest)
+	}
+
+	// 日志列同样要补上，且存量行为 0。这里断言「至少读到一条」，
+	// 否则循环体可能因为 logs 为空而一次都不执行、让这条检查变成摆设。
+	logs, total, err := upgraded.ListLogs(model.LogQuery{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("读取日志失败: %v", err)
+	}
+	if total == 0 || len(logs) == 0 {
+		t.Fatal("升级前插入的那条日志没读到 —— 这条断言会失去意义")
+	}
+	for _, l := range logs {
+		if l.ImagesDropped != 0 {
+			t.Errorf("存量日志的 images_dropped 应为 0，实际 %d", l.ImagesDropped)
+		}
+	}
+}
+
+func TestLogImagesDroppedRoundTrip(t *testing.T) {
+	st := newTestStore(t)
+
+	id := insertLog(t, st, func(l *model.RequestLog) {
+		l.ImagesDropped = 7
+	})
+	got, err := st.GetLog(id)
+	if err != nil {
+		t.Fatalf("读取日志失败: %v", err)
+	}
+	if got.ImagesDropped != 7 {
+		t.Fatalf("images_dropped 未正确往返: %+v", got.ImagesDropped)
+	}
+
+	// 列表接口也走同一套列，列错位在这里就会暴露。
+	logs, _, err := st.ListLogs(model.LogQuery{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("查询日志失败: %v", err)
+	}
+	if len(logs) != 1 || logs[0].ImagesDropped != 7 {
+		t.Fatalf("列表里的 images_dropped 不对: %+v", logs)
+	}
+}
