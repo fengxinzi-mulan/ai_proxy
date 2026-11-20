@@ -4,6 +4,7 @@
 // 目的是消除各页面重复的 box-shadow + border 组合（原来 6 个文件各写一份，
 // 暗色下阴影常量还都没换）。需要强调时用 accent 变体，而不是加粗描边。
 import { computed } from 'vue'
+import HelpTip from '@/components/HelpTip.vue'
 
 const props = withDefaults(
   defineProps<{
@@ -29,9 +30,14 @@ const cls = computed(() => ({
 
 <template>
   <section :class="cls">
-    <header v-if="title || $slots.actions" class="card-head">
+    <header v-if="title || description || $slots.actions || $slots.help" class="card-head">
       <div class="card-head-text">
-        <h3 v-if="title" class="card-title">{{ title }}</h3>
+        <h3 v-if="title || $slots.help" class="card-title">
+          <span v-if="title">{{ title }}</span>
+          <!-- 卡片级说明收进问号气泡：原先的 info 提示块常驻在卡片底部，
+               内容一长就把表单挤下去，也让页面显得全是解释文字。 -->
+          <HelpTip v-if="$slots.help" :width="440"><slot name="help" /></HelpTip>
+        </h3>
         <p v-if="description" class="card-desc">{{ description }}</p>
       </div>
       <div v-if="$slots.actions" class="card-actions">

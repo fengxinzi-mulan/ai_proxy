@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing/fstest"
@@ -65,7 +66,11 @@ func main() {
 		activateExistingWindow()
 		return
 	}
-	defer release()
+	// 自动更新重启时必须先放掉互斥量，否则新进程会被判成「已有实例在运行」
+	// 然后立刻退出 —— 用户看到的就是「更新完程序不见了」。
+	// 用只生效一次的包装：重启路径提前调用，defer 再调一次不能有副作用。
+	releaseLock := releaseSingleInstance(release)
+	defer releaseLock()
 
 	level := slog.LevelInfo
 	if *debug {
@@ -109,18 +114,29 @@ func main() {
 	}
 
 	app := &desktopApp{
-		logger:    logger,
-		dataDir:   dataDir,
-		host:      *host,
-		port:      *port,
-		web:       web,
-		autostart: *fromAutostart,
+		logger:      logger,
+		dataDir:     dataDir,
+		host:        *host,
+		port:        *port,
+		web:         web,
+		autostart:   *fromAutostart,
+		releaseLock: releaseLock,
 	}
 
 	if err := app.launch(); err != nil {
 		logger.Error("桌面窗口启动失败", "err", err)
 		fatalDialog("启动失败", err.Error())
 	}
+}
+
+// releaseSingleInstance 把互斥量释放包装成幂等函数。
+//
+// 释放点有两个：自动更新拉起新进程之前（必须提前放），以及 main 的 defer。
+// 两个都必须能安全调用，而 Windows 上重复 CloseHandle 会返回错误句柄，
+// 所以统一收敛到 sync.Once。
+func releaseSingleInstance(release func()) func() {
+	var once sync.Once
+	return func() { once.Do(release) }
 }
 
 // desktopApp 持有窗口生命周期内需要的全部状态。
@@ -133,6 +149,20 @@ type desktopApp struct {
 	// autostart 表示本次是被登录启动项拉起的：窗口不显示，直接收进托盘。
 	autostart bool
 
+	// releaseLock 释放单实例互斥量。可以重复调用（内部用 sync.Once 包过），
+	// 自动更新拉起新进程前必须先调用它。
+	releaseLock func()
+
+	// mu 保护 svc / ctx / tray。
+	//
+	// 这几项会被不同 goroutine 同时碰到：Wails 的回调在 UI 线程，
+	// 关闭确认来自 HTTP 处理协程，更新安装在另一个 goroutine，
+	// 托盘回调又在自己的消息循环里。不加锁就会出现「关闭流程读到一半 svc 被置空」
+	// 或者两个 goroutine 同时 stop 同一个托盘。
+	//
+	// 约定：持有 mu 时只做字段读写，绝不调用 svc/tray 上的方法 ——
+	// 那些方法可能反过来触发关闭回调，持锁就会死锁。
+	mu   sync.Mutex
 	svc  *service.Service
 	ctx  context.Context
 	tray *desktopTray
@@ -143,10 +173,71 @@ type desktopApp struct {
 	closePromptOpen atomic.Bool
 	// shuttingDown 防止 OnShutdown 重入。
 	shuttingDown atomic.Bool
+	// restarting 表示自动更新正在收摊/拉起新进程：这段时间禁止关窗，
+	// 否则进程先退出、新进程永远不会被拉起。见 prepareRestart。
+	restarting atomic.Bool
+}
+
+// getService / getContext / getTray 在锁内取快照，避免读字段与写字段竞态。
+func (a *desktopApp) getService() *service.Service {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.svc
+}
+
+func (a *desktopApp) getContext() context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ctx
+}
+
+func (a *desktopApp) getTray() *desktopTray {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tray
+}
+
+func (a *desktopApp) setService(svc *service.Service) {
+	a.mu.Lock()
+	a.svc = svc
+	a.mu.Unlock()
+}
+
+func (a *desktopApp) setContext(ctx context.Context) {
+	a.mu.Lock()
+	a.ctx = ctx
+	a.mu.Unlock()
+}
+
+func (a *desktopApp) setTray(t *desktopTray) {
+	a.mu.Lock()
+	a.tray = t
+	a.mu.Unlock()
+}
+
+// detachRuntime 一次性摘走服务与托盘，后续的关闭动作在锁外做。
+func (a *desktopApp) detachRuntime() (*desktopTray, *service.Service) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	tray, svc := a.tray, a.svc
+	a.tray, a.svc = nil, nil
+	return tray, svc
+}
+
+// stopTray 撤掉托盘图标（如果还在）。
+func (a *desktopApp) stopTray() {
+	if tray := a.getTray(); tray != nil {
+		tray.stop()
+	}
 }
 
 // launch 启动 HTTP 服务与窗口。
 func (a *desktopApp) launch() error {
+	// wails.Run 失败（WebView2 缺失、窗口创建失败）时 launch 会直接返回错误，
+	// 调用方只弹个对话框就退出。没有这层 defer，服务与数据库连接就泄漏在进程里，
+	// 表现为端口被占、下次启动报「已在运行」。
+	defer a.shutdown()
+
 	svc, err := a.startService(false)
 	if err != nil {
 		var le *service.ListenError
@@ -174,7 +265,7 @@ func (a *desktopApp) launch() error {
 	if err != nil {
 		return err
 	}
-	a.svc = svc
+	a.setService(svc)
 	a.logger.Info("代理服务已就绪", "url", svc.URL())
 
 	target := svc.URL()
@@ -214,7 +305,7 @@ func (a *desktopApp) launch() error {
 			DisablePinchZoom: true,
 		},
 		OnStartup: func(ctx context.Context) {
-			a.ctx = ctx
+			a.setContext(ctx)
 			tray, err := startTray(showMainWindow, a.quit)
 			if err != nil {
 				a.logger.Warn("创建系统托盘失败", "err", err)
@@ -224,23 +315,23 @@ func (a *desktopApp) launch() error {
 					runtime.WindowShow(ctx)
 				}
 			} else {
-				a.tray = tray
+				a.setTray(tray)
 			}
 		},
 		OnBeforeClose: func(ctx context.Context) bool {
 			return !a.handleClose(ctx)
 		},
 		OnShutdown: func(context.Context) {
-			if a.tray != nil {
-				a.tray.stop()
-			}
+			// 先撤托盘再关服务：托盘图标在新进程创建自己的图标之前必须消失，
+			// 否则会留下一个点不动的幽灵图标。
+			a.stopTray()
 			a.shutdown()
 		},
 	})
 	if err != nil {
 		return err
 	}
-	// wails.Run 返回即窗口已关闭；确保服务也停了。
+	// wails.Run 返回即窗口已关闭；确保服务也停了（defer 里还有一层，幂等）。
 	a.shutdown()
 	return nil
 }
@@ -307,20 +398,31 @@ func (a *desktopApp) autostartSpec() autostart.Spec {
 	}
 }
 
-// prepareRestart 在替换 exe 之前收摊：停托盘图标、关服务。
+// prepareRestart 在替换 exe 之前收摊：放单实例锁、停托盘图标、关服务。
+//
+// 顺序不能改：先放互斥量，再拉起新进程。新进程启动第一件事就是抢同一把锁，
+// 锁还在的话它会被判成「已有实例」直接退出，更新看上去就是程序凭空消失。
 //
 // 托盘图标必须先撤掉：新进程会创建自己的图标，旧进程不撤会留下一个
 // 点不动的幽灵图标，直到用户把鼠标划过去才消失。
 func (a *desktopApp) prepareRestart() {
-	if a.tray != nil {
-		a.tray.stop()
-		a.tray = nil
+	// 从这一刻到新进程拉起之间，服务与托盘都已经被收掉。若用户此时点关闭，
+	// 窗口会正常退出，安装线程随进程一起消失 —— 新版本写进了磁盘却没有
+	// 被拉起，看起来就是「更新完程序不见了」。所以这个窗口期内禁止关窗。
+	a.restarting.Store(true)
+	if a.releaseLock != nil {
+		a.releaseLock()
 	}
-	if a.svc != nil {
+	tray, svc := a.detachRuntime()
+	if tray != nil {
+		tray.stop()
+	}
+	if svc != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = a.svc.Shutdown(ctx)
-		a.svc = nil
+		if err := svc.Shutdown(ctx); err != nil {
+			a.logger.Warn("更新前关闭代理服务出错", "err", err)
+		}
 	}
 }
 
@@ -330,7 +432,14 @@ func (a *desktopApp) restartNewVersion() error {
 	if err != nil {
 		return err
 	}
+	// 再放一次锁兜底（幂等）：任何绕开 prepareRestart 的调用路径都不能
+	// 让新进程卡在「已有实例」上。
+	if a.releaseLock != nil {
+		a.releaseLock()
+	}
 	if err := update.Restart(exe, os.Args[1:]); err != nil {
+		// 拉起失败：解除关窗保护，否则窗口永远关不掉（服务已经关了）。
+		a.restarting.Store(false)
 		return err
 	}
 	a.quitting.Store(true)
@@ -345,11 +454,19 @@ func (a *desktopApp) restartNewVersion() error {
 //   - 直接退出：放行；
 //   - 托盘运行：隐藏窗口并阻止退出，代理继续跑；
 //   - 每次询问（默认）：通知前端弹出现代化确认框，用户选择后再执行。
+//
+// 所有「没法把询问送到用户眼前」的情况都必须放行，否则窗口永远关不掉。
 func (a *desktopApp) handleClose(ctx context.Context) bool {
 	if a.quitting.Load() {
 		return true
 	}
-	if a.ctx == nil {
+	if a.restarting.Load() {
+		// 更新正在收摊：放行会让进程先退出，新版本起不来。
+		// restartNewVersion 拉起失败时会清掉这个标记，窗口不会永久关不掉。
+		a.logger.Info("自动更新重启中，暂不关闭窗口")
+		return false
+	}
+	if a.getContext() == nil {
 		// 窗口还没就绪就收到关闭请求（例如启动失败），直接放行。
 		return true
 	}
@@ -359,27 +476,46 @@ func (a *desktopApp) handleClose(ctx context.Context) bool {
 		a.quitting.Store(true)
 		return true
 	case desktop.CloseTray:
+		if a.getTray() == nil {
+			// 没有托盘就没有任何入口能把窗口叫回来，躲进托盘等于让程序
+			// 变成「看不见也关不掉」的僵尸；直接放行退出。
+			a.logger.Warn("关闭配置为最小化到托盘，但托盘不可用，直接退出")
+			a.quitting.Store(true)
+			return true
+		}
 		a.minimizeToTray()
 		return false
+	}
+
+	svc := a.getService()
+	if svc == nil {
+		// 服务已经收摊（更新安装会先关服务）或从未起来：确认框依赖 SSE，
+		// 没有服务就没有通道，阻止关闭只会让窗口永久卡住。
+		a.logger.Warn("关闭时代理服务已不可用，直接退出窗口")
+		a.quitting.Store(true)
+		return true
+	}
+	if svc.SubscriberCount() == 0 {
+		// 没有任何 SSE 订阅者（例如前端崩溃、页面被关掉）意味着确认框发不出去。
+		// 这里不占用 closePromptOpen，直接退出，避免「点关闭毫无反应」。
+		a.logger.Info("关闭时没有界面订阅者，直接退出窗口")
+		a.quitting.Store(true)
+		return true
 	}
 
 	// 每次询问：把弹窗交给前端（NModal + 图标），在用户做出选择前阻止关闭。
 	if !a.closePromptOpen.CompareAndSwap(false, true) {
 		return false
 	}
-	if a.svc == nil {
-		a.closePromptOpen.Store(false)
-		return false
-	}
-	a.svc.Broadcast("desktop-close-ask", nil)
+	svc.Broadcast("desktop-close-ask", nil)
 	return false
 }
 
 // minimizeToTray 隐藏主窗口，代理服务保持运行。
 func (a *desktopApp) minimizeToTray() {
 	hideMainWindow()
-	if a.tray != nil {
-		a.tray.notify("AI Proxy", "已最小化到系统托盘，代理继续在后台运行。双击托盘图标可重新打开。")
+	if tray := a.getTray(); tray != nil {
+		tray.notify("AI Proxy", "已最小化到系统托盘，代理继续在后台运行。双击托盘图标可重新打开。")
 	}
 }
 
@@ -397,19 +533,27 @@ func (a *desktopApp) applyCloseChoice(action string) {
 // quit 由托盘菜单和系统信号调用。先置位，避免 OnBeforeClose 再次询问。
 func (a *desktopApp) quit() {
 	a.quitting.Store(true)
-	if a.ctx != nil {
-		runtime.Quit(a.ctx)
+	if ctx := a.getContext(); ctx != nil {
+		runtime.Quit(ctx)
 	}
 }
 
 // shutdown 停掉代理服务，幂等。
 func (a *desktopApp) shutdown() {
-	if !a.shuttingDown.CompareAndSwap(false, true) || a.svc == nil {
+	if !a.shuttingDown.CompareAndSwap(false, true) {
+		return
+	}
+	// 摘走引用再关：prepareRestart 可能已经把 svc 收走了，两边不能都关一次。
+	a.mu.Lock()
+	svc := a.svc
+	a.svc = nil
+	a.mu.Unlock()
+	if svc == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.svc.Shutdown(ctx); err != nil {
+	if err := svc.Shutdown(ctx); err != nil {
 		a.logger.Warn("关闭代理服务时出错", "err", err)
 	}
 	a.logger.Info("桌面版已退出")

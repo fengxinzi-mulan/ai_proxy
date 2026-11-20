@@ -10,9 +10,12 @@ package proxy
 // 不含任何真实账号信息。
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,6 +99,31 @@ func TestParseMistralBudgetFallsBackToTopLevel(t *testing.T) {
 	}
 	if !strings.Contains(windows[0].Hint, "EUR") {
 		t.Errorf("币种应来自顶层: %q", windows[0].Hint)
+	}
+}
+
+// 只返回 vibe_budget 的响应是合法的（账号只有 Vibe 预算时实测如此）。
+// 顶层为空只说明 api 那一侧没数据，不能因此整条额度都报错。
+func TestParseMistralBudgetVibeOnly(t *testing.T) {
+	body := `{"vibe_budget":{"usage_percentage":20.81,"initial_budget":300.0,` +
+		`"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}`
+
+	windows, err := parseMistralBudget([]byte(body))
+	if err != nil {
+		t.Fatalf("只有 vibe_budget 时应解析成功，实际报错: %v", err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("应产出 1 条额度窗口，实际 %d: %+v", len(windows), windows)
+	}
+	w := windows[0]
+	if w.Label != "Vibe 额度" || w.Cap != 300 || w.Percent != 20.81 {
+		t.Errorf("Vibe 额度解析不对: %+v", w)
+	}
+	if w.ResetAt == nil || w.ResetAt.Year() != 2026 {
+		t.Errorf("重置时间没解析出来: %+v", w.ResetAt)
+	}
+	if !strings.Contains(w.Hint, "USD") {
+		t.Errorf("提示里应带币种: %q", w.Hint)
 	}
 }
 
@@ -502,5 +530,162 @@ func TestQueryUsageMistralNoCredentials(t *testing.T) {
 	}
 	if len(snap.UsedURLs) != 0 {
 		t.Errorf("缺凭据时不该发出请求，实际请求了 %v", snap.UsedURLs)
+	}
+}
+
+// 只填账号密码、没有 API key：认 key 的官方接口根本发不出去，
+// 必须跳过它们，把 admin 能给的额度与 token 明细正常读回来。
+func TestQueryUsageMistralAccountOnly(t *testing.T) {
+	f := newMistralFixture(t, mistralAPIHandler, mistralAdminHandler)
+	f.startMistralLogin(t)
+
+	srv, st := newTestServer(t)
+	p := model.Provider{
+		Name:      "mistral",
+		BaseURL:   f.apiURL,
+		APIFormat: model.FormatOpenAI,
+		UsageQuery: model.UsageQueryConfig{
+			Template: mistralTemplateID,
+			Account:  f.account,
+			Password: f.pass,
+		},
+	}
+	prov, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if !snap.OK {
+		t.Fatalf("只有账号密码时应能读到 admin 数据，错误: %s，警告: %v", snap.Error, snap.Warnings)
+	}
+	// 没有密钥就没有预算窗口，但限额 + token 明细共 6 条统计要在。
+	if len(snap.Windows) != 0 {
+		t.Errorf("没有密钥时不该有预算窗口，实际 %+v", snap.Windows)
+	}
+	if len(snap.Period) != 6 {
+		t.Errorf("应读到 6 条周期统计，实际 %d: %+v", len(snap.Period), snap.Period)
+	}
+	for _, u := range snap.UsedURLs {
+		if strings.HasPrefix(u, f.apiURL) {
+			t.Errorf("没有密钥时不该请求官方接口: %s", u)
+		}
+	}
+	for _, w := range snap.Warnings {
+		if strings.Contains(w, "预算接口不可用") || strings.Contains(w, "订阅接口不可用") ||
+			strings.Contains(w, "密钥被拒") {
+			t.Errorf("跳过官方接口时不该报不可用/密钥被拒: %v", snap.Warnings)
+		}
+	}
+}
+
+// key 被拒但网页会话可用：不能因官方接口 401 提前收工，
+// admin 的额度与明细仍要读回来。
+func TestQueryUsageMistralKeyRejectedStillReadsAdmin(t *testing.T) {
+	rejecting := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	f := newMistralFixture(t, rejecting, mistralAdminHandler)
+	f.startMistralLogin(t)
+
+	srv, st := newTestServer(t)
+	prov := f.createProvider(t, st, model.UsageQueryConfig{
+		Account:  f.account,
+		Password: f.pass,
+	})
+
+	snap := runQueryUsage(t, srv, st, prov)
+	if !snap.OK {
+		t.Fatalf("admin 还能读时不该整体失败: %s", snap.Error)
+	}
+	if len(snap.Windows) != 0 {
+		t.Errorf("官方接口 401 时不该有预算窗口，实际 %+v", snap.Windows)
+	}
+	if len(snap.Period) == 0 {
+		t.Errorf("admin 可读时限额与明细应保留，实际为空；警告: %v", snap.Warnings)
+	}
+	if !hasWarning(snap.Warnings, "401") {
+		t.Errorf("应说明官方接口被拒，实际 %v", snap.Warnings)
+	}
+}
+
+// 会话 getter 遇到 401 要强制重登并重试一次 —— 只一次，多试只会撞上 Ory 的
+// 登录限流。
+func TestUsageSessionGetterRetriesOnceOn401(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer fresh" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(admin.Close)
+
+	var forced int
+	tokenFn := func(_ context.Context, force bool) (string, error) {
+		if force {
+			forced++
+			return "fresh", nil
+		}
+		return "stale", nil
+	}
+
+	get := newUsageSessionGetter(admin.Client(), admin.URL, tokenFn)
+	status, body, err := get(context.Background(), "/api/x", nil)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	if status != http.StatusOK || !strings.Contains(string(body), "ok") {
+		t.Errorf("401 后重登重试应成功，实际 status=%d body=%s", status, body)
+	}
+	if forced != 1 {
+		t.Errorf("应强制重登 1 次，实际 %d 次", forced)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("应发 2 次请求（原始 + 重试），实际 %d: %v", len(seen), seen)
+	}
+	if seen[0] != "Bearer stale" || seen[1] != "Bearer fresh" {
+		t.Errorf("两次请求的 token 不对: %v", seen)
+	}
+}
+
+// 重登拿回同一个 token 时不能再重试，否则会在 401 上打转。
+func TestUsageSessionGetterNoRetryLoopWhenTokenUnchanged(t *testing.T) {
+	var calls atomic.Int32
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(admin.Close)
+
+	var forced int
+	tokenFn := func(_ context.Context, force bool) (string, error) {
+		if force {
+			forced++
+		}
+		return "same", nil
+	}
+
+	get := newUsageSessionGetter(admin.Client(), admin.URL, tokenFn)
+	status, _, err := get(context.Background(), "/api/x", nil)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	if status != http.StatusUnauthorized {
+		t.Errorf("应把原来的 401 交给调用方，实际 %d", status)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("token 没变时不该重发请求，实际发了 %d 次", got)
+	}
+	if forced != 1 {
+		t.Errorf("应强制重登尝试 1 次，实际 %d 次", forced)
 	}
 }

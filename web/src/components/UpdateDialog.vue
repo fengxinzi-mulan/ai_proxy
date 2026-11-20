@@ -30,6 +30,10 @@ const busy = ref(false)
 // dismissed 记住「本次会话里用户已经关掉过弹框」，避免每次 SSE 推送都重新弹。
 // 但换了新版本号要复位 —— 否则「稍后」过一次，以后所有版本都被永久静音。
 const dismissed = ref(false)
+// 安装进行中用户主动关掉弹框：后续进度事件不能再把弹框顶回来。
+// 与 dismissed 分开：dismissed 是「这个版本不再提醒」，这里只表示「这次安装
+// 我不想盯着看」，安装本身照常推进。
+const userHidden = ref(false)
 
 const state = computed<UpdateState | null>(() => store.updateState)
 const installing = computed(() => store.updateInstalling)
@@ -85,10 +89,30 @@ function onState(s: UpdateState) {
     }
     return
   }
-  if (s.phase === 'restarting' || s.phase === 'applying') {
+
+  // 安装进行中：无论进度是哪儿发起的（设置页、自动更新、另一个标签页），
+  // 都要把弹框拉起来并启动兜底轮询 —— 只靠 SSE 的话，连接一断
+  // 进度条会永久冻在 downloading，用户既看不到结果也没法重试。
+  if (s.phase === 'downloading' || s.phase === 'verifying' || s.phase === 'applying' || s.phase === 'restarting') {
     busy.value = true
+    // 用户主动关掉的那次不该被下一条进度事件顶回来；安装本身照常推进。
+    if (!userHidden.value) show.value = true
+    if (pollTimer === null) startPollFallback()
     return
   }
+
+  // 重启后服务端回到 idle：说明新版本已经起来，页面里跑的还是旧前端的代码，
+  // 必须刷新才能加载新资源。这里延迟一点，等后端把窗口重新挂起来。
+  if (s.phase === 'idle' && (prev?.phase === 'restarting' || prev?.phase === 'applying')) {
+    busy.value = false
+    userHidden.value = false
+    stopPollFallback()
+    show.value = false
+    message.success('更新完成，正在重新加载页面…')
+    window.setTimeout(() => window.location.reload(), 1200)
+    return
+  }
+
   if (s.phase === 'idle' && s.hasUpdate && !s.skipped) {
     const isNew = !prev?.hasUpdate || prev.latestVersion !== s.latestVersion
     if (isNew && !dismissed.value) {
@@ -100,6 +124,8 @@ function onState(s: UpdateState) {
 defineExpose({
   /** 供 App.vue 的 SSE 回调转发。 */
   onState,
+  /** 首次拉到的快照里就是「安装中」时补一次弹框（App.vue bootstrap 之后调用）。 */
+  syncInstalling,
   /** 点侧边栏版本号：手动打开（会先强制检查一次）。 */
   open,
   /** 侧边栏小圆点用。 */
@@ -108,6 +134,7 @@ defineExpose({
 
 async function open() {
   dismissed.value = false
+  userHidden.value = false
   try {
     store.setUpdateState(await api.update.check())
   } catch (e) {
@@ -130,6 +157,7 @@ async function open() {
 async function startUpdate() {
   if (busy.value) return
   busy.value = true
+  userHidden.value = false
   show.value = true
   try {
     // 202 只表示「已受理」。真实进度全部走 SSE —— 不要用响应覆盖 store，
@@ -173,6 +201,19 @@ function startPollFallback() {
 
 onBeforeUnmount(stopPollFallback)
 
+/**
+ * 页面在安装过程中打开/刷新时，那条 SSE 事件已经错过了。
+ * 这里只补「正在安装」这几种状态：idle + 有新版本不自动弹，
+ * 否则每次刷新页面都会被更新弹框拦住。
+ */
+function syncInstalling() {
+  const s = store.updateState
+  if (!s) return
+  if (s.phase === 'downloading' || s.phase === 'verifying' || s.phase === 'applying' || s.phase === 'restarting') {
+    onState({ ...s })
+  }
+}
+
 async function skipThisVersion() {
   const v = state.value?.latestVersion ?? ''
   try {
@@ -193,7 +234,12 @@ async function skipThisVersion() {
  */
 function close() {
   show.value = false
-  if (!installing.value) dismissed.value = true
+  if (installing.value) {
+    // 安装中关窗只表示「不想盯着看」，别把后续进度事件又弹回来。
+    userHidden.value = true
+    return
+  }
+  dismissed.value = true
 }
 
 function openReleasePage() {
@@ -267,13 +313,25 @@ watch(installing, (v, old) => {
         <template v-else>
           <NButton quaternary @click="close">稍后</NButton>
           <NButton v-if="state?.hasUpdate" quaternary @click="skipThisVersion">跳过此版本</NButton>
-          <NButton v-if="state?.canAutoInstall" type="primary" :loading="busy" @click="startUpdate">
+          <!-- 没有新版本时不能出现「立即更新」：重启后的状态里 latestVersion 仍带着
+               上一次的版本号，只看 canAutoInstall 会给出一个点了没反应的按钮。 -->
+          <NButton
+            v-if="state?.hasUpdate && state?.canAutoInstall"
+            type="primary"
+            :loading="busy"
+            @click="startUpdate"
+          >
             <template #icon>
               <NIcon :size="15"><Download /></NIcon>
             </template>
             立即更新
           </NButton>
-          <NButton v-else type="primary" :disabled="!state?.htmlUrl" @click="openReleasePage">
+          <NButton
+            v-else-if="state?.hasUpdate"
+            type="primary"
+            :disabled="!state?.htmlUrl"
+            @click="openReleasePage"
+          >
             打开下载页
           </NButton>
         </template>

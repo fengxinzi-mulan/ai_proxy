@@ -8,6 +8,7 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { useMessage, NTooltip } from 'naive-ui'
 import { useAppStore } from '@/stores/app'
+import { copyText } from '@/utils/clipboard'
 
 const store = useAppStore()
 const message = useMessage()
@@ -19,18 +20,20 @@ const shortName = computed(() => active.value?.name ?? '<短名>')
 const copied = ref(false)
 let resetTimer: number | undefined
 
-function copy() {
-  navigator.clipboard.writeText(url.value).then(
-    () => {
-      message.success('已复制')
-      copied.value = true
-      window.clearTimeout(resetTimer)
-      resetTimer = window.setTimeout(() => {
-        copied.value = false
-      }, 1400)
-    },
-    () => message.error('复制失败'),
-  )
+async function copy() {
+  try {
+    // 局域网 http 下没有 navigator.clipboard，交给 copyText 走降级路径。
+    await copyText(url.value)
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : '复制失败')
+    return
+  }
+  message.success('已复制')
+  copied.value = true
+  window.clearTimeout(resetTimer)
+  resetTimer = window.setTimeout(() => {
+    copied.value = false
+  }, 1400)
 }
 
 onBeforeUnmount(() => window.clearTimeout(resetTimer))

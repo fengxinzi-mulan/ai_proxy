@@ -19,6 +19,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -36,8 +37,11 @@ const (
 	// maxCompressPixels 是单张图片的像素上限（约 50MP）。超过就不解码 ——
 	// 解码一张 100MP 的图要吃掉几百 MB 内存，而它大概率是攻击或误操作。
 	maxCompressPixels = 50_000_000
-	// maxCompressImages 是单次请求最多处理的图片张数。
+	// maxCompressImages 是单次请求最多**尝试**压缩的图片张数。
 	// 多图会话（Codex 一次贴十几张）很常见，但再多的请求本身就该被限流了。
+	//
+	// 按尝试次数而不是成功次数封顶：「压完没变小」的图不会增加成功计数，
+	// 一批这样的图就能让请求逐张解码几十次，白烧 CPU 还拖长首字节。
 	maxCompressImages = 16
 	// maxCompressBase64 是单张图片 base64 串的长度上限（约 20 MB 原始字节）。
 	maxCompressBase64 = 20 << 20
@@ -89,7 +93,25 @@ type compressStats struct {
 	Count int
 	// SavedBytes 是 base64 串长度的净减少量，也就是实际省下的请求字节。
 	SavedBytes int64
+	// attempted 是已经尝试过解码压缩的张数（不论最后有没有变小）。
+	// 上限按它来卡，见 maxCompressImages 的说明。
+	attempted int
 }
+
+// takeAttempt 申请一次压缩尝试；超过上限返回 false。
+//
+// 调用方在**准备解码**前调用一次，成功改写与否都不退还：
+// 花掉的 CPU 不会因为「压完没变小」而回来。
+func (st *compressStats) takeAttempt() bool {
+	if st.attempted >= maxCompressImages {
+		return false
+	}
+	st.attempted++
+	return true
+}
+
+// exhausted 报告是否已经用满尝试额度。
+func (st *compressStats) exhausted() bool { return st.attempted >= maxCompressImages }
 
 // compressImagesInBody 递归遍历请求体，压缩其中所有内联图片。
 //
@@ -108,7 +130,7 @@ func compressImagesInBody(obj map[string]any, opt model.ImageCompressSettings) c
 // Responses 续传的 input 指纹每轮都变 → 续传全部失效。
 // 这不是理论风险：多图会话正好踩在 16 这个边界上。
 func walkImages(node any, opt model.ImageCompressSettings, st *compressStats) {
-	if st.Count >= maxCompressImages {
+	if st.exhausted() {
 		return
 	}
 	switch v := node.(type) {
@@ -124,12 +146,12 @@ func walkImages(node any, opt model.ImageCompressSettings, st *compressStats) {
 		sort.Strings(keys)
 
 		for _, key := range keys {
-			if st.Count >= maxCompressImages {
+			if st.exhausted() {
 				return
 			}
 			child := v[key]
 			if s, ok := child.(string); ok {
-				if imageKeys[key] && isDataImageURL(s) {
+				if imageKeys[key] && isDataImageURL(s) && st.takeAttempt() {
 					if out, ok := compressDataURL(s, opt); ok {
 						v[key] = out
 						st.Count++
@@ -142,7 +164,7 @@ func walkImages(node any, opt model.ImageCompressSettings, st *compressStats) {
 		}
 	case []any:
 		for _, child := range v {
-			if st.Count >= maxCompressImages {
+			if st.exhausted() {
 				return
 			}
 			walkImages(child, opt, st)
@@ -154,7 +176,7 @@ func walkImages(node any, opt model.ImageCompressSettings, st *compressStats) {
 //
 // source.type 为 "url" 时是远程图片，不下载、不动；只处理 base64。
 func compressAnthropicImage(node map[string]any, opt model.ImageCompressSettings, st *compressStats) {
-	if st.Count >= maxCompressImages {
+	if st.exhausted() {
 		return
 	}
 	src, ok := node["source"].(map[string]any)
@@ -172,6 +194,9 @@ func compressAnthropicImage(node map[string]any, opt model.ImageCompressSettings
 	if !strings.HasPrefix(mime, "image/") {
 		return
 	}
+	if !st.takeAttempt() {
+		return
+	}
 	out, outMime, ok := compressBase64Image(raw, mime, opt)
 	if !ok {
 		return
@@ -187,11 +212,11 @@ func compressAnthropicImage(node map[string]any, opt model.ImageCompressSettings
 // 注意 Gemini 的 data 字段**不带** data: 前缀，是裸 base64，
 // 所以不能走 isDataImageURL 那条路。
 func compressGeminiImage(node map[string]any, opt model.ImageCompressSettings, st *compressStats) {
-	if st.Count >= maxCompressImages {
+	if st.exhausted() {
 		return
 	}
 	for _, key := range []string{"inlineData", "inline_data"} {
-		if st.Count >= maxCompressImages {
+		if st.exhausted() {
 			return
 		}
 		inline, ok := node[key].(map[string]any)
@@ -208,6 +233,9 @@ func compressGeminiImage(node map[string]any, opt model.ImageCompressSettings, s
 		raw, ok := inline["data"].(string)
 		if !ok || raw == "" {
 			continue
+		}
+		if !st.takeAttempt() {
+			return
 		}
 		out, outMime, ok := compressBase64Image(raw, mime, opt)
 		if !ok {
@@ -305,6 +333,16 @@ func compressImageBytes(raw []byte, mime string, opt model.ImageCompressSettings
 		return raw, mime, false
 	}
 
+	// 手机竖拍的照片像素本身是横的，方向靠 EXIF Orientation 表示。Go 的解码器
+	// 不认这个标记，不转像素就会把竖图压成横图甚至倒图（客户端看原图正常，
+	// 看压过的图是歪的）。重编码后 EXIF 会整段丢掉，所以必须在缩放前真的把
+	// 像素摆正 —— 而且要在缩放之前，因为 5~8 会交换宽高。
+	if format == "jpeg" {
+		if orientation := jpegExifOrientation(raw); orientation > 1 {
+			img = applyOrientation(img, orientation)
+		}
+	}
+
 	if overEdge {
 		img = scaleToMaxEdge(img, opt.MaxEdge)
 	}
@@ -391,4 +429,144 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------- EXIF Orientation ----------
+
+// jpegExifOrientation 读取 JPEG 的 EXIF Orientation（1~8）。
+//
+// 只认 JPEG 的 APP1 Exif 段；没有这段、结构不认识、值越界都返回 0，
+// 调用方按「不需要旋转」处理 —— 任何解析失败都不该改变图片内容。
+func jpegExifOrientation(raw []byte) int {
+	if len(raw) < 4 || raw[0] != 0xFF || raw[1] != 0xD8 {
+		return 0
+	}
+	// 从 SOI 之后逐个 marker 走：跳过无长度的 standalone 标记，
+	// 遇到扫描数据（SOS）或图像结束（EOI）就说明 EXIF 不存在了。
+	p := 2
+	for p+4 <= len(raw) {
+		if raw[p] != 0xFF {
+			return 0
+		}
+		marker := raw[p+1]
+		switch {
+		case marker == 0xFF:
+			// 填充字节，跳过即可。
+			p++
+			continue
+		case marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7):
+			p += 2
+			continue
+		case marker == 0xDA || marker == 0xD9:
+			return 0
+		}
+		size := int(raw[p+2])<<8 | int(raw[p+3])
+		if size < 2 {
+			return 0
+		}
+		start := p + 4
+		end := p + 2 + size
+		if end > len(raw) || start > end {
+			return 0
+		}
+		if marker == 0xE1 {
+			if o := exifOrientationFromAPP1(raw[start:end]); o != 0 {
+				return o
+			}
+		}
+		p = end
+	}
+	return 0
+}
+
+// exifOrientationFromAPP1 从 APP1 段的 TIFF 头里取 Orientation 标签。
+func exifOrientationFromAPP1(seg []byte) int {
+	const exifHeader = "Exif\x00\x00"
+	if len(seg) < len(exifHeader)+8 || string(seg[:len(exifHeader)]) != exifHeader {
+		return 0
+	}
+	tiff := seg[len(exifHeader):]
+
+	var order binary.ByteOrder
+	switch string(tiff[:2]) {
+	case "II":
+		order = binary.LittleEndian
+	case "MM":
+		order = binary.BigEndian
+	default:
+		return 0
+	}
+	// TIFF 头：42 是固定魔数，接着是 IFD0 的偏移。
+	if order.Uint16(tiff[2:4]) != 42 {
+		return 0
+	}
+	ifd := int(order.Uint32(tiff[4:8]))
+	if ifd < 8 || ifd+2 > len(tiff) {
+		return 0
+	}
+	count := int(order.Uint16(tiff[ifd : ifd+2]))
+	off := ifd + 2
+	for i := 0; i < count; i++ {
+		if off+12 > len(tiff) {
+			return 0
+		}
+		entry := tiff[off : off+12]
+		if order.Uint16(entry[0:2]) == 0x0112 {
+			// 类型 3 = SHORT，值内联在 4 字节值域的前两个字节里。
+			if order.Uint16(entry[2:4]) != 3 || order.Uint32(entry[4:8]) < 1 {
+				return 0
+			}
+			v := int(order.Uint16(entry[8:10]))
+			if v >= 1 && v <= 8 {
+				return v
+			}
+			return 0
+		}
+		off += 12
+	}
+	return 0
+}
+
+// applyOrientation 按 EXIF Orientation 把像素摆正（1~8 的旋转/镜像组合）。
+//
+// 定向映射（src 坐标 → dst 坐标）：
+//
+//	2 水平镜像     3 旋转 180°    4 垂直镜像
+//	5 对角转置     6 顺时针 90°   7 反对角转置   8 逆时针 90°
+//
+// 5~8 会交换宽高，所以目标画布尺寸要跟着换。
+func applyOrientation(src image.Image, orientation int) image.Image {
+	if orientation <= 1 || orientation > 8 {
+		return src
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dw, dh := w, h
+	if orientation >= 5 {
+		dw, dh = h, w
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			var dx, dy int
+			switch orientation {
+			case 2:
+				dx, dy = w-1-x, y
+			case 3:
+				dx, dy = w-1-x, h-1-y
+			case 4:
+				dx, dy = x, h-1-y
+			case 5:
+				dx, dy = y, x
+			case 6:
+				dx, dy = h-1-y, x
+			case 7:
+				dx, dy = h-1-y, w-1-x
+			case 8:
+				dx, dy = y, w-1-x
+			}
+			dst.Set(dx, dy, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
 }

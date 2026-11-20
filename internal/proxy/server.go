@@ -9,6 +9,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"ai_proxy/internal/hub"
 	"ai_proxy/internal/model"
@@ -129,9 +131,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 而 Gemini 这两项都不在请求体里（模型在路径上，流式靠 :streamGenerateContent / alt=sse）。
 	in.model = modelNameForRequest(prov.APIFormat, in.clientPath, reqBody)
 	in.wantStream = requestWantsStream(prov.APIFormat, in.clientPath, r.URL.RawQuery, reqBody)
-	// 响应按「这次请求实际用的协议」解析，而不是供应商配置的协议：
-	// DSH 会同时打 /v1/chat/completions 和 /v1/responses，供应商却只能配一种。
-	in.format = effectiveFormat(prov.APIFormat, in.clientPath)
 
 	// 模型映射：把客户端请求的模型名换成目标模型名。非 Gemini 的格式模型名在请求体里，
 	// 由 rewriteRequestBody 改写；Gemini 的模型名在 URL 路径上，必须在拼上游地址之前
@@ -143,12 +142,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 会话标识先于改写算好：prompt_cache_key 要用它保持多轮稳定。
-	// 端点判定也要用「真正发往上游的那条路径」：配了 CustomPath 时客户端路径被完全
-	// 接管，按客户端路径判会误判成「不知道是不是生成端点」而漏注入。
+	// 会话标识与端点路径先于改写算好：prompt_cache_key 与实际协议判定都要用
+	// 「真正发往上游的那条路径」（配了 CustomPath 时客户端路径被完全接管）。
+	endpointPath := upstreamEndpointPath(prov, in.upstreamPath)
+	// 响应与请求改写都按「这次请求实际用的协议」走，而不是供应商配置的静态协议：
+	// DSH 会同时打 /v1/chat/completions 和 /v1/responses，供应商却只能配一种。
+	in.format = effectiveFormat(prov.APIFormat, endpointPath)
+
 	rewritten := rewriteRequest(prov, settings, reqBody, in.model, rewriteOptions{
 		cacheKeySeed: sessionCacheSeed(r),
-		clientPath:   upstreamEndpointPath(prov, in.upstreamPath),
+		clientPath:   endpointPath,
+		format:       in.format,
 	})
 	in.outBody = rewritten.Body
 	in.modifications = rewritten.Modifications
@@ -223,6 +227,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput
 		s.failWith(w, in, http.StatusBadGateway, err.Error())
 		return
 	}
+	// 客户端可能用 ?key=<代理访问密钥> 通过本代理鉴权（Gemini SDK 的旧写法）。
+	// 那是给本代理看的，绝不能随 URL 发给上游，更不能落进请求日志。
+	target = stripProxyKeyFromURL(target, in.settings.AccessKey)
 
 	key, _ := s.keys.Pick(prov)
 	// 续传改写必须在选定 key 之后：链按 provider+model+key+session 隔离，
@@ -275,17 +282,18 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, in forwardInput
 	// 按状态码决定是否让该密钥进入冷却。
 	s.keys.Report(prov.ID, key.ID, resp.StatusCode, "")
 
-	// 非流式 chat 响应可能要改写 content 数组，长度会随之变化。必须在写响应头
-	// 之前把上游的 Content-Length 摘掉，让 Go 走分块传输，否则客户端会按旧长度
-	// 截断或一直等剩余字节。
-	if in.apiFormat() == model.FormatOpenAI &&
-		!isEventStream(resp.Header.Get("Content-Type")) &&
-		!hasNonIdentityEncoding(resp.Header.Get("Content-Encoding")) {
+	// 未压缩且响应体可能被改写（OpenAI chat 归一化或剥离 usage 块）时，长度会随之变化，
+	// 必须在写响应头之前把上游的 Content-Length 摘掉，让 Go 走分块传输，
+	// 否则客户端会按旧长度截断或一直等剩余字节。
+	// 上游已压缩时 relay 会原样转发压缩字节，绝不能删 Content-Encoding。
+	respCompressed := hasNonIdentityEncoding(resp.Header.Get("Content-Encoding"))
+	mayMutateResp := !respCompressed && (prov.StripUsageChunk || in.apiFormat() == model.FormatOpenAI)
+	if mayMutateResp {
 		resp.Header.Del("Content-Length")
 		resp.ContentLength = -1
 	}
 
-	copyResponseHeaders(w.Header(), resp.Header, prov.StripUsageChunk)
+	copyResponseHeaders(w.Header(), resp.Header, mayMutateResp)
 	w.WriteHeader(resp.StatusCode)
 
 	res := s.relay(w, r, resp, in, liveID)
@@ -895,12 +903,16 @@ func buildUpstreamHeaders(r *http.Request, prov model.Provider, key model.APIKey
 
 	// 客户端为了通过本代理的鉴权，常把代理访问密钥填进 API key 字段。
 	// 那是给本代理看的，绝不能转发给上游 —— 供应商没配密钥（「客户端持钥」模式）时
-	// 尤其危险，会把代理密钥直接泄露给上游。这里不挑头名，凡是值里带着访问密钥的
-	// 一律删掉。
+	// 尤其危险，会把代理密钥直接泄露给上游。
+	// 始终剔除 X-AI-Proxy-Key；其余头仅在值精确等于访问密钥或 "Bearer <访问密钥>" 时删除，
+	// 避免较短的访问密钥误伤 User-Agent 等普通请求头。
+	out.Del("X-AI-Proxy-Key")
 	if accessKey != "" {
 		for name, values := range out {
 			for _, v := range values {
-				if strings.Contains(v, accessKey) {
+				trimmed := strings.TrimSpace(v)
+				if constantTimeEqual(trimmed, accessKey) ||
+					isBearerOf(trimmed, accessKey) {
 					out.Del(name)
 					break
 				}
@@ -924,7 +936,8 @@ func buildUpstreamHeaders(r *http.Request, prov model.Provider, key model.APIKey
 }
 
 // copyResponseHeaders 把上游响应头写给客户端。
-func copyResponseHeaders(dst, src http.Header, stripUsage bool) {
+// dropContentLength 为 true 表示后续会改写响应体（且响应未压缩），必须丢弃 Content-Length。
+func copyResponseHeaders(dst, src http.Header, dropContentLength bool) {
 	extraHop := map[string]bool{}
 	for _, v := range src.Values("Connection") {
 		for _, item := range strings.Split(v, ",") {
@@ -938,8 +951,7 @@ func copyResponseHeaders(dst, src http.Header, stripUsage bool) {
 		if hopByHopHeaders[canonical] || extraHop[canonical] {
 			continue
 		}
-		// 剥离 usage 块会改变响应体长度，这两个头必须丢弃。
-		if stripUsage && (canonical == "Content-Length" || canonical == "Content-Encoding") {
+		if dropContentLength && canonical == "Content-Length" {
 			continue
 		}
 		dst[canonical] = append([]string(nil), values...)
@@ -990,7 +1002,11 @@ func (c *capture) string() string {
 	if len(c.buf) == 0 {
 		return ""
 	}
-	s := string(c.buf)
+	buf := c.buf
+	if c.over {
+		buf = trimInvalidUTF8Tail(buf)
+	}
+	s := string(buf)
 	if c.over {
 		s += "\n…（内容超出上限，已截断）"
 	}
@@ -1004,7 +1020,22 @@ func truncate(b []byte, limit int) string {
 	if limit <= 0 || len(b) <= limit {
 		return string(b)
 	}
-	return string(b[:limit]) + "\n…（内容超出上限，已截断）"
+	return string(trimInvalidUTF8Tail(b[:limit])) + "\n…（内容超出上限，已截断）"
+}
+
+// trimInvalidUTF8Tail 去掉截断末尾可能残留的不完整 UTF-8 字节序列。
+func trimInvalidUTF8Tail(b []byte) []byte {
+	n := len(b)
+	// UTF-8 字符最多 4 字节，最多往回退 3 字节就能对齐到合法 rune 边界。
+	for i := 1; i <= 3 && i <= n; i++ {
+		if utf8.RuneStart(b[n-i]) {
+			if utf8.Valid(b[n-i:]) {
+				return b
+			}
+			return b[:n-i]
+		}
+	}
+	return b
 }
 
 // sanitizeHeaders 把请求头渲染成可读文本，并抹掉凭据。
@@ -1056,18 +1087,78 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+func constantTimeEqual(a, b string) bool {
+	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// isBearerOf 判断 value 是否是 "Bearer <token>"（前缀大小写不敏感）。
+//
+// 认证方案名按 RFC 7235 是大小写不敏感的，客户端写 "bearer xxx" 也得认；
+// 常量时间比较只用于 token 本身。
+func isBearerOf(value, token string) bool {
+	const prefix = "Bearer "
+	if len(value) < len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
+		return false
+	}
+	return constantTimeEqual(strings.TrimSpace(value[len(prefix):]), token)
+}
+
+// stripProxyKeyFromURL 删掉查询串里值等于代理访问密钥的参数。
+//
+// Gemini 系的客户端习惯把密钥放在 ?key=…（也有 api_key / token 的写法）。
+// 客户端把「代理访问密钥」填进去时，不删就会连 URL 一起转发给上游，
+// 并原样写进请求日志。只删值完全相等的参数，上游自己需要的 key 不受影响。
+func stripProxyKeyFromURL(raw, accessKey string) string {
+	if accessKey == "" || raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.RawQuery == "" {
+		return raw
+	}
+	q := u.Query()
+	changed := false
+	for name, values := range q {
+		kept := make([]string, 0, len(values))
+		removed := false
+		for _, v := range values {
+			if constantTimeEqual(v, accessKey) {
+				removed = true
+				continue
+			}
+			kept = append(kept, v)
+		}
+		if !removed {
+			continue
+		}
+		changed = true
+		if len(kept) == 0 {
+			q.Del(name)
+		} else {
+			q[name] = kept
+		}
+	}
+	if !changed {
+		return raw
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // authorized 在配置了访问密钥时校验请求。
+// 兼容 OpenAI（Authorization: Bearer）、Anthropic（x-api-key）、Gemini（x-goog-api-key）
+// 与自定义头（X-AI-Proxy-Key）。
 func (s *Server) authorized(r *http.Request, st model.Settings) bool {
 	if st.AccessKey == "" {
 		return true
 	}
-	if r.Header.Get("X-AI-Proxy-Key") == st.AccessKey {
-		return true
-	}
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		if strings.TrimPrefix(auth, "Bearer ") == st.AccessKey {
+	for _, h := range []string{"X-AI-Proxy-Key", "x-api-key", "x-goog-api-key"} {
+		if constantTimeEqual(r.Header.Get(h), st.AccessKey) {
 			return true
 		}
+	}
+	if auth := r.Header.Get("Authorization"); isBearerOf(auth, st.AccessKey) {
+		return true
 	}
 	return false
 }

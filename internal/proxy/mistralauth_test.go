@@ -321,3 +321,92 @@ func TestMistralLoginWithCSRF(t *testing.T) {
 		t.Fatalf("浏览器流程（有 CSRF）应能登录，实际报错: %v", err)
 	}
 }
+
+// 缓存键必须带上密码：同一账号改了密码之后，按账号缓存的那份旧 session
+// 会被上游判失效，而缓存还没过期，于是每次查询都撞 401。
+func TestMistralSessionCacheKeyIncludesPassword(t *testing.T) {
+	mock := &mistralAuthMock{
+		account:   "user@example.com",
+		password:  "secret",
+		expiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	srv := mock.start(t)
+
+	sess := newMistralSession()
+	for i := 0; i < 2; i++ {
+		if _, err := sess.Token(context.Background(), srv.Client(), mock.account, mock.password, false); err != nil {
+			t.Fatalf("第 %d 次登录失败: %v", i+1, err)
+		}
+	}
+	if got := mock.flowCalls.Load(); got != 1 {
+		t.Fatalf("相同凭据应命中缓存，实际登录 %d 次", got)
+	}
+
+	// 换密码 → 换缓存项 → 必须重新登录（这里故意用错密码，登录会失败）。
+	if _, err := sess.Token(context.Background(), srv.Client(), mock.account, "another-password", false); err == nil {
+		t.Fatal("密码不对时应报错")
+	}
+	if got := mock.flowCalls.Load(); got != 2 {
+		t.Errorf("换密码后应重新登录，期望 2 次实际 %d 次", got)
+	}
+
+	// 失败的那次不该清掉原密码的缓存。
+	if _, err := sess.Token(context.Background(), srv.Client(), mock.account, mock.password, false); err != nil {
+		t.Fatalf("原密码的缓存不该被清掉: %v", err)
+	}
+	if got := mock.flowCalls.Load(); got != 2 {
+		t.Errorf("原密码应仍在缓存里，实际登录 %d 次", got)
+	}
+}
+
+// Ory 的节点值不全是字符串（复选框是 bool，数字输入是 number）。
+// 给成 string 会让整份响应用 Unmarshal 直接失败。
+func TestParseMistralFlowNonStringValues(t *testing.T) {
+	body := []byte(`{"state":"choose_method","ui":{
+		"nodes":[
+			{"attributes":{"name":"csrf_token","value":null},"messages":[]},
+			{"attributes":{"name":"remember_me","value":true},"messages":[]},
+			{"attributes":{"name":"captcha_code","value":1234},"messages":[]},
+			{"attributes":{"name":"identifier","value":"user@example.com"},"messages":[]}
+		],
+		"messages":[{"type":"error","text":"Too many login attempts, please retry later."}]
+	}}`)
+
+	flow, err := parseMistralFlow(body)
+	if err != nil {
+		t.Fatalf("节点值不是字符串时也应能解析: %v", err)
+	}
+	if got := flow.nodeValue("identifier"); got != "user@example.com" {
+		t.Errorf("字符串值应原样返回，实际 %q", got)
+	}
+	if got := flow.nodeValue("remember_me"); got != "true" {
+		t.Errorf("bool 值应转成可读文本，实际 %q", got)
+	}
+	if got := flow.nodeValue("captcha_code"); got != "1234" {
+		t.Errorf("数字值应转成可读文本，实际 %q", got)
+	}
+	if got := flow.nodeValue("csrf_token"); got != "" {
+		t.Errorf("null 值应返回空串，实际 %q", got)
+	}
+
+	// ui.messages 是流程级错误（限流、会话失效），只看 ui.nodes 会漏掉它。
+	if got := flow.firstError(); !strings.Contains(got, "Too many login attempts") {
+		t.Errorf("应扫出顶层 ui.messages 里的错误，实际 %q", got)
+	}
+}
+
+// 节点上的错误优先于流程级消息：字段级提示对用户更具体。
+func TestParseMistralFlowNodeErrorWins(t *testing.T) {
+	body := []byte(`{"ui":{
+		"nodes":[{"attributes":{"name":"password","value":""},
+			"messages":[{"type":"error","text":"The provided credentials are invalid."}]}],
+		"messages":[{"type":"error","text":"flow level error"}]
+	}}`)
+	flow, err := parseMistralFlow(body)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if got := flow.firstError(); !strings.Contains(got, "credentials") {
+		t.Errorf("应优先返回节点上的错误，实际 %q", got)
+	}
+}

@@ -35,6 +35,19 @@ export const useAppStore = defineStore('app', () => {
       : false,
   )
 
+  /**
+   * 访问密钥变更的版本号。
+   *
+   * SSE（EventSource）无法改请求头、也改不了已建的连接：设置页保存了新密钥后，
+   * 旧连接带的还是旧密钥，服务端会一直回 401，且 EventSource 遇到非 2xx 不会重连。
+   * 所有 useEvents 实例都盯着这个版本号，一变更就整体重建连接。
+   */
+  const authVersion = ref(0)
+
+  function bumpAuthVersion() {
+    authVersion.value += 1
+  }
+
   // 更新状态放在 store 而不是 App.vue 的局部 ref：弹框（App.vue 的子组件）
   // 与设置页都要读同一份，两处各自拉一次必然漂移。
   const updateState = ref<UpdateState | null>(null)
@@ -91,15 +104,17 @@ export const useAppStore = defineStore('app', () => {
     updateState.value = s
   }
 
-  /** 跟随系统主题变化。只在 mode=system 时影响实际配色。 */
-  function watchSystemTheme() {
-    if (typeof window === 'undefined' || !window.matchMedia) return
+  /** 跟随系统主题变化。只在 mode=system 时影响实际配色。返回取消监听的函数。 */
+  function watchSystemTheme(): () => void {
+    if (typeof window === 'undefined' || !window.matchMedia) return () => {}
     const mq = window.matchMedia('(prefers-color-scheme: dark)')
     const onChange = (e: MediaQueryListEvent) => {
       systemDark.value = e.matches
       applyTheme()
     }
     mq.addEventListener('change', onChange)
+    // 组件卸载/OAuth 等场景下如果不摘监听，热更新会一层层叠加回调。
+    return () => mq.removeEventListener('change', onChange)
   }
 
   function applyTheme() {
@@ -145,9 +160,21 @@ export const useAppStore = defineStore('app', () => {
     settings.value = await api.getSettings()
   }
 
-  /** 切换「当前生效」供应商。 */
+  /**
+   * 切换「当前生效」供应商。
+   *
+   * 服务端在 activate 里会顺带改掉所有供应商的 active 标记与排序，直接调
+   * reloadProviders 比拿激活接口的返回值覆盖列表更可靠（后者不含用量快照）。
+   *
+   * 快速连点两个供应商时只让最后一次负责刷新：先发的请求若后到，它带来的
+   * 列表会把新选择覆盖回旧值，顶栏显示就和实际生效不一致了。
+   */
+  let activateSeq = 0
   async function activate(id: number) {
-    providers.value = await api.activateProvider(id)
+    const seq = ++activateSeq
+    await api.activateProvider(id)
+    if (seq !== activateSeq) return
+    await reloadProviders()
   }
 
   /**
@@ -208,6 +235,8 @@ export const useAppStore = defineStore('app', () => {
     error,
     themeMode,
     dark,
+    authVersion,
+    bumpAuthVersion,
     isDesktop,
     version,
     usageRefreshing,

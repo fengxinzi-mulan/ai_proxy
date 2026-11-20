@@ -17,6 +17,7 @@ import {
 } from 'naive-ui'
 import { api } from '@/api'
 import type { RequestLog } from '@/types'
+import { copyText } from '@/utils/clipboard'
 import {
   OUTCOME_LABELS,
   cacheHitRateOf,
@@ -50,19 +51,24 @@ const loading = ref(false)
 const tab = ref('overview')
 
 // 列表接口不带报文正文，展开详情时再单独拉一次。
+// 连续点开两条记录时，先发的请求可能后到；只认最后一次打开的那条。
+let loadSeq = 0
 watch(
   () => [props.show, props.logId] as const,
   async ([show, id]) => {
     if (!show || !id) return
+    const seq = ++loadSeq
     loading.value = true
     log.value = null
     tab.value = 'overview'
     try {
-      log.value = await api.getLog(id)
+      const detail = await api.getLog(id)
+      if (seq !== loadSeq) return
+      log.value = detail
     } catch (e) {
-      message.error(e instanceof Error ? e.message : String(e))
+      if (seq === loadSeq) message.error(e instanceof Error ? e.message : String(e))
     } finally {
-      loading.value = false
+      if (seq === loadSeq) loading.value = false
     }
   },
 )
@@ -81,12 +87,15 @@ const contVerdict = computed(() =>
   ),
 )
 
-function copy(text: string | undefined) {
+async function copy(text: string | undefined) {
   if (!text) return
-  navigator.clipboard.writeText(text).then(
-    () => message.success('已复制'),
-    () => message.error('复制失败'),
-  )
+  try {
+    // 局域网 http 下没有 navigator.clipboard，交给 copyText 走降级路径。
+    await copyText(text)
+    message.success('已复制')
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : '复制失败')
+  }
 }
 
 const prettyReq = computed(() => prettyJSON(log.value?.reqBody))

@@ -32,11 +32,12 @@ type ProviderPreset struct {
 	// Changes 与下面的字段一一对应，供界面逐条展示。
 	Changes []PresetChange `json:"changes"`
 
-	StripUnsupportedParams *bool   `json:"stripUnsupportedParams,omitempty"`
-	PromptCacheKeyMode     *string `json:"promptCacheKeyMode,omitempty"`
-	UsageInjectMode        *string `json:"usageInjectMode,omitempty"`
-	ContinuationMode       *string `json:"continuationMode,omitempty"`
-	TimeoutSeconds         *int    `json:"timeoutSeconds,omitempty"`
+	StripUnsupportedParams      *bool   `json:"stripUnsupportedParams,omitempty"`
+	ReplayReasoningAsThinkChunk *bool   `json:"replayReasoningAsThinkChunk,omitempty"`
+	PromptCacheKeyMode          *string `json:"promptCacheKeyMode,omitempty"`
+	UsageInjectMode             *string `json:"usageInjectMode,omitempty"`
+	ContinuationMode            *string `json:"continuationMode,omitempty"`
+	TimeoutSeconds              *int    `json:"timeoutSeconds,omitempty"`
 	// MaxImagesPerRequest 是单请求图片数量上限；0 表示不限制（预设里不会出现 0，
 	// 想让上限「不限制」就别列这一项）。
 	MaxImagesPerRequest *int `json:"maxImagesPerRequest,omitempty"`
@@ -56,6 +57,11 @@ var providerPresets = []ProviderPreset{
 				Field:  "严格上游兼容",
 				Value:  "开启",
 				Reason: "messages schema 不允许多余字段：reasoning_content、store、name 这类回放字段会让整条请求 422",
+			},
+			{
+				Field:  "思维链还原（ThinkChunk）",
+				Value:  "开启",
+				Reason: "将客户端回放的 assistant.reasoning_content 还原为 Mistral 原生 thinking 内容块，避免多步工具调用间思维链断裂且保持前缀缓存稳定",
 			},
 			{
 				Field:  "prompt_cache_key",
@@ -88,13 +94,14 @@ var providerPresets = []ProviderPreset{
 				Reason: "逐张推进时丢弃边界每轮前移一格，「第一张保留下来的图」的位置跟着变，前缀缓存从那里断开、整段保留区全价重算；按 5 张一批推进后，图片数在 21~25 这段窗口里发出的是同一份 body，缓存照常命中，只有每长满 5 张才失效一次",
 			},
 		},
-		StripUnsupportedParams: boolPtr(true),
-		PromptCacheKeyMode:     strPtr(PromptCacheKeyAuto),
-		UsageInjectMode:        strPtr("off"),
-		ContinuationMode:       strPtr(ContinuationOff),
-		TimeoutSeconds:         intPtr(900),
-		MaxImagesPerRequest:    intPtr(20),
-		ImageTrimBatch:         intPtr(5),
+		StripUnsupportedParams:      boolPtr(true),
+		ReplayReasoningAsThinkChunk: boolPtr(true),
+		PromptCacheKeyMode:          strPtr(PromptCacheKeyAuto),
+		UsageInjectMode:             strPtr("off"),
+		ContinuationMode:            strPtr(ContinuationOff),
+		TimeoutSeconds:              intPtr(900),
+		MaxImagesPerRequest:         intPtr(20),
+		ImageTrimBatch:              intPtr(5),
 	},
 }
 
@@ -160,6 +167,10 @@ func (p ProviderPreset) Apply(prov *Provider) []string {
 		prov.StripUnsupportedParams = *p.StripUnsupportedParams
 		changed = append(changed, "stripUnsupportedParams")
 	}
+	if p.ReplayReasoningAsThinkChunk != nil && prov.ReplayReasoningAsThinkChunk != *p.ReplayReasoningAsThinkChunk {
+		prov.ReplayReasoningAsThinkChunk = *p.ReplayReasoningAsThinkChunk
+		changed = append(changed, "replayReasoningAsThinkChunk")
+	}
 	if p.PromptCacheKeyMode != nil && prov.PromptCacheKeyMode != *p.PromptCacheKeyMode {
 		prov.PromptCacheKeyMode = *p.PromptCacheKeyMode
 		changed = append(changed, "promptCacheKeyMode")
@@ -190,6 +201,9 @@ func (p ProviderPreset) Apply(prov *Provider) []string {
 // Applied 报告供应商当前是否已经符合该预设（界面用它决定要不要提示）。
 func (p ProviderPreset) Applied(prov Provider) bool {
 	if p.StripUnsupportedParams != nil && prov.StripUnsupportedParams != *p.StripUnsupportedParams {
+		return false
+	}
+	if p.ReplayReasoningAsThinkChunk != nil && prov.ReplayReasoningAsThinkChunk != *p.ReplayReasoningAsThinkChunk {
 		return false
 	}
 	if p.PromptCacheKeyMode != nil && prov.PromptCacheKeyMode != *p.PromptCacheKeyMode {

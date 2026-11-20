@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -194,7 +195,7 @@ func Start(o Options) (*Service, error) {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		runLogCleanup(rootCtx, st, o.Logger)
@@ -203,24 +204,15 @@ func Start(o Options) (*Service, error) {
 		defer wg.Done()
 		proxy.NewUsageRefresher(st, proxySrv, o.Logger).Run(rootCtx)
 	}()
+	// 启动后的自动检查也要计入后台任务组：它读过数据库、写过 KV，
+	// 不纳入 wg 的话 Shutdown 会在它还在跑的时候就把库关掉。
+	go func() {
+		defer wg.Done()
+		checkUpdatesOnStartup(rootCtx, updater, o.Logger)
+	}()
 	go func() {
 		wg.Wait()
 		close(s.done)
-	}()
-
-	// 启动后延迟一会儿再查更新：先把服务与界面拉起来，别让一次网络请求
-	// 拖慢启动。失败只记 debug —— 离线、被墙、限流都是常态。
-	go func() {
-		select {
-		case <-rootCtx.Done():
-			return
-		case <-time.After(8 * time.Second):
-		}
-		ctx, cancel := context.WithTimeout(rootCtx, 30*time.Second)
-		defer cancel()
-		if _, err := updater.Check(ctx, false); err != nil {
-			o.Logger.Debug("启动时检查更新失败", "err", err)
-		}
 	}()
 
 	go func() {
@@ -231,6 +223,27 @@ func Start(o Options) (*Service, error) {
 	}()
 
 	return s, nil
+}
+
+// 启动后延迟多久做首次更新检查：先把服务与界面拉起来，别让一次网络请求
+// 拖慢启动。失败只记 debug —— 离线、被墙、限流都是常态。
+const (
+	startupUpdateDelay   = 8 * time.Second
+	startupUpdateTimeout = 30 * time.Second
+)
+
+// checkUpdatesOnStartup 是启动时的一次性自动检查，受最小间隔节流。
+func checkUpdatesOnStartup(ctx context.Context, updater *update.Manager, logger *slog.Logger) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(startupUpdateDelay):
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, startupUpdateTimeout)
+	defer cancel()
+	if _, err := updater.Check(checkCtx, false); err != nil {
+		logger.Debug("启动时检查更新失败", "err", err)
+	}
 }
 
 // ListenError 表示端口监听失败，桌面模式据此区分「端口被占用」和别的错误。
@@ -255,16 +268,25 @@ func (s *Service) Port() int { return s.port }
 // URL 返回窗口/浏览器应当访问的地址。
 //
 // 监听通配地址时不能把 0.0.0.0 交给浏览器，统一折回回环地址。
+// 主机部分必须经 net.JoinHostPort 拼装：IPv6 字面量不带方括号时
+// "http://::1:8080/" 是无效 URL，窗口会直接打不开。
 func (s *Service) URL() string {
-	host := s.host
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
-	}
-	return fmt.Sprintf("http://%s:%d/", host, s.port)
+	return "http://" + net.JoinHostPort(displayHost(s.host), strconv.Itoa(s.port)) + "/"
 }
 
 // Store 暴露底层存储，桌面模式读写桌面配置时需要。
 func (s *Service) Store() *store.Store { return s.store }
+
+// SubscriberCount 返回管理界面当前的 SSE 订阅者数量。
+//
+// 桌面壳用它判断「关闭确认框能不能真的送到用户眼前」：没有订阅者时
+// 广播出去的事件没人接收，继续阻止关闭只会让窗口永久卡住。
+func (s *Service) SubscriberCount() int {
+	if s.hub == nil {
+		return 0
+	}
+	return s.hub.SubscriberCount()
+}
 
 // Broadcast 把事件推给管理界面的 SSE 订阅者。
 //
@@ -364,23 +386,46 @@ func maybeAutoVacuum(st *store.Store, logger *slog.Logger, last *time.Time) {
 
 // printBanner 打印启动信息，把最常用的几个地址直接给出来。
 func printBanner(settings model.Settings, actualPort int, logger *slog.Logger) {
-	base := fmt.Sprintf("http://%s:%d", displayHost(settings.Host), actualPort)
+	base := "http://" + net.JoinHostPort(displayHost(settings.Host), strconv.Itoa(actualPort))
 	logger.Info("服务已启动",
 		"管理界面", base+"/",
 		"代理入口", base+"/v1/…",
 		"按名指定供应商", base+"/p/<供应商短名>/v1/…",
-		"监听", fmt.Sprintf("%s:%d", settings.Host, actualPort),
+		"监听", listenAddr(settings.Host, actualPort),
 	)
 	if settings.Host != "127.0.0.1" && settings.Host != "localhost" && settings.AccessKey == "" {
 		logger.Warn("正在监听非本机地址但未设置访问密钥，同网段的任何人都能使用本代理")
 	}
 }
 
+// displayHost 把「不该原样交给浏览器」的监听地址折回回环地址。
+//
+// 空串、"0.0.0.0"、"::" 都是「监听所有网卡」，浏览器访问它们没有意义；
+// 已经带方括号的 IPv6 字面量（用户手填）去掉括号，交给 JoinHostPort 重新加。
 func displayHost(host string) string {
-	if host == "0.0.0.0" || host == "" {
+	host = strings.TrimSpace(host)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "*":
 		return "127.0.0.1"
 	}
 	return host
+}
+
+// listenAddr 把真实监听主机与端口拼成可读地址。
+//
+// 与 displayHost 不同，它保留通配地址（"::" 要打印成 "[::]:port" 而不是
+// 折回收环地址）——这里展示的是「实际监听在哪」。IPv6 的方括号由
+// JoinHostPort 统一补，用户手填的 "[::1]" 必须先脱括号，否则会变成
+// "[[::1]]:8080" 这种非法地址。
+func listenAddr(host string, port int) string {
+	host = strings.TrimSpace(host)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // staticHandler 负责把前端资源与其余请求分发到正确的处理器。

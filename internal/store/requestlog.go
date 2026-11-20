@@ -23,6 +23,12 @@ const logColumns = `id, ts_start, ts_end, provider_id, provider_name, upstream_u
 
 // tsToDB / tsFromDB 定义在 db.go，全 store 包共用同一套时间格式。
 
+// ErrLogFilterRequired 表示删除日志时一个筛选条件都没有给。
+//
+// 单独定义一个哨兵错误，是为了让管理接口能把「请求本身不合法」映射成 400，
+// 而把真正的数据库故障留在 500 —— 两者混在一起时，排查方向完全是反的。
+var ErrLogFilterRequired = errors.New("缺少删除条件，已拒绝清空全部日志")
+
 // InsertLog 写入一条请求日志，返回自增 ID。
 func (s *Store) InsertLog(l *model.RequestLog) (int64, error) {
 	mods, err := json.Marshal(l.Modifications)
@@ -119,7 +125,7 @@ func (s *Store) GetLog(id int64) (model.RequestLog, error) {
 func (s *Store) DeleteLogs(q model.LogQuery) (int64, error) {
 	where, args := buildLogFilter(q)
 	if where == "" {
-		return 0, errors.New("缺少删除条件，已拒绝清空全部日志")
+		return 0, ErrLogFilterRequired
 	}
 	res, err := s.db.Exec(`DELETE FROM request_logs`+where, args...)
 	if err != nil {

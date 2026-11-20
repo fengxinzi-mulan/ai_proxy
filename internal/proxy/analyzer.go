@@ -42,9 +42,11 @@ type analyzer struct {
 	responseStore  *bool
 	responseOutput []json.RawMessage
 
-	// estTokens 是增量累积的输出 token 估算值。
-	// 增量累加而不是留全文再估算，长响应下内存占用是常数级。
-	estTokens int
+	// estWide / estNarrow 是增量累积的输出字符数（按字计数 / 按 4 字符计数），
+	// 读取时才折算成 token。增量累加而不是留全文再估算，长响应下内存占用是
+	// 常数级；不逐块折算是因为每块各向上取整会把零头累加成虚高的估值。
+	estWide   int
+	estNarrow int
 }
 
 // newAnalyzer 依据响应类型选择解析路径。
@@ -181,7 +183,22 @@ func (a *analyzer) TerminalEvent(event, data string) bool {
 	case model.FormatOpenAI:
 		return data == "[DONE]"
 	case model.FormatAnthropic:
-		return event == "message_stop"
+		if event == "message_stop" {
+			return true
+		}
+		// 部分网关不写 `event:` 行，只在 data 里带 type。先做一次廉价的
+		// 子串预筛，避免给每个事件都解析一遍 JSON。
+		if event != "" || !strings.Contains(data, "message_stop") {
+			return false
+		}
+		obj, err := decodeJSONObject([]byte(data))
+		if err != nil {
+			return false
+		}
+		if typ, ok := getString(obj, "type"); ok && typ == "message_stop" {
+			return true
+		}
+		return false
 	default:
 		return false
 	}
@@ -191,7 +208,9 @@ func (a *analyzer) TerminalEvent(event, data string) bool {
 func (a *analyzer) Truncated() bool { return a.bodyOver }
 
 // EstimateOutputTokens 返回增量累积的输出 token 估算值。
-func (a *analyzer) EstimateOutputTokens() int { return a.estTokens }
+func (a *analyzer) EstimateOutputTokens() int {
+	return a.estWide + (a.estNarrow+3)/4
+}
 
 // Result 返回收敛后的用量。
 //
@@ -223,7 +242,9 @@ func (a *analyzer) IsUsageOnlyChunk(event, data string) bool {
 	if choices, ok := obj["choices"].([]any); ok && len(choices) > 0 {
 		return false
 	}
-	_, hasUsage := obj["usage"]
+	// 用 getMap 而不是查键名：`"usage": null` 是「有键没值」，同样没有用量，
+	// 按键名判定会把它当成用量块剥掉，客户端反而丢了本该转发的空块。
+	_, hasUsage := getMap(obj, "usage")
 	return hasUsage
 }
 
@@ -401,6 +422,16 @@ func (a *analyzer) captureResponsesObject(obj map[string]any) {
 }
 
 func (a *analyzer) handleAnthropic(event string, obj map[string]any) {
+	// 有些网关（自建中转、部分兼容层）不写 SSE 的 `event:` 行，只在 data 里带
+	// type。流式时按 type 补出事件名，否则 message_start 的 usage（在 message
+	// 里）与 content_block_delta 的正文全部会漏掉。
+	//
+	// 用 !a.streaming 区分非流式：非流式 JSON 响应同样带 type:"message"，
+	// 把它的 body 当 SSE 逐行解析只会得到一堆无意义的分支。
+	if event == "" && a.streaming {
+		event, _ = getString(obj, "type")
+	}
+
 	// Anthropic 的输入用量与输出用量分布在两个事件里，
 	// 必须按字段合并，不能整体覆盖。
 	usagePath := "usage"
@@ -465,7 +496,7 @@ func (a *analyzer) handleAnthropic(event string, obj map[string]any) {
 	}
 
 	// 非流式响应体：usage 在顶层，正文在 content 数组里。
-	if event == "" {
+	if !a.streaming {
 		if arr, ok := obj["content"].([]any); ok {
 			var sb strings.Builder
 			appendTextValue(arr, &sb)
@@ -525,16 +556,18 @@ func (a *analyzer) handleGemini(obj map[string]any) {
 // 却不适合参与 token 估算。
 func (a *analyzer) markContent() { a.gotContent = true }
 
-// addOutput 累积输出文本的 token 估算，同时标记已出现内容。
+// addOutput 累积输出文本的字符数（折算 token 在读取时做），同时标记已出现内容。
 //
-// 只累加估算值、不保留原文：长响应下内存占用是常数级的，
-// 而估算值恰好是「上游没给用量」时唯一需要的东西。
+// 只累加计数、不保留原文：长响应下内存占用是常数级的，
+// 而计数值恰好是「上游没给用量」时唯一需要的东西。
 func (a *analyzer) addOutput(s string) {
 	if s == "" {
 		return
 	}
 	a.markContent()
-	a.estTokens += estimateTokens(s)
+	wide, narrow := tokenClassCounts(s)
+	a.estWide += wide
+	a.estNarrow += narrow
 }
 
 // ---------- SSE 组帧 ----------

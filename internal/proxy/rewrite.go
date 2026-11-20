@@ -58,6 +58,8 @@ type rewriteOptions struct {
 	// clientPath 是客户端请求的路径（已去掉 /p/<供应商> 前缀）。
 	// prompt_cache_key 只被部分端点接受，必须按路径判定，见 cacheKeyEndpoints。
 	clientPath string
+	// format 是本次请求实际使用的协议（由路径推导），为空时回落到 prov.APIFormat。
+	format model.APIFormat
 }
 
 // rewriteRequestBodyOpts 是带上下文版本的改写入口。
@@ -74,21 +76,30 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 
 	mappedModel, mapped := prov.MapModel(modelName)
 
+	effFormat := opts.format
+	if effFormat == "" {
+		effFormat = prov.APIFormat
+	}
+
 	// stream_options 是 OpenAI chat/completions 特有的字段，
 	// 其余格式（anthropic / gemini / responses）要么本来就返回用量，
 	// 要么不认这个字段，一律不注入。
-	wantUsageInject := prov.APIFormat == model.FormatOpenAI && shouldInjectUsageOption(prov, st)
+	wantUsageInject := effFormat == model.FormatOpenAI && shouldInjectUsageOption(prov, st)
 	// responses 的 input 项缺 type 时上游会整条请求判 400，而 OpenAI 规范允许省略
 	// 这个字段，所以客户端省略不算写错。这是合规性修正，不设开关：客户端本来就
 	// 带 type 时它是空操作，不会留下改写标记。
-	wantResponsesFix := prov.APIFormat == model.FormatResponses
+	wantResponsesFix := effFormat == model.FormatResponses
 	// developer 角色归一化：OpenAI 新客户端（ZCode、DSH）会把系统消息写成
 	// role:"developer"，而 Mistral 这类严格上游只认 system/user/assistant/tool，
 	// 整条请求会 422。改名无损，直接对所有 OpenAI 系格式生效。
-	wantRoleFix := isOpenAIStyle(prov.APIFormat) && bytes.Contains(rawBody, []byte(`"developer"`))
+	wantRoleFix := isOpenAIStyle(effFormat) && bytes.Contains(rawBody, []byte(`"developer"`))
+	// Mistral 思维链对称还原：在剥离非标准字段之前，先把 assistant 消息里回放的
+	// reasoning_content 还原成 Mistral 原生 ThinkChunk，保留多步推理连贯性与前缀缓存。
+	wantReplayReasoning := prov.ReplayReasoningAsThinkChunk && isOpenAIStyle(effFormat) &&
+		bytes.Contains(rawBody, []byte(`"reasoning_content"`))
 	// thinking / reasoning_content 裁剪则相反：不少兼容网关确实认这些字段，
 	// 替用户做主会悄悄关掉推理或丢掉思维链回放，所以只在供应商显式开启严格兼容时才动。
-	wantStrip := prov.StripUnsupportedParams && isOpenAIStyle(prov.APIFormat) && hasUnsupportedParam(rawBody)
+	wantStrip := prov.StripUnsupportedParams && isOpenAIStyle(effFormat) && hasUnsupportedParam(rawBody)
 	// max_tokens 与 max_completion_tokens 是两个「同一个意思的名字」。有的上游只认前者
 	// （Mistral 的 ChatCompletionRequest 只有 max_tokens），有的只认后者（OpenAI 新模型），
 	// 同时带上就是非法输入。这是纯粹的同义重复，不涉及用户意图取舍，所以无条件下消解。
@@ -102,9 +113,9 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 	// 光看供应商还不够 —— 同一个 Mistral key 下，只有生成类端点认这个字段，
 	// embeddings / moderations / ocr 一律 422，所以还要按路径判定。
 	wantCacheKey := prov.PromptCacheKeyMode == model.PromptCacheKeyAuto &&
-		isOpenAIStyle(prov.APIFormat) && cacheKeyApplies(opts.clientPath)
+		isOpenAIStyle(effFormat) && cacheKeyApplies(opts.clientPath)
 	promptText, promptStrategy, hasPrompt := resolvePromptForModel(prov, st, modelName, mappedModel, mapped)
-	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantStrip && !wantCacheKey && !wantImageCompress && !wantMergeMaxTokens && !wantImageLimit {
+	if !wantUsageInject && !hasPrompt && !wantResponsesFix && !mapped && !wantRoleFix && !wantReplayReasoning && !wantStrip && !wantCacheKey && !wantImageCompress && !wantMergeMaxTokens && !wantImageLimit {
 		return rewriteResult{Body: rawBody}
 	}
 
@@ -138,13 +149,22 @@ func rewriteRequest(prov model.Provider, st model.Settings, rawBody []byte, mode
 		}
 	}
 	if hasPrompt {
-		if applyPrompt(obj, prov.APIFormat, promptText, promptStrategy) {
+		promptFormat := effFormat
+		if isOpenAIStyle(promptFormat) && isResponsesShaped(obj) {
+			promptFormat = model.FormatResponses
+		}
+		if applyPrompt(obj, promptFormat, promptText, promptStrategy) {
 			mods = append(mods, "prompt_"+promptStrategy)
 		}
 	}
 	// 放在提示词注入之后：注入出来的项同样会被补齐，最终发出去的 body 一律合规。
-	if wantResponsesFix && normalizeResponsesInput(obj) {
+	if (wantResponsesFix || (isOpenAIStyle(effFormat) && isResponsesShaped(obj))) && normalizeResponsesInput(obj) {
 		mods = append(mods, "responses_input_type")
+	}
+	// 放在严格字段裁剪之前：先把 assistant.reasoning_content 还原进 content 的 ThinkChunk，
+	// 其余角色或空串的 reasoning_content 仍交给后面的 stripChatMessageExtraFields 清理。
+	if wantReplayReasoning && replayAssistantReasoningAsThinkChunk(obj) {
+		mods = append(mods, "reasoning_to_think_chunk")
 	}
 	if wantStrip {
 		// 续传真的要用 store 时才保留它；其余情况下 Responses 的 store 也要裁
@@ -258,19 +278,31 @@ var chatMessageExtraFields = []string{
 }
 
 // prefilterParams 是 hasUnsupportedParam 的字节预筛清单
-// （顶层 ∪ 消息级 ∪ name ∪ 严格上游不认的工具/输入项类型）。
+// （顶层 ∪ 消息级 ∪ name ∪ 严格上游不认的工具/输入项类型 ∪ tool_choice）。
+//
+// 直接从各裁剪表自动汇总，避免往裁剪表新增项时漏改预筛清单导致整项裁剪被跳过。
 var prefilterParams = func() []string {
-	out := make([]string, 0, len(chatUnsupportedTopLevelParams)+len(chatMessageExtraFields)+20)
-	out = append(out, chatUnsupportedTopLevelParams...)
-	out = append(out, chatMessageExtraFields...)
-	out = append(out, "name", "previous_response_id")
-	// Responses 上「只认固定值」的几个顶层字段：值不合规就是整条 400，但字段名本身
-	// 是合法的，所以不能无条件删，只能按值判断（见 stripResponsesFixedValueParams）。
-	out = append(out, "truncation", "background", "metadata")
-	// 内置工具与 Responses 输入项的类型名：命中才值得把 body 解析成 JSON。
-	out = append(out, "web_search", "namespace", "local_shell", "file_search",
-		"code_interpreter", "image_generation", "item_reference", "compaction",
-		"mcp_call", "encrypted_content")
+	seen := map[string]bool{}
+	var out []string
+	add := func(keys ...string) {
+		for _, k := range keys {
+			if k != "" && !seen[k] {
+				seen[k] = true
+				out = append(out, k)
+			}
+		}
+	}
+	add(chatUnsupportedTopLevelParams...)
+	add(chatMessageExtraFields...)
+	add(responsesDisabledOnlyParams...)
+	add("name", "previous_response_id", "background", "metadata",
+		"namespace", "tool_choice", "encrypted_content")
+	for k := range strictUnsupportedToolTypes {
+		add(k)
+	}
+	for k := range strictUnsupportedInputTypes {
+		add(k)
+	}
 	return out
 }()
 
@@ -358,6 +390,93 @@ func stripUnsupportedParams(obj map[string]any, keepResponsesStore bool) []strin
 		}
 	}
 	return removed
+}
+
+// replayAssistantReasoningAsThinkChunk 把 OpenAI Chat 历史里 assistant 消息的
+// reasoning_content 对称还原为 Mistral 原生 ThinkChunk，并移除顶层 reasoning_content。
+//
+// 这是 response_normalize.go 的逆操作：响应侧为了兼容 OpenAI 客户端把 Mistral 的
+// [{"type":"thinking","thinking":[{"type":"text","text":"..."}],"closed":true}] 拍平到了
+// reasoning_content；请求侧再回放给 Mistral 时，如果直接删掉 reasoning_content，
+// 模型在多步 tool_calls 之间就会丢掉上一步思维链。还原成 ThinkChunk 既符合 Mistral
+// 官方 Chat schema（不触发 extra_forbidden 422），又保持跨轮前缀恒定以命中缓存。
+func replayAssistantReasoningAsThinkChunk(obj map[string]any) bool {
+	if isResponsesShaped(obj) {
+		return false
+	}
+	messages, ok := obj["messages"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "assistant" {
+			continue
+		}
+		rc, ok := msg["reasoning_content"].(string)
+		if !ok || rc == "" {
+			continue
+		}
+
+		thinkChunk := map[string]any{
+			"type": "thinking",
+			"thinking": []any{
+				map[string]any{
+					"type": "text",
+					"text": rc,
+				},
+			},
+			"closed": true,
+		}
+
+		switch c := msg["content"].(type) {
+		case nil:
+			msg["content"] = []any{thinkChunk}
+		case string:
+			if c == "" {
+				msg["content"] = []any{thinkChunk}
+			} else {
+				msg["content"] = []any{
+					thinkChunk,
+					map[string]any{"type": "text", "text": c},
+				}
+			}
+		case []any:
+			if !hasThinkingChunk(c) {
+				merged := make([]any, 0, len(c)+1)
+				merged = append(merged, thinkChunk)
+				merged = append(merged, c...)
+				msg["content"] = merged
+			}
+		default:
+			// content 是对象/数字这类非规范形态：还原不出合规的 content 数组，
+			// 但 reasoning_content 仍必须删掉，否则严格上游会因 extra_forbidden 422。
+			delete(msg, "reasoning_content")
+			changed = true
+			continue
+		}
+
+		delete(msg, "reasoning_content")
+		changed = true
+	}
+	return changed
+}
+
+func hasThinkingChunk(parts []any) bool {
+	for _, raw := range parts {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := m["type"].(string); typ == "thinking" {
+			return true
+		}
+	}
+	return false
 }
 
 // stripChatMessageExtraFields 删除 chat 消息里的非标准字段，返回被删掉的键名
@@ -879,6 +998,9 @@ func shouldInjectUsageOption(prov model.Provider, st model.Settings) bool {
 //
 // 只有真正改动了内容才返回 true，否则视为未修改，避免日志上出现无意义的改写标记。
 func injectIncludeUsage(obj map[string]any) bool {
+	if isResponsesShaped(obj) {
+		return false
+	}
 	streaming, ok := obj["stream"].(bool)
 	if !ok || !streaming {
 		// 非流式响应本来就带 usage，不需要这个参数。

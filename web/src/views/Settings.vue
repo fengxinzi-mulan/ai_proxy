@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref, computed } from 'vue'
+import { onMounted, reactive, ref, computed, watch } from 'vue'
 import {
   NForm,
   NFormItem,
@@ -23,7 +23,8 @@ import {
 import { FolderOpen, RefreshCw, Save, FileText, Download, RotateCw } from 'lucide-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import AppCard from '@/components/AppCard.vue'
-import { api } from '@/api'
+import HelpTip from '@/components/HelpTip.vue'
+import { api, getAccessKey, setAccessKey } from '@/api'
 import { useAppStore } from '@/stores/app'
 import type { AutostartState, Settings, UpdateState } from '@/types'
 import { PROMPT_STRATEGY_LABELS } from '@/types'
@@ -52,6 +53,16 @@ const saving = ref(false)
 const loading = ref(true)
 const noProxyText = ref('')
 const keyCleared = ref(false)
+
+// 点了「清除密钥」之后又输入了新密钥：以输入框为准。
+// 不监听的话，keyCleared 会一直为 true，保存时发出去的是空串，
+// 用户改主意输入的新密钥反而被丢掉。
+watch(
+  () => form.accessKey,
+  (v) => {
+    if (v) keyCleared.value = false
+  },
+)
 
 const strategyOptions = Object.entries(PROMPT_STRATEGY_LABELS).map(([value, label]) => ({
   label,
@@ -98,8 +109,6 @@ async function save() {
   try {
     const payload: Settings = {
       ...form,
-      // 留空表示「保持原值」；要清除密钥得走下面的显式按钮。
-      accessKey: keyCleared.value ? '' : form.accessKey,
       proxy: {
         ...form.proxy,
         noProxy: noProxyText.value
@@ -108,10 +117,31 @@ async function save() {
           .filter(Boolean),
       },
     }
+    // 后端契约：accessKey 缺省/null = 保留原值，"" = 清除，非空 = 设置。
+    // 用户没动过输入框（且没点「清除密钥」）时直接不发这个字段 ——
+    // 否则表单里那个空串会被当成「清除」，把远端已有的密钥悄悄抹掉。
+    if (keyCleared.value) {
+      payload.accessKey = ''
+    } else if (!form.accessKey || form.accessKey === (store.settings?.accessKey ?? '')) {
+      // 没改过就整个字段不发：多标签页/桌面端+浏览器同时开着时，旧标签页里
+      // 回传一份陈旧密钥会把别的客户端刚改好的密钥回滚掉。
+      delete (payload as Partial<Settings>).accessKey
+    }
     const saved = await api.saveSettings(payload)
     store.settings = saved
     Object.assign(form, saved)
     keyCleared.value = false
+
+    // 保存成功后必须把本地密钥与服务端对齐并重建 SSE：
+    // 服务端此刻已按新密钥校验，本地还留着旧值（或空值）时，本次会话里
+    // 所有请求都 401、实时通道也连不上，只能刷新页面才能恢复。
+    // 服务端省略该字段时不能当成「已清除」——那会把本地有效密钥删掉。
+    const returned = Object.prototype.hasOwnProperty.call(saved, 'accessKey') && saved.accessKey !== undefined
+    const nextKey = returned ? (saved.accessKey ?? '') : getAccessKey()
+    if (nextKey !== getAccessKey()) {
+      setAccessKey(nextKey)
+      store.bumpAuthVersion()
+    }
     message.success('已保存')
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
@@ -251,7 +281,8 @@ function openReleasePage() {
  * 这里只负责把请求打出去并给出即时反馈。
  */
 async function startUpdateFromSettings() {
-  if (updateBusy.value) return
+  // 安装已经在跑（弹框那边也可能刚发起过）时不要再打一次请求。
+  if (updateBusy.value || store.updateInstalling) return
   updateBusy.value = true
   try {
     await api.update.install()
@@ -292,8 +323,8 @@ async function startUpdateFromSettings() {
                 <NFormItem label="监听地址">
                   <div class="field">
                     <NInput v-model:value="form.host" placeholder="127.0.0.1" />
-                    <span class="field-hint">改成 0.0.0.0 可以给同网段其它设备用</span>
                   </div>
+                  <HelpTip text="改成 0.0.0.0 可以给同网段其它设备用" />
                 </NFormItem>
                 <NFormItem label="监听端口">
                   <NInputNumber v-model:value="form.port" :min="1" :max="65535" class="field-narrow" />
@@ -304,7 +335,7 @@ async function startUpdateFromSettings() {
                       v-model:value="form.accessKey"
                       type="password"
                       show-password-on="click"
-                      placeholder="留空表示不校验"
+                      placeholder="留空表示保留原值；要清除请点右侧按钮"
                       class="field-narrow"
                     />
                     <NButton v-if="store.settings?.accessKey" size="small" @click="clearAccessKey">
@@ -353,6 +384,16 @@ async function startUpdateFromSettings() {
 
           <div class="col-side">
             <AppCard title="开机自启">
+              <template #help>
+                <template v-if="store.isDesktop">
+                  登录后自动启动并隐藏到系统托盘，代理立刻可用；双击托盘图标打开窗口。
+                </template>
+                <template v-else>
+                  登录后以控制台方式自动启动，数据目录用绝对路径写入启动项，
+                  所以从任何工作目录启动都能找到同一个数据库。
+                </template>
+                这一项直接写系统启动项，不走「保存」按钮。
+              </template>
               <NForm label-placement="left" :label-width="132" size="small">
                 <NFormItem label="登录时自动启动">
                   <NSwitch
@@ -379,19 +420,13 @@ async function startUpdateFromSettings() {
                 启动项指向的是旧路径（{{ autostart.registered }}）。程序被移动过位置，
                 关掉再打开一次开关即可更新。
               </NAlert>
-              <NAlert v-else type="info" :bordered="false" class="inline-alert">
-                <template v-if="store.isDesktop">
-                  登录后自动启动并隐藏到系统托盘，代理立刻可用；双击托盘图标打开窗口。
-                </template>
-                <template v-else>
-                  登录后以控制台方式自动启动，数据目录用绝对路径写入启动项，
-                  所以从任何工作目录启动都能找到同一个数据库。
-                </template>
-                这一项直接写系统启动项，不走「保存」按钮。
-              </NAlert>
             </AppCard>
 
             <AppCard title="版本与更新" class="card-gap">
+              <template #help>
+                更新包来自 GitHub Release，安装前会校验 SHA-256。
+                自动检查每 6 小时最多一次，手动检查不受限制。
+              </template>
               <div class="about-list">
                 <div class="about-row">
                   <span class="about-label">当前版本</span>
@@ -426,7 +461,7 @@ async function startUpdateFromSettings() {
                   v-if="updateState?.hasUpdate && updateState.canAutoInstall"
                   block
                   type="primary"
-                  :loading="updateBusy"
+                  :loading="updateBusy || store.updateInstalling"
                   @click="startUpdateFromSettings"
                 >
                   <template #icon>
@@ -455,13 +490,13 @@ async function startUpdateFromSettings() {
                 有新版本 {{ updateState.latestVersion }} 可用。启动时也会自动检查一次，
                 发现新版本会弹出确认框，可以直接一键更新并重启。
               </NAlert>
-              <NAlert v-else type="info" :bordered="false" class="inline-alert">
-                更新包来自 GitHub Release，安装前会校验 SHA-256。
-                自动检查每 6 小时最多一次，手动检查不受限制。
-              </NAlert>
             </AppCard>
 
             <AppCard title="默认超时" class="card-gap">
+              <template #help>
+                AI 请求的生成耗时跨度很大，总超时默认给了 10 分钟。填 0 表示不限制。
+                单个供应商可以在自己的配置里覆盖这两项。
+              </template>
               <NForm label-placement="left" :label-width="132" size="small">
                 <NFormItem label="上游总超时（秒）">
                   <NInputNumber
@@ -480,13 +515,12 @@ async function startUpdateFromSettings() {
                   />
                 </NFormItem>
               </NForm>
-              <NAlert type="info" :bordered="false" class="inline-alert">
-                AI 请求的生成耗时跨度很大，总超时默认给了 10 分钟。填 0 表示不限制。
-                单个供应商可以在自己的配置里覆盖这两项。
-              </NAlert>
             </AppCard>
 
             <AppCard title="日志保留" class="card-gap">
+              <template #help>
+                后台每小时清理一次。关掉报文存储后仍会记录全部统计指标，只是详情页看不到请求与响应内容。
+              </template>
               <NForm label-placement="left" :label-width="132" size="small">
                 <NFormItem label="存储请求响应体">
                   <NSwitch v-model:value="form.storeBodies" />
@@ -516,20 +550,23 @@ async function startUpdateFromSettings() {
                       :step="10000"
                       class="field-narrow"
                     />
-                    <span class="field-hint">0 = 不限制</span>
+                    <span class="field-hint">条</span>
+                    <HelpTip text="0 = 不限制" />
                   </div>
                 </NFormItem>
               </NForm>
-              <NAlert type="info" :bordered="false" class="inline-alert">
-                后台每小时清理一次。关掉报文存储后仍会记录全部统计指标，只是详情页看不到请求与响应内容。
-              </NAlert>
             </AppCard>
           </div>
         </div>
       </NTabPane>
 
       <NTabPane name="proxy" tab="全局代理（VPN）">
-        <AppCard>
+        <AppCard title="全局代理">
+          <template #help>
+            全局代理对所有「代理模式 = 继承全局」的供应商生效。
+            需要单独设置或完全直连的供应商，可在其编辑页的「网络代理」里覆盖。
+            保存后连接缓存会立即失效并重建。
+          </template>
           <NForm label-placement="left" :label-width="132" size="small" class="settings-form">
             <NFormItem label="启用全局代理">
               <NSwitch v-model:value="form.proxy.enabled" />
@@ -547,8 +584,8 @@ async function startUpdateFromSettings() {
                   :placeholder="form.proxy.type === 'socks5' ? '127.0.0.1:1080' : '127.0.0.1:7890'"
                   class="field-wide"
                 />
-                <span class="field-hint">host:port，带不带 http:// 都可以</span>
               </div>
+              <HelpTip text="host:port，带不带 http:// 都可以" />
             </NFormItem>
             <NFormItem label="用户名">
               <NInput v-model:value="form.proxy.username" placeholder="可留空" class="field-wide" />
@@ -572,16 +609,17 @@ async function startUpdateFromSettings() {
               />
             </NFormItem>
           </NForm>
-          <NAlert type="info" :bordered="false" class="inline-alert">
-            全局代理对所有「代理模式 = 继承全局」的供应商生效。
-            需要单独设置或完全直连的供应商，可在其编辑页的「网络代理」里覆盖。
-            保存后连接缓存会立即失效并重建。
-          </NAlert>
         </AppCard>
       </NTabPane>
 
       <NTabPane name="prompt" tab="全局提示词">
-        <AppCard>
+        <AppCard title="全局提示词">
+          <template #help>
+            供应商的模型正则规则优先于供应商自己的提示词，后者优先于这里的全局提示词。
+            只对「提示词模式 = 继承全局」的供应商生效；三种注入方式分别适配
+            OpenAI 的 messages、Anthropic 的顶层 system、Gemini 的 systemInstruction。
+            凡是注入过提示词的请求，日志里都会标记「已改写」，并保存改写前后的请求体供对比。
+          </template>
           <NForm label-placement="left" :label-width="132" size="small" class="settings-form">
             <NFormItem label="启用">
               <NSwitch v-model:value="form.globalPrompt.enabled" />
@@ -605,40 +643,21 @@ async function startUpdateFromSettings() {
               />
             </NFormItem>
           </NForm>
-
-          <NDivider class="hint-divider" />
-          <div class="hint-list">
-            <div class="hint-row">
-              <span class="hint-label">优先级</span>
-              <span>供应商的模型正则规则 &gt; 供应商自己的提示词 &gt; 这里的全局提示词</span>
-            </div>
-            <div class="hint-row">
-              <span class="hint-label">生效范围</span>
-              <span>
-                只对「提示词模式 = 继承全局」的供应商生效。三种注入方式分别适配
-                OpenAI 的 messages、Anthropic 的顶层 system、Gemini 的 systemInstruction。
-              </span>
-            </div>
-            <div class="hint-row">
-              <span class="hint-label">留痕</span>
-              <span>凡是注入过提示词的请求，日志里都会标记「已改写」，并保存改写前后的请求体供对比。</span>
-            </div>
-          </div>
         </AppCard>
 
         <AppCard title="统计口径" class="card-gap">
-          <NForm label-placement="left" :label-width="132" size="small">
-            <NFormItem label="注入 include_usage">
-              <NSwitch v-model:value="form.usageInjectDefault" />
-            </NFormItem>
-          </NForm>
-          <NAlert type="info" :bordered="false" class="inline-alert">
+          <template #help>
             对 OpenAI Chat Completions 格式的流式请求注入
             <code class="mono">stream_options: {"include_usage": true}</code>，
             让上游在流末尾返回精确的 token 用量。
             关闭后，流式请求的 token 数只能用本地规则估算（日志里会标注「估算」）。
             单个供应商可以覆盖这一项。
-          </NAlert>
+          </template>
+          <NForm label-placement="left" :label-width="132" size="small">
+            <NFormItem label="注入 include_usage">
+              <NSwitch v-model:value="form.usageInjectDefault" />
+            </NFormItem>
+          </NForm>
         </AppCard>
       </NTabPane>
 
@@ -646,6 +665,15 @@ async function startUpdateFromSettings() {
         <div class="settings-grid">
           <div class="col-main">
             <AppCard title="图片压缩">
+              <template #help>
+                只处理请求体里<strong>内联</strong>的图片（data URL / base64），不会去下载远程图片。
+                触发条件是「或」：字节数超阈值，或者长边超上限 —— 后者能救下那种体积不大、
+                但分辨率极高的截图（PNG 压得很小，视觉 token 却很贵）。
+                <br />
+                输出格式：带透明像素的图保持 PNG，其余转 JPEG。GIF 与无法解码的图跳过；
+                压完反而更大时保留原图。压缩是确定性的（同一张图每次结果逐字节相同），
+                所以不会破坏 Responses 续传的前缀匹配。
+              </template>
               <NForm label-placement="left" :label-width="132" size="small" class="settings-form">
                 <NFormItem label="启用">
                   <NSwitch v-model:value="form.imageCompress.enabled" />
@@ -660,7 +688,8 @@ async function startUpdateFromSettings() {
                       :disabled="!form.imageCompress.enabled"
                       class="field-narrow"
                     />
-                    <span class="field-hint">字节，超过就压缩</span>
+                    <span class="field-hint">字节</span>
+                    <HelpTip text="超过阈值就压缩" />
                   </div>
                 </NFormItem>
                 <NFormItem label="长边上限">
@@ -673,7 +702,8 @@ async function startUpdateFromSettings() {
                       :disabled="!form.imageCompress.enabled"
                       class="field-narrow"
                     />
-                    <span class="field-hint">像素，0 = 只按字节判断</span>
+                    <span class="field-hint">像素</span>
+                    <HelpTip text="0 = 只按字节判断" />
                   </div>
                 </NFormItem>
                 <NFormItem label="JPEG 质量">
@@ -686,19 +716,10 @@ async function startUpdateFromSettings() {
                       :disabled="!form.imageCompress.enabled"
                       class="field-narrow"
                     />
-                    <span class="field-hint">1-100，只影响不透明图片</span>
+                    <HelpTip text="1-100，只影响不透明图片" />
                   </div>
                 </NFormItem>
               </NForm>
-              <NAlert type="info" :bordered="false" class="inline-alert">
-                只处理请求体里<strong>内联</strong>的图片（data URL / base64），不会去下载远程图片。
-                触发条件是「或」：字节数超阈值，或者长边超上限 —— 后者能救下那种体积不大、
-                但分辨率极高的截图（PNG 压得很小，视觉 token 却很贵）。
-                <br />
-                输出格式：带透明像素的图保持 PNG，其余转 JPEG。GIF 与无法解码的图跳过；
-                压完反而更大时保留原图。压缩是确定性的（同一张图每次结果逐字节相同），
-                所以不会破坏 Responses 续传的前缀匹配。
-              </NAlert>
             </AppCard>
           </div>
 
@@ -761,6 +782,10 @@ async function startUpdateFromSettings() {
             </AppCard>
 
             <AppCard title="数据位置" class="card-gap">
+              <template #help>
+                桌面版优先沿用程序同目录下的 data；不存在时使用用户配置目录。
+                日志按 5 MB 轮转，保留 5 份，可以在这里直接打开排查问题。
+              </template>
               <NSpin :show="!desktopInfo">
                 <div class="path-list">
                   <div class="path-row">
@@ -790,10 +815,6 @@ async function startUpdateFromSettings() {
                   </div>
                 </div>
               </NSpin>
-              <NAlert type="info" :bordered="false" class="inline-alert">
-                桌面版优先沿用程序同目录下的 data；不存在时使用用户配置目录。
-                日志按 5 MB 轮转，保留 5 份，可以在这里直接打开排查问题。
-              </NAlert>
             </AppCard>
           </div>
 

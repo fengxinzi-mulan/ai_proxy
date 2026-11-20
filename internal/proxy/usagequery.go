@@ -49,6 +49,11 @@ type usageClient struct {
 	// 模板要给用户看的降级说明必须分清这两种，否则会同时冒出「登录失败」和
 	// 「未填写账号密码」两条互相矛盾的提示。
 	sessionAttempted bool
+	// hasAPIKey 表示该供应商配了可用的密钥（get 那套身份）。
+	//
+	// 只填网页账号密码时没有 API key，认 key 的官方接口发出去只会拿到 401，
+	// 模板据此跳过它们，而不是把「没配密钥」记成「密钥被拒」。
+	hasAPIKey bool
 }
 
 // usageTemplate 描述一种「向上游查询套餐余量」的协议实现。
@@ -132,16 +137,17 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 	// 也不再把 BaseURL 推导当作非致命错误 —— 预算接口就在 BaseURL 那个站点上。
 	// 其它模板仍然只认账号密钥（客户端持钥时代理手上没有密钥，查不了额度）。
 	isMistral := tmpl.info.ID == mistralTemplateID
+	_, hasAPIKey := firstProviderKey(prov)
 	var mistralAccount, mistralPassword string
 	if isMistral {
 		mistralAccount, mistralPassword = mistralCredentials(prov)
 		// 一个密钥都没有时，预算接口也读不了；只有账号密码也还能查 token 明细。
-		if _, hasKey := firstProviderKey(prov); !hasKey && (mistralAccount == "" || mistralPassword == "") {
+		if !hasAPIKey && (mistralAccount == "" || mistralPassword == "") {
 			snap.Error = "Mistral 用量查询需要供应商密钥（读预算与计划）；" +
 				"想额外看本月 token 明细，再在「用量」页填 admin.mistral.ai 的登录账号与密码"
 			return finish()
 		}
-	} else if _, ok := firstProviderKey(prov); !ok {
+	} else if !hasAPIKey {
 		snap.Error = "该供应商未配置密钥，用量查询需要账号密钥，无法透传客户端密钥"
 		return finish()
 	}
@@ -166,14 +172,20 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 	sessionAttempted := false
 	if isMistral && mistralAccount != "" && mistralPassword != "" {
 		sessionAttempted = true
-		token, loginErr := s.mistral.Token(ctx, client, mistralAccount, mistralPassword, false)
-		if loginErr != nil {
+		// 先登一次：登录失败要作为警告落进快照，而不是等真正发 admin 请求时
+		// 才以一个语焉不详的网络错误冒出来。
+		if _, loginErr := s.mistral.Token(ctx, client, mistralAccount, mistralPassword, false); loginErr != nil {
 			// 不 return：预算走 API key，仍然能查。把原因留成警告。
 			snap.Warnings = append(snap.Warnings,
 				"账号密码登录失败，已跳过本月 token 明细："+loginErr.Error())
 		} else {
+			// token 现取而不是抓一次存着：会话可能在上游被判失效，getter 收到
+			// 401 时会强制重登并重试一次（见 newUsageSessionGetter）。
 			// 用变量而不是常量：测试要把站点根指向 httptest，生产路径上两者相同。
-			sessionGet = newUsageSessionGetter(client, mistralAdminOrigin, token)
+			sessionGet = newUsageSessionGetter(client, mistralAdminOrigin,
+				func(ctx context.Context, forceRefresh bool) (string, error) {
+					return s.mistral.Token(ctx, client, mistralAccount, mistralPassword, forceRefresh)
+				})
 		}
 	}
 
@@ -246,6 +258,7 @@ func (s *Server) QueryUsage(ctx context.Context, prov model.Provider, settings m
 		},
 		sessionGet:       recordedSessionGet,
 		sessionAttempted: sessionAttempted,
+		hasAPIKey:        hasAPIKey,
 	}
 
 	result, err := tmpl.fetch(ctx, cli)
@@ -337,8 +350,15 @@ func originOf(raw string) string {
 // 只给 Mistral 的 token 明细用：那一份数据还挂在网页后台（admin.mistral.ai），
 // 认的是账号密码登录换来的会话 token，与生成接口的 API key 完全是两套身份。
 // 站点根写死 —— 这些接口与生成接口不同域，没法从 BaseURL 推导。
-func newUsageSessionGetter(client *http.Client, origin, token string) func(context.Context, string, url.Values) (int, []byte, error) {
-	return func(ctx context.Context, path string, query url.Values) (int, []byte, error) {
+//
+// token 由 tokenFn 现取，而不是创建 getter 时就抓一份存住：Ory 的会话可能中途
+// 被上游判失效，缓存里那份要到过期时间才会换。所以这里遇到 401 就强制重登
+// 并重试一次（只一次）—— 多试只会把账号往 Ory 的登录限流上撞。
+func newUsageSessionGetter(
+	client *http.Client, origin string,
+	tokenFn func(ctx context.Context, forceRefresh bool) (string, error),
+) func(context.Context, string, url.Values) (int, []byte, error) {
+	get := func(ctx context.Context, path string, query url.Values, token string) (int, []byte, error) {
 		target := strings.TrimRight(origin, "/") + path
 		if len(query) > 0 {
 			target += "?" + query.Encode()
@@ -357,6 +377,26 @@ func newUsageSessionGetter(client *http.Client, origin, token string) func(conte
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return resp.StatusCode, body, nil
+	}
+
+	return func(ctx context.Context, path string, query url.Values) (int, []byte, error) {
+		token, err := tokenFn(ctx, false)
+		if err != nil {
+			return 0, nil, err
+		}
+		status, body, err := get(ctx, path, query, token)
+		// 只对 401 重登：403 是「这个账号没有权限」，重新登录改变不了结果，
+		// 还会白白往 Ory 的登录限流上撞一次。
+		if err != nil || status != http.StatusUnauthorized {
+			return status, body, err
+		}
+		refreshed, refreshErr := tokenFn(ctx, true)
+		if refreshErr != nil || refreshed == "" || refreshed == token {
+			// 重登没成：把上游原来的 401 原样交给调用方。换成登录错误会让
+			// 用户以为「账号密码不对」，而实际原因可能只是这次会话过期。
+			return status, body, nil
+		}
+		return get(ctx, path, query, refreshed)
 	}
 }
 
@@ -1139,44 +1179,60 @@ func fetchMistralUsage(ctx context.Context, cli *usageClient) (*model.UsageSnaps
 		st, body, err := cli.sessionGet(ctx, path, query)
 		return mistralResult{status: st, body: body, err: err}, true
 	}
-	budget := apiGet(mistralPathBudget)
-	sub := apiGet(mistralPathSubscription)
+	budget := mistralResult{}
+	sub := mistralResult{}
+	// 只填了账号密码（没有 API key）时，官方那两个认 key 的接口根本发不出去：
+	// 照发只会把「没配密钥」显示成「密钥被拒」，然后整轮 401 提前结束，
+	// admin 后台能给的额度与明细反而一条都拿不到。
+	hasKey := cli.hasAPIKey
+	if hasKey {
+		budget = apiGet(mistralPathBudget)
+		sub = apiGet(mistralPathSubscription)
+	}
 
 	// 两个官方接口都 401/403 时，用户最需要知道的是「这把 key 不对」，
-	// 而不是两条「HTTP 401」的泛化警告。
-	if isHTTPAuthFailure(budget) && isHTTPAuthFailure(sub) {
+	// 而不是两条「HTTP 401」的泛化警告。但只在没有网页会话可兜底时才收工 ——
+	// key 失效不代表 admin 那两样也读不到，提前 return 会把能拿到的数据丢掉。
+	if hasKey && cli.sessionGet == nil && isHTTPAuthFailure(budget) && isHTTPAuthFailure(sub) {
 		return nil, errors.New("Mistral 拒绝了这把 API 密钥（HTTP 401/403），请检查供应商密钥是否正确")
 	}
 
 	okCount := 0
 
-	// ---------- 额度窗口 ----------
-	if budget.err != nil {
-		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("预算接口不可用（无法连接）：%v", budget.err))
-	} else if budget.status < 200 || budget.status >= 300 {
-		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("预算接口不可用（HTTP %d）", budget.status))
-	} else if windows, err := parseMistralBudget(budget.body); err != nil {
-		snap.Warnings = append(snap.Warnings, "预算结构无法识别："+err.Error())
-	} else {
-		okCount++
-		snap.Windows = append(snap.Windows, windows...)
-	}
+	// ---------- 额度窗口与订阅计划（只在有密钥时才有得查） ----------
+	if hasKey {
+		switch {
+		case budget.err != nil:
+			snap.Warnings = append(snap.Warnings,
+				fmt.Sprintf("预算接口不可用（无法连接）：%v", budget.err))
+		case budget.status < 200 || budget.status >= 300:
+			snap.Warnings = append(snap.Warnings,
+				fmt.Sprintf("预算接口不可用（HTTP %d）", budget.status))
+		default:
+			if windows, err := parseMistralBudget(budget.body); err != nil {
+				snap.Warnings = append(snap.Warnings, "预算结构无法识别："+err.Error())
+			} else {
+				okCount++
+				snap.Windows = append(snap.Windows, windows...)
+			}
+		}
 
-	// ---------- 订阅计划 ----------
-	if sub.err != nil {
-		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("订阅接口不可用（无法连接）：%v", sub.err))
-	} else if sub.status < 200 || sub.status >= 300 {
-		snap.Warnings = append(snap.Warnings,
-			fmt.Sprintf("订阅接口不可用（HTTP %d）", sub.status))
-	} else if info, err := parseMistralSubscription(sub.body); err != nil {
-		snap.Warnings = append(snap.Warnings, "订阅结构无法识别："+err.Error())
-	} else {
-		okCount++
-		snap.PlanName, snap.Status = info.planName, info.status
-		snap.Warnings = append(snap.Warnings, info.warnings...)
+		switch {
+		case sub.err != nil:
+			snap.Warnings = append(snap.Warnings,
+				fmt.Sprintf("订阅接口不可用（无法连接）：%v", sub.err))
+		case sub.status < 200 || sub.status >= 300:
+			snap.Warnings = append(snap.Warnings,
+				fmt.Sprintf("订阅接口不可用（HTTP %d）", sub.status))
+		default:
+			if info, err := parseMistralSubscription(sub.body); err != nil {
+				snap.Warnings = append(snap.Warnings, "订阅结构无法识别："+err.Error())
+			} else {
+				okCount++
+				snap.PlanName, snap.Status = info.planName, info.status
+				snap.Warnings = append(snap.Warnings, info.warnings...)
+			}
+		}
 	}
 
 	// ---------- 可选：本月限额状态 ----------
@@ -1262,11 +1318,13 @@ func parseMistralBudget(body []byte) ([]model.UsageWindow, error) {
 	// 回退要有条件：顶层那三个字段全为空值时说明响应里根本没有预算数据，
 	// 这时不能造一条「额度 0 / 已用 0」出来 —— 把「读不到」显示成「额度为 0」
 	// 会直接误导用户（见 model.UsageSnapshot 的设计约束）。
+	//
+	// 但也不能因此直接报错：只返回 vibe_budget 的响应是合法的（账号只有 Vibe
+	// 预算时实测如此），顶层为空只说明 api 那一侧没有数据。
 	api := root.APIBudget
-	if api == nil {
-		if root.InitialBudget == 0 && root.ResetAt == "" && root.Currency == "" {
-			return nil, errors.New("没有 api_budget / vibe_budget")
-		}
+	// 只有顶层真的带了「总额」时才回退：只看 reset_at/currency 也可能是在说
+	// vibe_budget，合成一条 0 额度窗口比不显示更误导。
+	if api == nil && root.InitialBudget > 0 {
 		fallback := root.mistralBudget
 		api = &fallback
 	}

@@ -363,6 +363,28 @@ var migrations = []migration{
 			`ALTER TABLE providers ADD COLUMN image_trim_batch INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
+	{
+		// Mistral 思维链对称还原开关：把客户端回放的 assistant.reasoning_content
+		// 还原成 Mistral 原生 ThinkChunk，而不是直接剥离。
+		// 对已开启严格兼容的 mistral.ai 供应商平滑默认开启，老库其他供应商保持 0。
+		//
+		// 只认官方主机的精确前缀：用 LIKE '%mistral.ai%' 会命中
+		// api.mistral.ai.evil.com 这种仿冒域名，也会把第三方网关一起打开，
+		// 而它们未必接受 think 内容块。
+		version: 13,
+		stmts: []string{
+			`ALTER TABLE providers ADD COLUMN replay_reasoning_as_think_chunk INTEGER NOT NULL DEFAULT 0`,
+			`UPDATE providers SET replay_reasoning_as_think_chunk = 1
+			 WHERE strip_unsupported_params = 1 AND (
+				lower(base_url) = 'https://api.mistral.ai'
+				OR lower(base_url) LIKE 'https://api.mistral.ai/%'
+				OR lower(base_url) LIKE 'https://api.mistral.ai:%'
+				OR lower(base_url) = 'http://api.mistral.ai'
+				OR lower(base_url) LIKE 'http://api.mistral.ai/%'
+				OR lower(base_url) LIKE 'http://api.mistral.ai:%'
+			 )`,
+		},
+	},
 }
 
 func (s *Store) migrate() error {

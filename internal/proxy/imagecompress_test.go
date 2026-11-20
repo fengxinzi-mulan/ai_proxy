@@ -530,3 +530,209 @@ func TestJPEGQualityAffectsSize(t *testing.T) {
 		t.Fatal("unreachable")
 	}
 }
+
+// ---------- 尝试次数上限（Bug 23） ----------
+
+// 「压完没变小」的图不会增加成功计数。按成功张数封顶时，一批这样的图能
+// 绕开上限，让请求逐张解码压缩几十次。
+func TestCompressImagesInBodyCapsAttemptsNotSuccesses(t *testing.T) {
+	// 2x2 的 PNG 重编码成 JPEG 反而更大，所以一张都不会被改写。
+	raw := noisyPNG(t, 2, 2, false)
+	url := pngDataURL(raw)
+	opt := model.ImageCompressSettings{Enabled: true, ThresholdBytes: 0, MaxEdge: 0, Quality: 85}
+
+	total := maxCompressImages + 12
+	items := make([]any, 0, total)
+	for i := 0; i < total; i++ {
+		items = append(items, map[string]any{"type": "input_image", "image_url": url})
+	}
+	body := map[string]any{"input": items}
+
+	st := compressImagesInBody(body, opt)
+	if st.Count != 0 {
+		t.Fatalf("这批图压完更大应保持原样，实际改写 %d 张", st.Count)
+	}
+	if st.attempted != maxCompressImages {
+		t.Errorf("解码尝试应停在 %d 次，实际 %d（按成功张数封顶会放行全部 %d 张）",
+			maxCompressImages, st.attempted, total)
+	}
+}
+
+// 尝试额度只在确实要解码时消耗：小图（低于阈值）不该占额度。
+func TestCompressImagesInBodyAttemptsOnlyForCandidates(t *testing.T) {
+	small := pngDataURL(noisyPNG(t, 8, 8, false))
+	big := pngDataURL(noisyPNG(t, 600, 600, false))
+
+	items := []any{}
+	for i := 0; i < 3; i++ {
+		items = append(items, map[string]any{"type": "input_image", "image_url": small})
+	}
+	items = append(items, map[string]any{"type": "input_image", "image_url": big})
+	body := map[string]any{"input": items}
+
+	st := compressImagesInBody(body, defaultOpt())
+	if st.attempted != 4 {
+		t.Errorf("4 张候选图应各消耗一次尝试，实际 %d", st.attempted)
+	}
+	if st.Count != 1 {
+		t.Errorf("只有大图会被改写，实际 %d", st.Count)
+	}
+}
+
+// ---------- EXIF Orientation（Bug 22） ----------
+
+// exifAPP1 构造只带 Orientation 的 APP1 段（大端 TIFF，最小结构）。
+func exifAPP1(orientation uint16) []byte {
+	tiff := []byte{
+		'M', 'M', 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, // TIFF 头，IFD0 在偏移 8
+		0x00, 0x01, // 1 个条目
+		0x01, 0x12, // tag = Orientation
+		0x00, 0x03, // type = SHORT
+		0x00, 0x00, 0x00, 0x01, // count = 1
+		byte(orientation >> 8), byte(orientation), 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, // 没有下一个 IFD
+	}
+	payload := append([]byte("Exif\x00\x00"), tiff...)
+	size := len(payload) + 2
+	seg := []byte{0xFF, 0xE1, byte(size >> 8), byte(size)}
+	return append(seg, payload...)
+}
+
+// jpegWithOrientation 在 JPEG 的 SOI 之后插入 APP1 段。
+func jpegWithOrientation(t *testing.T, base []byte, orientation uint16) []byte {
+	t.Helper()
+	if len(base) < 2 || base[0] != 0xFF || base[1] != 0xD8 {
+		t.Fatal("基准图不是 JPEG")
+	}
+	out := make([]byte, 0, len(base)+32)
+	out = append(out, base[:2]...)
+	out = append(out, exifAPP1(orientation)...)
+	out = append(out, base[2:]...)
+	return out
+}
+
+func noisyJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img, _, err := image.Decode(bytes.NewReader(noisyPNG(t, w, h, false)))
+	if err != nil {
+		t.Fatalf("解码 PNG 失败: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err != nil {
+		t.Fatalf("编码 JPEG 失败: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestJPEGExifOrientation(t *testing.T) {
+	base := noisyJPEG(t, 40, 20)
+	for o := 1; o <= 8; o++ {
+		raw := jpegWithOrientation(t, base, uint16(o))
+		if got := jpegExifOrientation(raw); got != o {
+			t.Errorf("orientation %d 应解析为 %d，实际 %d", o, o, got)
+		}
+	}
+
+	// 解析失败一律按「不旋转」处理，绝不能改坏图片。
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"没有 APP1", base},
+		{"不是 JPEG", noisyPNG(t, 8, 8, false)},
+		{"越界的值", jpegWithOrientation(t, base, 9)},
+		{"被截断", jpegWithOrientation(t, base, 6)[:12]},
+		{"空输入", nil},
+	}
+	for _, c := range cases {
+		if got := jpegExifOrientation(c.raw); got != 0 {
+			t.Errorf("%s: 应返回 0，实际 %d", c.name, got)
+		}
+	}
+}
+
+// applyOrientation 的方向映射必须按 EXIF 定义：这里只钉「结果图片某个角
+// 来自原图哪个角」和宽高变化，够定位任何一处映射写反。
+func TestApplyOrientationMappings(t *testing.T) {
+	const w, h = 4, 2
+	src := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			src.SetNRGBA(x, y, color.NRGBA{R: uint8(40 * x), G: uint8(40 * y), B: 0, A: 255})
+		}
+	}
+	// 期望：结果左上角与右下角分别来自原图的哪个坐标，以及结果宽高。
+	cases := []struct {
+		orientation        int
+		tlX, tlY, brX, brY int
+		dw, dh             int
+	}{
+		{2, w - 1, 0, 0, h - 1, w, h},
+		{3, w - 1, h - 1, 0, 0, w, h},
+		{4, 0, h - 1, w - 1, 0, w, h},
+		{5, 0, 0, w - 1, h - 1, h, w},
+		{6, 0, h - 1, w - 1, 0, h, w},
+		{7, w - 1, h - 1, 0, 0, h, w},
+		{8, w - 1, 0, 0, h - 1, h, w},
+	}
+	for _, c := range cases {
+		dst := applyOrientation(src, c.orientation)
+		b := dst.Bounds()
+		if b.Dx() != c.dw || b.Dy() != c.dh {
+			t.Fatalf("orientation %d 尺寸应为 %dx%d，实际 %dx%d",
+				c.orientation, c.dw, c.dh, b.Dx(), b.Dy())
+		}
+		tr, tg, _, _ := dst.At(0, 0).RGBA()
+		sr, sg, _, _ := src.At(c.tlX, c.tlY).RGBA()
+		if tr != sr || tg != sg {
+			t.Errorf("orientation %d 的左上角应来自 (%d,%d)", c.orientation, c.tlX, c.tlY)
+		}
+		br, bg, _, _ := dst.At(b.Dx()-1, b.Dy()-1).RGBA()
+		xr, xg, _, _ := src.At(c.brX, c.brY).RGBA()
+		if br != xr || bg != xg {
+			t.Errorf("orientation %d 的右下角应来自 (%d,%d)", c.orientation, c.brX, c.brY)
+		}
+	}
+
+	// 1 与非法值都原样返回。
+	if got := applyOrientation(src, 1); got != image.Image(src) {
+		t.Error("orientation 1 应原样返回")
+	}
+	if got := applyOrientation(src, 0); got != image.Image(src) {
+		t.Error("orientation 0 应原样返回")
+	}
+}
+
+// 竖拍手机照片的像素是横的，靠 EXIF 表示方向。压缩后 EXIF 会丢，
+// 所以必须在缩放进码前真的把像素转过来，否则客户端看到的是横图。
+func TestCompressImageBytesAppliesJPEGOrientation(t *testing.T) {
+	const w, h = 200, 60
+	raw := jpegWithOrientation(t, noisyJPEG(t, w, h), 6)
+	opt := model.ImageCompressSettings{Enabled: true, ThresholdBytes: 0, MaxEdge: 0, Quality: 60}
+
+	out, mime, ok := compressImageBytes(raw, "image/jpeg", opt)
+	if !ok {
+		t.Fatal("应压缩成功")
+	}
+	if mime != "image/jpeg" {
+		t.Errorf("mime 应为 jpeg，实际 %q", mime)
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("解码压缩结果失败: %v", err)
+	}
+	if cfg.Width != h || cfg.Height != w {
+		t.Errorf("orientation 6 应转成 %dx%d（宽高交换），实际 %dx%d", h, w, cfg.Width, cfg.Height)
+	}
+
+	// 没有 EXIF 时保持原方向，不该无端旋转。
+	plain, _, ok := compressImageBytes(noisyJPEG(t, w, h), "image/jpeg", opt)
+	if !ok {
+		t.Fatal("无 EXIF 的图也应压缩成功")
+	}
+	if cfg, _, err := image.DecodeConfig(bytes.NewReader(plain)); err != nil {
+		t.Fatalf("解码失败: %v", err)
+	} else if cfg.Width != w || cfg.Height != h {
+		t.Errorf("没有 EXIF 时不该旋转，实际 %dx%d", cfg.Width, cfg.Height)
+	}
+}

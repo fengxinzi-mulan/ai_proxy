@@ -530,24 +530,41 @@ export function enumerateBuckets(fromIso: string, toIso: string, bucket: string)
   const to = new Date(toIso)
   if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return []
 
+  // 区间为「全部」且没有任何请求时，后端会给出零值时间（0001-01-01）。
+  // Date.UTC(1, ...) 会把 1 当年份偏移处理成 1901 年，于是从 1901 枚举到 2026
+  // 得到 800 个空桶 —— 图上就是一堆归零的刻度，NEmpty 永远不触发。
+  // SQLite 里的时间戳最小也是 Unix 元年前后，1970 之前的一律视为「没有有效区间」。
+  if (from.getUTCFullYear() < 1970) return []
+
   const stepMs = bucket === 'minute' ? 60_000 : bucket === 'day' ? 86_400_000 : 3_600_000
   const pad = (n: number) => String(n).padStart(2, '0')
 
   // 对齐到桶边界，与 SQLite 的截断行为保持一致。
-  const aligned = new Date(
-    Date.UTC(
-      from.getUTCFullYear(),
-      from.getUTCMonth(),
-      from.getUTCDate(),
-      bucket === 'day' ? 0 : from.getUTCHours(),
-      bucket === 'minute' ? from.getUTCMinutes() : 0,
-    ),
-  )
+  const align = (d: Date) =>
+    new Date(
+      Date.UTC(
+        d.getUTCFullYear(),
+        d.getUTCMonth(),
+        d.getUTCDate(),
+        bucket === 'day' ? 0 : d.getUTCHours(),
+        bucket === 'minute' ? d.getUTCMinutes() : 0,
+      ),
+    )
 
-  const out: string[] = []
+  const end = align(to).getTime()
+  let start = align(from).getTime()
+
   // 上限兜底，避免区间异常时生成海量刻度把页面卡死。
   const maxBuckets = 800
-  for (let t = aligned.getTime(); t <= to.getTime() && out.length < maxBuckets; t += stepMs) {
+  const total = Math.floor((end - start) / stepMs) + 1
+  // 超限时从「区间末尾」反向取最近的 800 个桶。长期使用后「全部」跨度可能
+  // 上千天，若从最早的桶往后截断，最近的数据反而不会出现在图上。
+  if (total > maxBuckets) {
+    start = end - (maxBuckets - 1) * stepMs
+  }
+
+  const out: string[] = []
+  for (let t = start; t <= end && out.length < maxBuckets; t += stepMs) {
     const d = new Date(t)
     if (bucket === 'day') {
       out.push(`${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`)

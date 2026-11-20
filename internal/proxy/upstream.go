@@ -44,6 +44,9 @@ func (p *clientPool) get(key string, build func() (*http.Client, error)) (*http.
 	}
 	// 简单上限，防止长期运行中配置反复微调导致缓存无限增长。
 	if len(p.clients) > 64 {
+		for _, old := range p.clients {
+			old.CloseIdleConnections()
+		}
 		p.clients = map[string]*http.Client{}
 	}
 	p.clients[key] = c
@@ -54,6 +57,9 @@ func (p *clientPool) get(key string, build func() (*http.Client, error)) (*http.
 func (p *clientPool) reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	for _, old := range p.clients {
+		old.CloseIdleConnections()
+	}
 	p.clients = map[string]*http.Client{}
 }
 
@@ -195,10 +201,11 @@ func applyProxy(transport *http.Transport, cfg model.ProxyConfig) error {
 		if cfg.Username != "" || cfg.Password != "" {
 			auth = &proxy.Auth{User: cfg.Username, Password: cfg.Password}
 		}
-		dialer, err := proxy.SOCKS5("tcp", addr, auth, &net.Dialer{
+		directDialer := &net.Dialer{
 			Timeout:   transport.TLSHandshakeTimeout,
 			KeepAlive: 30 * time.Second,
-		})
+		}
+		dialer, err := proxy.SOCKS5("tcp", addr, auth, directDialer)
 		if err != nil {
 			return fmt.Errorf("创建 SOCKS5 拨号器失败: %w", err)
 		}
@@ -206,7 +213,19 @@ func applyProxy(transport *http.Transport, cfg model.ProxyConfig) error {
 		if !ok {
 			return fmt.Errorf("SOCKS5 拨号器不支持带 context 的拨号")
 		}
-		transport.DialContext = contextDialer.DialContext
+		noProxy := append([]string(nil), cfg.NoProxy...)
+		transport.DialContext = func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+			if len(noProxy) > 0 {
+				host, _, splitErr := net.SplitHostPort(targetAddr)
+				if splitErr != nil {
+					host = targetAddr
+				}
+				if matchesNoProxy(host, noProxy) {
+					return directDialer.DialContext(ctx, network, targetAddr)
+				}
+			}
+			return contextDialer.DialContext(ctx, network, targetAddr)
+		}
 		// SOCKS5 模式下不再设置 Proxy，否则会双重代理。
 		return nil
 	}
@@ -242,10 +261,21 @@ func matchesNoProxy(host string, list []string) bool {
 	if len(list) == 0 {
 		return false
 	}
-	host = strings.ToLower(strings.TrimSpace(host))
+	host = normalizeNoProxyEntry(host)
+	if host == "" {
+		return false
+	}
 	for _, raw := range list {
-		item := strings.ToLower(strings.TrimSpace(raw))
+		item := normalizeNoProxyEntry(raw)
 		if item == "" {
+			continue
+		}
+		// 通配写法（*.example.com）只匹配子域，不匹配裸域名 —— 与 curl 一致。
+		if strings.HasPrefix(item, "*.") {
+			suffix := item[1:] // ".example.com"
+			if len(host) > len(suffix) && strings.HasSuffix(host, suffix) {
+				return true
+			}
 			continue
 		}
 		item = strings.TrimPrefix(item, ".")
@@ -254,6 +284,23 @@ func matchesNoProxy(host string, list []string) bool {
 		}
 	}
 	return false
+}
+
+// normalizeNoProxyEntry 把用户写的 host 片段规整成可比较的裸主机名：
+// 小写、去空白、去 IPv6 方括号、去端口。
+//
+// no_proxy 列表里 "example.com:8080"、"[::1]"、"[::1]:8080" 都是常见写法，
+// 不处理就会静默不命中 —— 用户以为走了直连，实际还在代理上。
+func normalizeNoProxyEntry(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimPrefix(s, "[")
+	if i := strings.Index(s, "]"); i >= 0 {
+		s = s[:i]
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	return strings.TrimSpace(s)
 }
 
 // ---------- 密钥轮询与健康状态 ----------

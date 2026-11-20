@@ -1008,9 +1008,10 @@ func TestMigrateV10KeepsImageLimitUnlimited(t *testing.T) {
 	// （否则 ListLogs 返回空切片，下面的循环体一次都不执行，等于没测）。
 	insertLog(t, st, func(l *model.RequestLog) { l.ImagesDropped = 0 })
 	// 回滚到「v10 的时刻」：删列 + 删迁移记录。SQLite 3.35+ 支持 DROP COLUMN。
-	// 注意要连同更高版本（v12 的 image_trim_batch）一起回滚，否则 Open 只会补
-	// version > 10 的那几条，v11 的列永远补不回来。
+	// 注意要连同更高版本（v12 的 image_trim_batch、v13 的思维链还原开关）一起
+	// 回滚，否则 Open 只会补 version > 10 的那几条，v11 的列永远补不回来。
 	for _, stmt := range []string{
+		`ALTER TABLE providers DROP COLUMN replay_reasoning_as_think_chunk`,
 		`ALTER TABLE providers DROP COLUMN image_trim_batch`,
 		`ALTER TABLE providers DROP COLUMN max_images_per_request`,
 		`ALTER TABLE request_logs DROP COLUMN images_dropped`,
@@ -1078,5 +1079,83 @@ func TestLogImagesDroppedRoundTrip(t *testing.T) {
 	}
 	if len(logs) != 1 || logs[0].ImagesDropped != 7 {
 		t.Fatalf("列表里的 images_dropped 不对: %+v", logs)
+	}
+}
+
+// Bug 40：写入路径必须统一规整短名、拒绝空名，并在 DisplayName 缺失时兜底。
+// 只在 API 层规整是不够的 —— 命令行/自启/测试等路径都直接调 store。
+func TestProviderNameNormalizedOnWrite(t *testing.T) {
+	st := newTestStore(t)
+
+	p := newProvider("  GiThub  ")
+	p.DisplayName = ""
+	created, err := st.CreateProvider(p)
+	if err != nil {
+		t.Fatalf("创建供应商失败: %v", err)
+	}
+	if created.Name != "github" {
+		t.Errorf("创建时短名应规整为小写去空格，实际 %q", created.Name)
+	}
+	if created.DisplayName != "github" {
+		t.Errorf("DisplayName 缺省时应兜底为短名，实际 %q", created.DisplayName)
+	}
+
+	// 更新路径同样要规整：否则改个大小写就能绕过唯一索引。
+	created.Name = "  UpDaTeD "
+	created.DisplayName = ""
+	updated, err := st.UpdateProvider(created)
+	if err != nil {
+		t.Fatalf("更新供应商失败: %v", err)
+	}
+	if updated.Name != "updated" || updated.DisplayName != "updated" {
+		t.Errorf("更新后短名/显示名应规整，实际 %q / %q", updated.Name, updated.DisplayName)
+	}
+
+	created.Name = "   "
+	if _, err := st.UpdateProvider(created); err != ErrEmptyName {
+		t.Errorf("更新为空短名应返回 ErrEmptyName，实际 %v", err)
+	}
+}
+
+// Bug 40：不管调用方传什么，库里都只能有一条 active=1。
+// 出现两条时 /v1 取哪个生效供应商就变成随机行为。
+func TestCreateProviderKeepsSingleActive(t *testing.T) {
+	st := newTestStore(t)
+
+	first := newProvider("first")
+	first.Active = true
+	a, err := st.CreateProvider(first)
+	if err != nil {
+		t.Fatalf("创建第一个供应商失败: %v", err)
+	}
+	if !a.Active {
+		t.Error("显式要求 active 的第一个供应商应生效")
+	}
+
+	second := newProvider("second")
+	second.Active = true
+	b, err := st.CreateProvider(second)
+	if err != nil {
+		t.Fatalf("创建第二个供应商失败: %v", err)
+	}
+	if !b.Active {
+		t.Error("显式要求 active 的第二个供应商应生效")
+	}
+
+	list, err := st.ListProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := 0
+	for _, p := range list {
+		if p.Active {
+			active++
+		}
+	}
+	if active != 1 {
+		t.Fatalf("active 供应商应恰好 1 条，实际 %d 条", active)
+	}
+	if activeProv, err := st.GetActiveProvider(); err != nil || activeProv.ID != b.ID {
+		t.Errorf("生效供应商应为后创建的 b，实际 %+v (err=%v)", activeProv, err)
 	}
 }

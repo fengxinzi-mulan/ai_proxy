@@ -138,11 +138,13 @@ type desktopTray struct {
 	onShow   func()
 	onQuit   func()
 	notified bool
+	// done 在消息循环真正退出后关闭，stop 靠它确认图标已经删干净。
+	done chan struct{}
 }
 
 // startTray 创建托盘图标并启动消息循环。失败不影响主窗口启动。
 func startTray(onShow, onQuit func()) (*desktopTray, error) {
-	t := &desktopTray{onShow: onShow, onQuit: onQuit}
+	t := &desktopTray{onShow: onShow, onQuit: onQuit, done: make(chan struct{})}
 	trayCurrent = t
 	ready := make(chan uintptr, 1)
 	errCh := make(chan error, 1)
@@ -164,6 +166,8 @@ func (t *desktopTray) run(ready chan<- uintptr, errCh chan<- error) {
 	// 消息循环必须固定在同一个 OS 线程上。
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	// 无论正常退出还是建窗失败，都让 stop 的等待有结果。
+	defer close(t.done)
 
 	hInstance, _, _ := procGetModuleHandleW.Call(0)
 	className, _ := windows.UTF16PtrFromString("AIProxyTrayWindow")
@@ -328,13 +332,31 @@ func (t *desktopTray) notify(title, text string) {
 	procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
 }
 
+// stop 撤掉托盘图标，并等待消息循环真正退出。
+//
+// 只 post 一条 WM_CLOSE 然后返回是不够的：消息循环可能还没处理到它，
+// 进程就退出了，Shell 里会留下一个点不动的幽灵图标（要划一下鼠标才消失）。
+// 等待上限 500ms —— 正常情况是毫秒级，超时也不能把退出流程挂住。
 func (t *desktopTray) stop() {
 	t.mu.Lock()
-	hwnd := t.hwnd
+	hwnd, done := t.hwnd, t.done
 	t.hwnd = 0
 	t.mu.Unlock()
-	if hwnd != 0 {
-		procPostMessageW.Call(hwnd, wmClose, 0, 0)
+	if hwnd == 0 {
+		return
+	}
+	procPostMessageW.Call(hwnd, wmClose, 0, 0)
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		// 消息循环没在时限内退出（菜单打开、线程卡住）：直接跨线程删一次图标。
+		// Shell_NotifyIcon(NIM_DELETE) 可以在任意线程调用；循环之后如果再处理
+		// WM_CLOSE 也只是重复删一次，返回 false 而已。不补这一下，图标就会
+		// 一直留在 Shell 里，而 hwnd 已经置零、后续没有任何补救机会。
+		t.removeIcon(hwnd)
 	}
 }
 

@@ -103,6 +103,9 @@ type openPayload struct {
 	Target string `json:"target"`
 }
 
+// openDir 是 openInFileManager 的间接引用，单测可以替换它来断言传进去的路径。
+var openDir = openInFileManager
+
 // handleOpen 用系统文件管理器打开数据目录或日志目录。
 //
 // 只接受两个固定 target，绝不把请求里的路径拼进命令，避免命令注入。
@@ -122,15 +125,30 @@ func (d *DesktopAPI) handleOpen(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "未知的打开目标")
 		return
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 先转绝对路径再交给文件管理器。dataDir 在某些启动方式下是相对路径
+	// （命令行模式很常见），而 explorer.exe / xdg-open 会按**它们自己的**
+	// 工作目录解析相对路径 —— 结果打开的是 System32 之类的地方，
+	// 或者因为路径不存在直接什么都不发生。
+	abs, err := filepath.Abs(dir)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "目录不可用: "+err.Error())
 		return
 	}
-	if err := openInFileManager(dir); err != nil {
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, "目录不可用: "+err.Error())
+		return
+	}
+	// 目录必须真实存在再交出去：explorer.exe 收到不存在的路径会静默打开
+	// 「文档」目录，用户以为点错了按钮。
+	if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+		writeError(w, http.StatusInternalServerError, "目录不可用: "+abs)
+		return
+	}
+	if err := openDir(abs); err != nil {
 		writeError(w, http.StatusInternalServerError, "打开目录失败: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": dir})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": abs})
 }
 
 // handleInfo 返回界面要展示的本地路径信息。

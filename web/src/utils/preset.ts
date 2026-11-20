@@ -41,6 +41,12 @@ export function presetApplied(preset: ProviderPreset, p: Partial<Provider>): boo
   if (preset.stripUnsupportedParams !== undefined && p.stripUnsupportedParams !== preset.stripUnsupportedParams) {
     return false
   }
+  if (
+    preset.replayReasoningAsThinkChunk !== undefined &&
+    p.replayReasoningAsThinkChunk !== preset.replayReasoningAsThinkChunk
+  ) {
+    return false
+  }
   if (preset.promptCacheKeyMode !== undefined && p.promptCacheKeyMode !== preset.promptCacheKeyMode) {
     return false
   }

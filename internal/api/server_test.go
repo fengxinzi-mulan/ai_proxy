@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"ai_proxy/internal/autostart"
 	"ai_proxy/internal/hub"
@@ -215,10 +216,11 @@ func TestApplyProviderPreset(t *testing.T) {
 	if err := json.Unmarshal([]byte(resp), &result); err != nil {
 		t.Fatalf("结果不是合法 JSON: %v %s", err, resp)
 	}
-	if len(result.Applied) != 6 {
-		t.Errorf("应改动六项，实际 %v", result.Applied)
+	if len(result.Applied) != 7 {
+		t.Errorf("应改动七项，实际 %v", result.Applied)
 	}
 	if !result.Provider.StripUnsupportedParams ||
+		!result.Provider.ReplayReasoningAsThinkChunk ||
 		result.Provider.PromptCacheKeyMode != model.PromptCacheKeyAuto ||
 		result.Provider.UsageInjectMode != "off" ||
 		result.Provider.TimeoutSeconds != 900 ||
@@ -509,5 +511,221 @@ func TestPutSettingsKeepsImageCompressWhenOmitted(t *testing.T) {
 	}
 	if !after.ImageCompress.Enabled {
 		t.Error("显式 true 应被保存")
+	}
+}
+
+// ---------- Bug 37：访问密钥可以显式清除 ----------
+
+// 空串曾长期表示「保持原值」，导致用户永远关不掉访问密钥。
+func TestPutSettingsAccessKeyCanBeCleared(t *testing.T) {
+	_, h := newTestAPI(t)
+
+	status, resp := doJSON(t, h, http.MethodPut, "/api/settings",
+		`{"host":"127.0.0.1","port":8080,"accessKey":"s3cret"}`)
+	if status != http.StatusOK {
+		t.Fatalf("保存失败: %d %s", status, resp)
+	}
+	if !strings.Contains(resp, `"accessKey":"s3cret"`) {
+		t.Fatalf("访问密钥应写入: %s", resp)
+	}
+
+	// 不传 accessKey：保持原值（脚本/旧页面不会回传密钥）。
+	status, resp = doJSON(t, h, http.MethodPut, "/api/settings",
+		`{"host":"127.0.0.1","port":8080}`)
+	if status != http.StatusOK {
+		t.Fatalf("保存失败: %d %s", status, resp)
+	}
+	if !strings.Contains(resp, `"accessKey":"s3cret"`) {
+		t.Errorf("省略 accessKey 时应保持原值: %s", resp)
+	}
+
+	// 显式 null 也按「没传」处理，不能被当成清空。
+	status, resp = doJSON(t, h, http.MethodPut, "/api/settings",
+		`{"host":"127.0.0.1","port":8080,"accessKey":null}`)
+	if status != http.StatusOK {
+		t.Fatalf("保存失败: %d %s", status, resp)
+	}
+	if !strings.Contains(resp, `"accessKey":"s3cret"`) {
+		t.Errorf("accessKey=null 应保持原值: %s", resp)
+	}
+
+	// 显式空串：清除。
+	status, resp = doJSON(t, h, http.MethodPut, "/api/settings",
+		`{"host":"127.0.0.1","port":8080,"accessKey":""}`)
+	if status != http.StatusOK {
+		t.Fatalf("保存失败: %d %s", status, resp)
+	}
+	if !strings.Contains(resp, `"accessKey":""`) {
+		t.Errorf("显式空串应清除访问密钥: %s", resp)
+	}
+}
+
+// ---------- Bug 38 / 39：日志删除与清空 ----------
+
+func insertTestLog(t *testing.T, srv *Server) {
+	t.Helper()
+	now := time.Now()
+	entry := model.RequestLog{
+		TSStart: now, TSEnd: now,
+		ProviderID: 1, ProviderName: "上游", Model: "gpt-4o",
+		APIFormat: "openai", HTTPStatus: 200, Success: true,
+		Modifications: []string{},
+	}
+	if _, err := srv.store.InsertLog(&entry); err != nil {
+		t.Fatalf("插入测试日志失败: %v", err)
+	}
+}
+
+// 无条件 DELETE 曾因为 parseLogQuery 的默认 24 小时窗口静默删掉一天的数据；
+// range=all 则会生成恒真的 ts_start <= now，同样绕过全表删保护。
+func TestDeleteLogsRequiresExplicitConditions(t *testing.T) {
+	srv, h := newTestAPI(t)
+	insertTestLog(t, srv)
+
+	for _, path := range []string{"/api/logs", "/api/logs?range=all"} {
+		status, resp := doJSON(t, h, http.MethodDelete, path, "")
+		if status != http.StatusBadRequest {
+			t.Errorf("%s 应返回 400，实际 %d: %s", path, status, resp)
+		}
+	}
+
+	// 日志必须还在。
+	status, resp := doJSON(t, h, http.MethodGet, "/api/logs", "")
+	if status != http.StatusOK {
+		t.Fatalf("列表失败: %d %s", status, resp)
+	}
+	var list struct {
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(resp), &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Total != 1 {
+		t.Fatalf("无条件删除不该生效，剩余 %d 条", list.Total)
+	}
+
+	// 带条件才放行（这里没有匹配的供应商，删 0 条也是成功）。
+	status, resp = doJSON(t, h, http.MethodDelete, "/api/logs?providerId=99", "")
+	if status != http.StatusOK {
+		t.Fatalf("带条件删除应放行，实际 %d: %s", status, resp)
+	}
+	if !strings.Contains(resp, `"deleted":0`) {
+		t.Errorf("不应误删日志: %s", resp)
+	}
+}
+
+// 非法 JSON 只能写一次响应：修复前 decode 写 400 后，确认校验分支又写一次，
+// 响应体变成两段 JSON，前端的错误提示反而拿不到原因。
+func TestClearLogsInvalidJSONWritesSingleError(t *testing.T) {
+	_, h := newTestAPI(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/logs/clear", bytes.NewBufferString(`{"confirm":`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("非法 JSON 应返回 400，实际 %d", rec.Code)
+	}
+	dec := json.NewDecoder(strings.NewReader(rec.Body.String()))
+	var first map[string]any
+	if err := dec.Decode(&first); err != nil {
+		t.Fatalf("响应体应为 JSON: %v (%q)", err, rec.Body.String())
+	}
+	if first["error"] == nil {
+		t.Errorf("响应应包含错误信息: %q", rec.Body.String())
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		t.Errorf("响应体只应有一段 JSON，实际 %q", rec.Body.String())
+	}
+}
+
+// ---------- Bug 42：接口形态补齐 ----------
+
+// providerPayload 被嵌入匿名结构体后，空/非法时间戳仍必须能解析成功。
+func TestProviderPayloadEmbeddedDecode(t *testing.T) {
+	var body struct {
+		providerPayload
+		ProbeModel string `json:"probeModel"`
+	}
+	raw := `{"name":"p","baseUrl":"https://x/v1","createdAt":"","updatedAt":"昨天","probeModel":"m"}`
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("时间戳不该导致解析失败: %v", err)
+	}
+	if body.BaseURL != "https://x/v1" || body.ProbeModel != "m" {
+		t.Errorf("字段解析异常: baseUrl=%q probeModel=%q", body.BaseURL, body.ProbeModel)
+	}
+}
+
+// 激活动作要和列表接口返回同一形态，前端才能整份替换。
+func TestActivateProviderReturnsListView(t *testing.T) {
+	_, h := newTestAPI(t)
+	p := createProvider(t, h, `{"name":"p1","enabled":true,"baseUrl":"https://api.example.com/v1"}`)
+
+	status, resp := doJSON(t, h, http.MethodPost, fmt.Sprintf("/api/providers/%d/activate", p.ID), "")
+	if status != http.StatusOK {
+		t.Fatalf("激活应成功，实际 %d: %s", status, resp)
+	}
+	var views []struct {
+		ID        int64           `json:"id"`
+		KeyHealth json.RawMessage `json:"keyHealth"`
+		Usage     json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(resp), &views); err != nil {
+		t.Fatalf("应返回供应商数组: %v (%s)", err, resp)
+	}
+	if len(views) != 1 || views[0].ID != p.ID {
+		t.Fatalf("返回内容不对: %s", resp)
+	}
+	if len(views[0].KeyHealth) == 0 {
+		t.Errorf("激活动作的响应缺少 keyHealth: %s", resp)
+	}
+}
+
+// 应用预设会改动转发相关字段，必须清续传状态并广播 providers 事件。
+func TestApplyProviderPresetBroadcastsProviders(t *testing.T) {
+	srv, h := newTestAPI(t)
+	p := createProvider(t, h, `{"name":"mistral","enabled":true,
+		"baseUrl":"https://api.mistral.ai/v1","apiFormat":"openai"}`)
+
+	ch := srv.hub.Subscribe()
+	defer srv.hub.Unsubscribe(ch)
+
+	status, resp := doJSON(t, h, http.MethodPost, fmt.Sprintf("/api/providers/%d/apply-preset", p.ID),
+		`{"presetId":"mistral"}`)
+	if status != http.StatusOK {
+		t.Fatalf("应用预设失败: %d %s", status, resp)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case payload, ok := <-ch:
+			if !ok {
+				t.Fatal("事件通道被关闭")
+			}
+			if strings.Contains(string(payload), `"providers"`) {
+				return
+			}
+		case <-deadline:
+			t.Fatal("应用预设后没有广播 providers 事件")
+		}
+	}
+}
+
+// autoBucket 不能因为 to 是零值就算出负数跨度而退化成按天。
+func TestAutoBucketHandlesZeroTo(t *testing.T) {
+	now := time.Now()
+	if got := autoBucket(time.Time{}, now); got != store.BucketDay {
+		t.Errorf("from 为零时应按天，实际 %v", got)
+	}
+	if got := autoBucket(now.Add(-time.Hour), time.Time{}); got != store.BucketMinute {
+		t.Errorf("to 为零时应按当前时间补齐，实际 %v", got)
+	}
+	if got := autoBucket(now.Add(time.Hour), time.Time{}); got != store.BucketDay {
+		t.Errorf("跨度为负时应退回按天，实际 %v", got)
+	}
+	if got := autoBucket(now.Add(-30*time.Hour), now); got != store.BucketHour {
+		t.Errorf("30 小时应按小时，实际 %v", got)
 	}
 }

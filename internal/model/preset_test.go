@@ -47,11 +47,14 @@ func TestMistralPresetAppliesOnlyListedFields(t *testing.T) {
 	prov.Prompt.Text = "自定义提示词"
 
 	applied := preset.Apply(&prov)
-	if len(applied) != 6 {
-		t.Fatalf("应改动六项（严格兼容/缓存键/用量注入/超时/图片上限/成批替换），实际 %v", applied)
+	if len(applied) != 7 {
+		t.Fatalf("应改动七项（严格兼容/思维链还原/缓存键/用量注入/超时/图片上限/成批替换），实际 %v", applied)
 	}
 	if !prov.StripUnsupportedParams {
 		t.Error("严格兼容应被打开")
+	}
+	if !prov.ReplayReasoningAsThinkChunk {
+		t.Error("思维链还原应被打开")
 	}
 	if prov.PromptCacheKeyMode != PromptCacheKeyAuto {
 		t.Errorf("prompt_cache_key 应为 auto，实际 %q", prov.PromptCacheKeyMode)
@@ -102,8 +105,8 @@ func TestMistralPresetAppliesOnlyListedFields(t *testing.T) {
 func TestProviderPresetChangesMatchFields(t *testing.T) {
 	preset, _ := LookupProviderPreset("mistral")
 	// 界面靠 Changes 展示「改什么」，字段数量必须与要改的项对得上。
-	if len(preset.Changes) != 7 {
-		t.Errorf("应给出七条变更说明，实际 %d", len(preset.Changes))
+	if len(preset.Changes) != 8 {
+		t.Errorf("应给出八条变更说明，实际 %d", len(preset.Changes))
 	}
 	for _, c := range preset.Changes {
 		if c.Field == "" || c.Value == "" || c.Reason == "" {

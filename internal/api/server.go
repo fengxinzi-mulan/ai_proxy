@@ -6,6 +6,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -139,17 +140,33 @@ func (s *Server) Auth(next http.Handler) http.Handler {
 	})
 }
 
+// checkKey 校验管理接口的访问密钥。
+//
+// 与代理入口保持同一套方式（README 也这么写）：OpenAI 的 Authorization、
+// Anthropic 的 x-api-key、Gemini 的 x-goog-api-key、自定义头，以及 EventSource
+// 不得不用的 ?key=。比较全部走常量时间，避免时序侧信道。
 func checkKey(r *http.Request, want string) bool {
-	if r.Header.Get("X-AI-Proxy-Key") == want {
+	for _, h := range []string{"X-AI-Proxy-Key", "x-api-key", "x-goog-api-key"} {
+		if constantTimeEqual(r.Header.Get(h), want) {
+			return true
+		}
+	}
+	if constantTimeEqual(r.URL.Query().Get("key"), want) {
 		return true
 	}
-	if r.URL.Query().Get("key") == want {
-		return true
+	return isBearerOf(r.Header.Get("Authorization"), want)
+}
+
+func constantTimeEqual(a, b string) bool {
+	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func isBearerOf(value, token string) bool {
+	const prefix = "Bearer "
+	if len(value) < len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
+		return false
 	}
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ") == want
-	}
-	return false
+	return constantTimeEqual(strings.TrimSpace(value[len(prefix):]), token)
 }
 
 // ---------- 基础 ----------
@@ -216,25 +233,29 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	type settingsPayload struct {
 		model.Settings
 		ImageCompress *model.ImageCompressSettings `json:"imageCompress"`
+		// AccessKey 同样用指针，但语义不同：nil（含 JSON null）= 保持原值，
+		// "" = 显式清除。之前用「空串=保持原值」把「关掉访问密钥」这条路
+		// 彻底堵死了 —— 用户只能在库里手改，界面上怎么保存都还在鉴权。
+		AccessKey *string `json:"accessKey"`
 	}
 	var payload settingsPayload
 	if !s.decode(w, r, &payload) {
 		return
 	}
+	cur, curErr := s.store.GetSettings()
 	incoming := payload.Settings
 	if payload.ImageCompress != nil {
 		incoming.ImageCompress = *payload.ImageCompress
-	} else if cur, err := s.store.GetSettings(); err == nil {
+	} else if curErr == nil {
 		// 没传就保持原值。
 		incoming.ImageCompress = cur.ImageCompress
 	}
-
-	// 访问密钥留空表示「保持原值」，这样前端不必为了改代理而回传密钥。
-	if incoming.AccessKey == "" {
-		if cur, err := s.store.GetSettings(); err == nil {
-			incoming.AccessKey = cur.AccessKey
-		}
+	if payload.AccessKey != nil {
+		incoming.AccessKey = *payload.AccessKey
+	} else if curErr == nil {
+		incoming.AccessKey = cur.AccessKey
 	}
+
 	if err := s.store.SaveSettings(incoming); err != nil {
 		s.fail(w, err)
 		return
@@ -248,20 +269,19 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 供应商 ----------
 
-func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
-	list, err := s.store.ListProviders()
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	// 附上密钥健康状态，前端不用再逐个请求。
-	type providerView struct {
-		model.Provider
-		KeyHealth map[string]proxy.KeyHealth `json:"keyHealth"`
-		// Usage 是服务端定时刷出来的最近一次用量快照。
-		// 随列表一起下发，卡片上的额度条就不用再单独请求一次。
-		Usage *model.UsageSnapshot `json:"usage"`
-	}
+// providerView 是供应商在列表/激活动作里的统一响应形态。
+//
+// 附上密钥健康状态与用量快照，前端不用再逐个请求；两个动作返回同一种
+// 结构，界面才能用同一份 store 数据直接替换，不必分叉处理。
+type providerView struct {
+	model.Provider
+	KeyHealth map[string]proxy.KeyHealth `json:"keyHealth"`
+	// Usage 是服务端定时刷出来的最近一次用量快照。
+	Usage *model.UsageSnapshot `json:"usage"`
+}
+
+// providerViews 给一批供应商补上附加信息。
+func (s *Server) providerViews(list []model.Provider) []providerView {
 	usage, err := s.store.ListProviderUsage()
 	if err != nil {
 		// 快照读不出来不该让整个供应商列表挂掉 —— 它只是附加信息。
@@ -276,7 +296,16 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, view)
 	}
-	s.writeJSON(w, http.StatusOK, out)
+	return out
+}
+
+func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListProviders()
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, s.providerViews(list))
 }
 
 func (s *Server) handleGetProvider(w http.ResponseWriter, r *http.Request) {
@@ -289,11 +318,12 @@ func (s *Server) handleGetProvider(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	type providerView struct {
+	// 详情视图只额外带用量快照；密钥健康状态由 /keys 单独提供（要逐 key 探测）。
+	type providerDetailView struct {
 		model.Provider
 		Usage *model.UsageSnapshot `json:"usage"`
 	}
-	view := providerView{Provider: p}
+	view := providerDetailView{Provider: p}
 	snap, err := s.store.GetProviderUsage(id)
 	if err != nil {
 		s.logger.Warn("读取用量快照失败", "err", err)
@@ -389,7 +419,8 @@ func (s *Server) handleActivateProvider(w http.ResponseWriter, r *http.Request) 
 		s.fail(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, list)
+	// 与列表接口保持同一形态（带 keyHealth / usage），前端可以直接整份替换。
+	s.writeJSON(w, http.StatusOK, s.providerViews(list))
 }
 
 func (s *Server) handleReorderProviders(w http.ResponseWriter, r *http.Request) {
@@ -418,9 +449,11 @@ func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 允许前端临时传入「待保存」的配置，这样用户不用先保存再测试。
+	// 用 providerPayload 而不是裸 model.Provider：前端可能把列表里的对象
+	// 原样回传（含空串时间戳），裸结构会因此 400。
 	var override *model.Provider
 	var body struct {
-		model.Provider
+		providerPayload
 		ProbeModel string `json:"probeModel"`
 	}
 	if s.decodeOptional(w, r, &body) && body.BaseURL != "" {
@@ -456,9 +489,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	// 与 /test、/usage 一致：允许带上「待保存」的配置，这样在编辑模型映射时改完 BaseURL
 	// 或密钥后，不用先保存就能拉一份模型列表来选。
 	var override *model.Provider
-	var body struct {
-		model.Provider
-	}
+	var body providerPayload
 	if s.decodeOptional(w, r, &body) && body.BaseURL != "" {
 		candidate := body.Provider
 		candidate.ID = prov.ID
@@ -547,6 +578,10 @@ func (s *Server) handleApplyProviderPreset(w http.ResponseWriter, r *http.Reques
 		s.fail(w, err)
 		return
 	}
+	// 预设会改动续传/缓存键等影响转发行为的字段：不清续传状态的话，
+	// 旧缓存键关联的上一轮对话会被带进新配置，出现「换了预设但还连着旧会话」。
+	s.proxy.ResetContinuation()
+	s.hub.Broadcast("providers", nil)
 	s.logger.Info("已应用供应商优化预设", "provider", updated.Name, "preset", preset.ID, "fields", applied)
 	s.writeJSON(w, http.StatusOK, map[string]any{"provider": updated, "applied": applied})
 }
@@ -602,9 +637,7 @@ func (s *Server) handleProviderUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var override *model.Provider
-	var body struct {
-		model.Provider
-	}
+	var body providerPayload
 	// 与 /test 一致：用 BaseURL 是否为空来判断「前端有没有真的传配置过来」。
 	// 空请求体（意思是用已保存的配置查一遍）走数据库里的那份。
 	if s.decodeOptional(w, r, &body) && body.BaseURL != "" {
@@ -661,18 +694,70 @@ func (s *Server) handleGetLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteLogs(w http.ResponseWriter, r *http.Request) {
-	q, err := parseLogQuery(r)
+	// 这里刻意不走 parseLogQuery：那个函数在不给时间参数时会默认套上
+	// 「最近 24 小时」，于是「无条件 DELETE /api/logs」会静默删掉一天的数据，
+	// 而不是被空条件保护挡住。range=all 也不能翻译成 ts_start <= now ——
+	// 那个条件恒真，同样绕过 store 层的全表删保护。
+	q, err := parseLogDeleteQuery(r)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	n, err := s.store.DeleteLogs(q)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		if errors.Is(err, store.ErrLogFilterRequired) {
+			// 客户端没给任何条件：这是请求本身的问题，不是服务端故障。
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.fail(w, err)
 		return
 	}
 	s.hub.Broadcast("logs-cleared", map[string]any{"deleted": n})
 	s.writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
+}
+
+// parseLogDeleteQuery 解析删除条件的子集，时间区间只在显式给出时才生效。
+func parseLogDeleteQuery(r *http.Request) (model.LogQuery, error) {
+	qv := r.URL.Query()
+	q := model.LogQuery{
+		Model:   qv.Get("model"),
+		Status:  qv.Get("status"),
+		Keyword: qv.Get("q"),
+	}
+	// 非法 status 会让 buildLogFilter 静默不生成条件，最后被「缺少删除条件」
+	// 拒掉 —— 用户明明带了筛选，却被告知没带条件，提示完全指错方向。
+	switch q.Status {
+	case "", "success", "failed", "cancelled":
+	default:
+		return q, fmt.Errorf("status 只能是 success / failed / cancelled: %q", q.Status)
+	}
+	if v := qv.Get("providerId"); v != "" {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return q, fmt.Errorf("providerId 不是合法数字: %s", v)
+		}
+		q.ProviderID = id
+	}
+	from, to, err := parseDeleteRange(qv.Get("range"), qv.Get("from"), qv.Get("to"))
+	if err != nil {
+		return q, err
+	}
+	q.From, q.To = from, to
+	return q, nil
+}
+
+// parseDeleteRange 与 parseRange 的差别只有一处：不给参数（或 range=all）时
+// 保持零值，即「不加时间条件」，交给 store 判断条件是否为空。
+func parseDeleteRange(rangeSpec, fromSpec, toSpec string) (time.Time, time.Time, error) {
+	if fromSpec != "" || toSpec != "" {
+		return parseRange(rangeSpec, fromSpec, toSpec)
+	}
+	switch strings.TrimSpace(rangeSpec) {
+	case "", "all":
+		return time.Time{}, time.Time{}, nil
+	}
+	return parseRange(rangeSpec, "", "")
 }
 
 func (s *Server) handleClearLogs(w http.ResponseWriter, r *http.Request) {
@@ -680,7 +765,12 @@ func (s *Server) handleClearLogs(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Confirm bool `json:"confirm"`
 	}
-	if !s.decode(w, r, &body) || !body.Confirm {
+	// 解析失败时 decode 已经写好 400 响应体，这里必须立刻返回：
+	// 继续写第二个响应头会触发 "superfluous WriteHeader" 并丢掉真正的错误信息。
+	if !s.decode(w, r, &body) {
+		return
+	}
+	if !body.Confirm {
 		s.writeError(w, http.StatusBadRequest, "请显式确认后再清空日志（confirm=true）")
 		return
 	}
@@ -1115,15 +1205,33 @@ func parseRange(rangeSpec, fromSpec, toSpec string) (time.Time, time.Time, error
 
 func (s *Server) rangeFromRequest(r *http.Request) (time.Time, time.Time, error) {
 	qv := r.URL.Query()
-	return parseRange(qv.Get("range"), qv.Get("from"), qv.Get("to"))
+	from, to, err := parseRange(qv.Get("range"), qv.Get("from"), qv.Get("to"))
+	if err != nil {
+		return from, to, err
+	}
+	// 只传 from 时 to 是零值。拿零值去查就是 ts_start <= 0001，永远查不到数据；
+	// 补成当前时间，查询与响应里的区间才和「从现在往前」的直觉一致。
+	if !from.IsZero() && to.IsZero() {
+		to = time.Now()
+	}
+	return from, to, nil
 }
 
 // autoBucket 按时间跨度自动选择分桶粒度，让趋势图点数保持在可读范围。
+//
+// 端点可能只给 from 不给 to（或反过来），零值不能直接参与 Sub：
+// to 零值时用当前时间补齐，跨度算出来是负数（from 在未来）则退回按天分桶。
 func autoBucket(from, to time.Time) store.Bucket {
 	if from.IsZero() {
 		return store.BucketDay
 	}
+	if to.IsZero() {
+		to = time.Now()
+	}
 	span := to.Sub(from)
+	if span <= 0 {
+		return store.BucketDay
+	}
 	switch {
 	case span <= 6*time.Hour:
 		return store.BucketMinute

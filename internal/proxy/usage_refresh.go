@@ -27,6 +27,12 @@ import (
 func (s *Server) RefreshUsage(ctx context.Context, prov model.Provider, settings model.Settings) model.UsageSnapshot {
 	snap := s.QueryUsage(ctx, prov, settings)
 	snap.ProviderID = prov.ID
+	// 取消/超时是被动中断，不是上游给的结论：这类结果不能覆盖库里已有的
+	// 有效快照，否则关页面、重启、切供应商都会把「上一份好数据」冲成
+	// 一条「查询失败」，界面看起来就像额度突然读不到了。
+	if ctx.Err() != nil {
+		return snap
+	}
 	if err := s.store.SaveProviderUsage(snap); err != nil {
 		s.logger.Warn("保存用量快照失败", "provider", prov.Name, "err", err)
 	}

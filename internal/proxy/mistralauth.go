@@ -22,6 +22,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +75,17 @@ func newMistralSession() *mistralSession {
 	return &mistralSession{entries: map[string]mistralToken{}}
 }
 
+// mistralSessionCacheKey 是会话缓存的键：账号 + 密码摘要。
+//
+// 为什么不能只用账号：用户改了密码之后，按账号缓存的那份旧 session 会被上游
+// 判失效，而缓存里的过期时间还没到，于是每次查询都拿着旧 token 撞 401，
+// 要等十几个小时缓存自然过期才恢复。带上密码摘要等于「换密码即换缓存项」。
+// 摘要而不是明文：缓存键会出现在内存 dump 与日志排查里，没必要带明文口令。
+func mistralSessionCacheKey(account, password string) string {
+	sum := sha256.Sum256([]byte(password))
+	return account + "\x00" + hex.EncodeToString(sum[:])
+}
+
 // Token 返回该账号可用的 session_token，必要时先登录。
 //
 // forceRefresh 为 true 时忽略缓存强制重登（调用方收到 401 时用）。
@@ -86,12 +99,21 @@ func (s *mistralSession) Token(
 	if password == "" {
 		return "", errors.New("未填写 Mistral 密码")
 	}
+	key := mistralSessionCacheKey(account, password)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 顺手清掉过期条目：缓存键带密码摘要，用户反复改密码时旧键会一直留着。
+	now := time.Now()
+	for k, v := range s.entries {
+		if v.token == "" || !now.Before(v.expires) {
+			delete(s.entries, k)
+		}
+	}
+
 	if !forceRefresh {
-		if t, ok := s.entries[account]; ok && t.token != "" && time.Now().Before(t.expires) {
+		if t, ok := s.entries[key]; ok && t.token != "" {
 			return t.token, nil
 		}
 	}
@@ -99,18 +121,11 @@ func (s *mistralSession) Token(
 	tok, err := mistralLogin(ctx, client, account, password)
 	if err != nil {
 		// 登录失败就把旧缓存丢掉：留着只会在下次静默返回一个已失效的 token。
-		delete(s.entries, account)
+		delete(s.entries, key)
 		return "", err
 	}
-	s.entries[account] = tok
+	s.entries[key] = tok
 	return tok.token, nil
-}
-
-// forget 清掉某个账号的缓存，供调用方在收到 401 后使用。
-func (s *mistralSession) forget(account string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.entries, strings.TrimSpace(account))
 }
 
 // mistralLogin 走完 Ory 的两阶段登录，返回 session_token 与过期时间。
@@ -284,20 +299,31 @@ func doMistralRequest(client *http.Client, req *http.Request) (int, []byte, erro
 }
 
 // mistralFlow 是 Ory 登录流程响应里我们关心的部分。
+//
+// Attributes.Value 用 any 而不是 string：Ory 的节点值不全是字符串（复选框是
+// bool，数字输入是 number），给成 string 会让整份响应用 Unmarshal 直接失败，
+// 于是「密码阶段拿不到 csrf」被误报成「登录响应不是合法 JSON」。
 type mistralFlow struct {
 	State string `json:"state"`
 	UI    struct {
-		Nodes []struct {
-			Attributes struct {
-				Name  string `json:"name"`
-				Value string `json:"value"`
-			} `json:"attributes"`
-			Messages []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"messages"`
-		} `json:"nodes"`
+		Nodes    []mistralFlowNode    `json:"nodes"`
+		Messages []mistralFlowMessage `json:"messages"`
 	} `json:"ui"`
+}
+
+// mistralFlowNode 是一个输入节点。
+type mistralFlowNode struct {
+	Attributes struct {
+		Name  string `json:"name"`
+		Value any    `json:"value"`
+	} `json:"attributes"`
+	Messages []mistralFlowMessage `json:"messages"`
+}
+
+// mistralFlowMessage 是节点或流程级的一条提示（type=error 才是错误）。
+type mistralFlowMessage struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 func parseMistralFlow(body []byte) (mistralFlow, error) {
@@ -321,20 +347,42 @@ func (f mistralFlow) hasNode(name string) bool {
 // nodeValue 取某个节点的值（csrf_token 这类 hidden 字段用）。
 func (f mistralFlow) nodeValue(name string) string {
 	for _, n := range f.UI.Nodes {
-		if n.Attributes.Name == name {
-			return n.Attributes.Value
+		if n.Attributes.Name != name {
+			continue
+		}
+		switch v := n.Attributes.Value.(type) {
+		case string:
+			return v
+		case nil:
+			return ""
+		default:
+			// 少数节点是 bool / number（如复选框），按可读文本处理即可：
+			// 这里只取给上游回填的值，格式由 Ory 自己校验。
+			return fmt.Sprint(v)
 		}
 	}
 	return ""
 }
 
 // firstError 返回流程里的第一条错误消息。
+//
+// 两处都要扫：节点上的消息是「这个字段填错了」，ui.messages 是流程级错误
+// （限流、会话失效等）。只看节点会把这类整体性失败当成「登录响应异常」，
+// 用户拿到的提示就完全指错了方向。
 func (f mistralFlow) firstError() string {
 	for _, n := range f.UI.Nodes {
-		for _, m := range n.Messages {
-			if strings.EqualFold(m.Type, "error") && strings.TrimSpace(m.Text) != "" {
-				return strings.TrimSpace(m.Text)
-			}
+		if msg := firstErrorMessage(n.Messages); msg != "" {
+			return msg
+		}
+	}
+	return firstErrorMessage(f.UI.Messages)
+}
+
+// firstErrorMessage 从一组消息里取出第一条 type=error 的非空文本。
+func firstErrorMessage(messages []mistralFlowMessage) string {
+	for _, m := range messages {
+		if strings.EqualFold(m.Type, "error") && strings.TrimSpace(m.Text) != "" {
+			return strings.TrimSpace(m.Text)
 		}
 	}
 	return ""

@@ -167,6 +167,12 @@ func probeHeaders(prov model.Provider) http.Header {
 			h.Set(name, value)
 		}
 	}
+	// Anthropic 官方接口缺 anthropic-version 会直接 400，探活就会把「配置缺一个头」
+	// 误报成「连不通」。用户在 ExtraHeaders 里自己指定过就以用户的为准 ——
+	// 有些网关只认自己的版本号，硬覆盖会把本来可用的配置探成不可用。
+	if prov.APIFormat == model.FormatAnthropic && h.Get("anthropic-version") == "" {
+		h.Set("anthropic-version", "2023-06-01")
+	}
 	h.Set("Accept", "application/json")
 	return h
 }
@@ -229,6 +235,9 @@ func chatProbe(format model.APIFormat, probeModel string) (string, []byte) {
 
 // parseModelList 兼容 OpenAI 的 data[].id 与 Gemini 的 models[].name 两种结构，
 // 也接受裸数组，尽量把能认出来的模型名都捞出来。
+//
+// 只把「数组元素」当模型对象：容器对象（如 {"object":"list","data":[…]}）身上
+// 也可能有 name 之类的字段，把它当模型会混进一个列表标题。
 func parseModelList(body []byte) []string {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
@@ -236,32 +245,28 @@ func parseModelList(body []byte) []string {
 	}
 
 	set := map[string]struct{}{}
-	var walk func(node any)
-	walk = func(node any) {
+	var walk func(node any, isElement bool)
+	walk = func(node any, isElement bool) {
 		switch t := node.(type) {
 		case []any:
 			for _, item := range t {
-				walk(item)
+				walk(item, true)
 			}
 		case map[string]any:
-			if s, ok := t["id"].(string); ok && s != "" {
-				set[s] = struct{}{}
-			}
-			if s, ok := t["name"].(string); ok && s != "" {
-				// Gemini 的 name 形如 models/gemini-pro
-				set[strings.TrimPrefix(s, "models/")] = struct{}{}
-			}
-			if s, ok := t["model"].(string); ok && s != "" {
-				set[s] = struct{}{}
+			if isElement {
+				if name, ok := modelNameFromObject(t); ok {
+					set[name] = struct{}{}
+					return
+				}
 			}
 			for _, key := range []string{"data", "models", "items"} {
 				if child, ok := t[key]; ok {
-					walk(child)
+					walk(child, false)
 				}
 			}
 		}
 	}
-	walk(root)
+	walk(root, false)
 
 	out := make([]string, 0, len(set))
 	for k := range set {
@@ -269,6 +274,24 @@ func parseModelList(body []byte) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// modelNameFromObject 从模型对象里择一取出模型 ID（id > model > name）。
+//
+// name 只在没有 id/model 时才用，且要剥掉 Gemini 的 models/ 前缀：Gemini 的
+// 条目里 name 是 ID（"models/gemini-2.0-flash"），displayName 才是标题；但不少
+// 网关的条目是 {"id":"…","name":"Some Display Title"} —— 一律把 name 当 ID 会
+// 让下拉框里混进一批人写的标题，选中后请求直接 404。
+func modelNameFromObject(m map[string]any) (string, bool) {
+	for _, key := range []string{"id", "model"} {
+		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s), true
+		}
+	}
+	if s, ok := m["name"].(string); ok && strings.TrimSpace(s) != "" {
+		return strings.TrimPrefix(strings.TrimSpace(s), "models/"), true
+	}
+	return "", false
 }
 
 // describeProbeFailure 把上游的失败响应译成一句能指导操作的话。

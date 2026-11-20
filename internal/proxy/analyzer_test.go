@@ -413,6 +413,9 @@ func TestUsageOnlyChunkDetection(t *testing.T) {
 		{"带内容的正常块", `{"choices":[{"delta":{"content":"x"}}]}`, false},
 		{"choices 缺失但有 usage", `{"usage":{"prompt_tokens":1}}`, true},
 		{"空 choices 无 usage", `{"choices":[]}`, false},
+		// `usage: null` 是「有键没值」，同样不是 usage 块；按键名判会把该转发的
+		// 空块剥掉。
+		{"usage 为 null", `{"choices":[],"usage":null}`, false},
 		{"DONE 标记", `[DONE]`, false},
 	}
 	for _, c := range cases {
@@ -492,5 +495,85 @@ func TestEstimatePromptTokens(t *testing.T) {
 	// system 2 字 + 消息正文 2 字，共 4，再加 1 条消息的结构开销 4。
 	if got := estimatePromptTokens(model.FormatAnthropic, anthropicBody); got != 8 {
 		t.Errorf("Anthropic 结构应估算为 8（含 system 与消息开销），实际 %d", got)
+	}
+
+	// Responses 的 input 可以是一整段字符串（{"input":"hi"} 最简写法）。
+	// 不认这种形态会把全部输入算成 0。
+	responsesBody := []byte(`{"model":"m","input":"你好世界"}`)
+	if got := estimatePromptTokens(model.FormatResponses, responsesBody); got != 8 {
+		t.Errorf("Responses 字符串 input 应估算为 8（4 字 + 1 条消息开销），实际 %d", got)
+	}
+}
+
+// Anthropic 的 SSE 有些网关不写 `event:` 行，只在 data 里带 type。
+// 只认事件名会让 usage 与正文全部丢失。
+func TestAnalyzerAnthropicSSEWithoutEventLines(t *testing.T) {
+	body := "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-3\",\"usage\":{\"input_tokens\":25,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":10}}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":40}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+
+	a := newAnalyzer(model.FormatAnthropic, nil, "text/event-stream")
+	feedSSE(a, body)
+
+	u := a.Result()
+	if !u.Found {
+		t.Fatal("缺 event 行时也应从 data.type 推出事件类型并读到用量")
+	}
+	if u.PromptTokens != 135 || u.CachedTokens != 100 || u.CacheWriteTokens != 10 {
+		t.Errorf("输入侧用量解析错误: %+v", u)
+	}
+	if u.CompletionTokens != 40 {
+		t.Errorf("输出应为 40，实际 %d", u.CompletionTokens)
+	}
+	if a.Model() != "claude-3" {
+		t.Errorf("模型名应来自 message_start，实际 %q", a.Model())
+	}
+	if !a.HasContent() {
+		t.Error("正文 delta 应被计入输出")
+	}
+	if !a.StreamFinished() {
+		t.Error("data 里的 message_stop 应视为流正常结束")
+	}
+	// 终止事件的判定同样要认 data.type。
+	if !a.TerminalEvent("", `{"type":"message_stop"}`) {
+		t.Error("缺 event 行时 message_stop 也应判为终止事件")
+	}
+	if a.TerminalEvent("", `{"type":"content_block_delta"}`) {
+		t.Error("普通事件不该判为终止事件")
+	}
+}
+
+// 非流式 Anthropic 响应同样带 type:"message"，不能按 SSE 逐行解析后当成事件。
+func TestAnalyzerAnthropicNonStreamingKeepsUsage(t *testing.T) {
+	body := `{"type":"message","model":"claude-sonnet-4","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",
+		"usage":{"input_tokens":10,"output_tokens":5}}`
+
+	a := newAnalyzer(model.FormatAnthropic, nil, "application/json")
+	a.Feed([]byte(body))
+	a.Finish()
+
+	u := a.Result()
+	if u.PromptTokens != 10 || u.CompletionTokens != 5 || !u.Found {
+		t.Errorf("非流式用量解析错误: %+v", u)
+	}
+	if !a.HasContent() {
+		t.Error("非流式正文应计入输出")
+	}
+}
+
+// 流式输出估算不能逐块向上取整：8 个单字符块合起来是 2 token，
+// 逐块 (n+3)/4 会算成 8 token。
+func TestAnalyzerEstimateOutputNoPerChunkInflation(t *testing.T) {
+	a := newAnalyzer(model.FormatOpenAI, nil, "text/event-stream")
+	var sb strings.Builder
+	for i := 0; i < 8; i++ {
+		sb.WriteString("data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n")
+	}
+	feedSSE(a, sb.String())
+
+	if got := a.EstimateOutputTokens(); got != 2 {
+		t.Errorf("8 个字符应估算为 2 token（不能逐块向上取整），实际 %d", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,6 +76,8 @@ type fakeGitHub struct {
 	assets   map[string][]byte
 	notes    string
 	checksum string // 覆盖 SHA256SUMS.txt 内容；空则按实际文件算
+	// delay 让资产下载人为变慢，用来验证下载不受客户端硬超时限制。
+	delay time.Duration
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -110,6 +113,13 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			http.NotFound(w, r)
 			return
 		}
+		if f.delay > 0 {
+			select {
+			case <-time.After(f.delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		_, _ = w.Write(body)
 	})
 	f.srv = httptest.NewServer(mux)
@@ -141,7 +151,7 @@ func newTestManager(t *testing.T, f *fakeGitHub, version string, desktop bool) *
 	// 把 API 地址指到假服务器：fetchLatest 用的是常量模板，
 	// 这里通过覆盖 repo 无法做到，所以直接替换 apiLatest 不可行 ——
 	// 改为让 Manager 用一个可注入的 fetch 函数。
-	m.fetch = func(client *http.Client, repo, current string) (Release, error) {
+	m.fetch = func(_ context.Context, client *http.Client, repo, current string) (Release, error) {
 		resp, err := client.Get(f.srv.URL + "/releases/latest")
 		if err != nil {
 			return Release{}, err
@@ -251,9 +261,9 @@ func TestCheckRespectsMinInterval(t *testing.T) {
 
 	calls := 0
 	orig := m.fetch
-	m.fetch = func(c *http.Client, repo, cur string) (Release, error) {
+	m.fetch = func(_ context.Context, c *http.Client, repo, cur string) (Release, error) {
 		calls++
-		return orig(c, repo, cur)
+		return orig(context.Background(), c, repo, cur)
 	}
 
 	if _, err := m.Check(context.Background(), false); err != nil {
@@ -418,7 +428,7 @@ func TestCheckRestoresPersistedStateWithinInterval(t *testing.T) {
 		Store: st, Hub: hub.New(),
 		ClientFactory: func() (*http.Client, error) { return &http.Client{}, nil },
 	})
-	m1.fetch = func(c *http.Client, repo, cur string) (Release, error) {
+	m1.fetch = func(_ context.Context, c *http.Client, repo, cur string) (Release, error) {
 		resp, err := c.Get(f.srv.URL + "/releases/latest")
 		if err != nil {
 			return Release{}, err
@@ -443,7 +453,7 @@ func TestCheckRestoresPersistedStateWithinInterval(t *testing.T) {
 		ClientFactory: func() (*http.Client, error) { return &http.Client{}, nil },
 	})
 	calls := 0
-	m2.fetch = func(c *http.Client, repo, cur string) (Release, error) {
+	m2.fetch = func(_ context.Context, c *http.Client, repo, cur string) (Release, error) {
 		calls++
 		return Release{}, nil
 	}
@@ -475,7 +485,7 @@ func TestRestoreRecomputesHasUpdateAfterUpgrade(t *testing.T) {
 	f := newFakeGitHub(t)
 	f.assets[assetDesktop] = []byte("x")
 
-	fetch := func(c *http.Client, repo, cur string) (Release, error) {
+	fetch := func(_ context.Context, c *http.Client, repo, cur string) (Release, error) {
 		resp, err := c.Get(f.srv.URL + "/releases/latest")
 		if err != nil {
 			return Release{}, err
@@ -506,7 +516,7 @@ func TestRestoreRecomputesHasUpdateAfterUpgrade(t *testing.T) {
 		Store: st, Hub: hub.New(),
 		ClientFactory: func() (*http.Client, error) { return &http.Client{}, nil },
 	})
-	m2.fetch = func(*http.Client, string, string) (Release, error) {
+	m2.fetch = func(context.Context, *http.Client, string, string) (Release, error) {
 		t.Fatal("节流期内不该请求 GitHub")
 		return Release{}, nil
 	}
@@ -538,7 +548,7 @@ func TestSkipAndCheckDoNotClobberEachOther(t *testing.T) {
 		Store: st, Hub: hub.New(),
 		ClientFactory: func() (*http.Client, error) { return &http.Client{}, nil },
 	})
-	m.fetch = func(c *http.Client, repo, cur string) (Release, error) {
+	m.fetch = func(_ context.Context, c *http.Client, repo, cur string) (Release, error) {
 		resp, err := c.Get(f.srv.URL + "/releases/latest")
 		if err != nil {
 			return Release{}, err
@@ -607,7 +617,7 @@ func TestStateBroadcastsOnChange(t *testing.T) {
 		Store: st, Hub: h,
 		ClientFactory: func() (*http.Client, error) { return &http.Client{}, nil },
 	})
-	m.fetch = func(c *http.Client, repo, cur string) (Release, error) {
+	m.fetch = func(_ context.Context, c *http.Client, repo, cur string) (Release, error) {
 		resp, err := c.Get(f.srv.URL + "/releases/latest")
 		if err != nil {
 			return Release{}, err
@@ -639,5 +649,129 @@ func TestStateBroadcastsOnChange(t *testing.T) {
 		case <-deadline:
 			t.Fatal("没有收到 update 事件")
 		}
+	}
+}
+
+// Check 必须把调用方的 ctx 交给网络请求：服务关停/界面取消后，正在飞的
+// GitHub 请求要能立刻结束，而不是自己跑到超时。
+func TestCheckPassesContextToFetch(t *testing.T) {
+	f := newFakeGitHub(t)
+	m := newTestManager(t, f, "0.2.3", true)
+
+	type ctxKey struct{}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "marker")
+	got := ""
+	m.fetch = func(gotCtx context.Context, _ *http.Client, _, _ string) (Release, error) {
+		if v, ok := gotCtx.Value(ctxKey{}).(string); ok {
+			got = v
+		}
+		return Release{Tag: "v9.9.9"}, nil
+	}
+	if _, err := m.Check(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if got != "marker" {
+		t.Errorf("ctx 没有传到 fetch，实际 %q", got)
+	}
+}
+
+// fetchLatest 的请求必须挂上 ctx：上游不响应时，取消能立刻让它返回
+// （而不是等 http.Client 自己的超时）。
+func TestFetchLatestHonorsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if _, err := fetchLatest(ctx, &http.Client{}, "test/repo", "0.2.3"); err == nil {
+		t.Fatal("ctx 已取消时应当返回错误")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("ctx 取消后应立刻返回，实际耗时 %v", elapsed)
+	}
+}
+
+// 下载不能被客户端那 15～30 秒的全局 Timeout 掐断：慢网下大文件必然超时。
+func TestDownloadIgnoresClientHardTimeout(t *testing.T) {
+	payload := []byte("slow but valid binary")
+	f := newFakeGitHub(t)
+	f.assets[assetDesktop] = payload
+	f.delay = 150 * time.Millisecond
+
+	m := newTestManager(t, f, "0.2.3", true)
+	if _, err := m.Check(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟按普通 API 请求配出来的客户端：50ms 就不耐烦了。
+	client := &http.Client{Timeout: 50 * time.Millisecond}
+	rel := m.latest
+	asset, ok := rel.AssetByName(assetDesktop)
+	if !ok {
+		t.Fatal("缺少资产")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	path, err := m.download(ctx, client, rel, asset)
+	if err != nil {
+		t.Fatalf("下载不该受客户端硬超时影响: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(path) })
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("下载内容不一致: %q", got)
+	}
+}
+
+// 安装期间 Check 不能覆盖安装进度：用户看到的是「进度条跑着突然跳回 idle」。
+func TestCheckDoesNotOverwriteInstallingState(t *testing.T) {
+	f := newFakeGitHub(t)
+	m := newTestManager(t, f, "0.2.3", true)
+
+	m.fetch = func(context.Context, *http.Client, string, string) (Release, error) {
+		t.Fatal("安装期间不该发起检查请求")
+		return Release{}, nil
+	}
+	m.setState(func(s *State) {
+		s.Phase = PhaseDownloading
+		s.Progress = 42
+	})
+	m.mu.Lock()
+	m.installing = true
+	m.mu.Unlock()
+
+	st, err := m.Check(context.Background(), true)
+	if err != nil {
+		t.Fatalf("安装期间的检查应安静返回: %v", err)
+	}
+	if st.Phase != PhaseDownloading || st.Progress != 42 {
+		t.Errorf("安装状态被检查覆盖了: %+v", st)
+	}
+}
+
+// 重启后从持久化恢复的状态只有 HasUpdate，m.latest 是空的。此时点「立即更新」
+// 必须补拉一次 release；走 Check 会被安装期间的 guard 直接挡掉，导致永远报
+// 「发布里没有找到 ai_proxy-desktop.exe」。
+func TestInstallFetchesReleaseWhenLatestMissing(t *testing.T) {
+	f := newFakeGitHub(t)
+	m := newTestManager(t, f, "0.2.3", true)
+	m.setState(func(s *State) {
+		s.HasUpdate = true
+		s.CanAutoInstall = true
+		s.LatestVersion = "v9.9.9"
+	})
+
+	calls := 0
+	m.fetch = func(context.Context, *http.Client, string, string) (Release, error) {
+		calls++
+		return Release{}, fmt.Errorf("fetch-marker")
+	}
+	err := m.Install(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "fetch-marker") {
+		t.Fatalf("安装时应补拉 release 并报出拉取错误，实际 %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("应补拉一次 release，实际 %d 次", calls)
 	}
 }

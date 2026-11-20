@@ -207,6 +207,13 @@ export interface Provider {
   stripUnsupportedParams: boolean
 
   /**
+   * 思维链还原（ThinkChunk）：把历史 assistant.reasoning_content 还原成
+   * Mistral 原生的 thinking 内容块，保持多步工具调用的思维链连续。
+   * 只对认这个内容块的上游开启。
+   */
+  replayReasoningAsThinkChunk: boolean
+
+  /**
    * prompt_cache_key 注入模式。auto 时按「会话头 → 首条消息+tools 指纹」派生一个稳定值，
    * 提升上游前缀缓存命中率；不认这个字段的严格网关会被 422，所以默认 off。
    */
@@ -432,6 +439,7 @@ export interface ProviderPreset {
   hosts: string[]
   changes: PresetChange[]
   stripUnsupportedParams?: boolean
+  replayReasoningAsThinkChunk?: boolean
   promptCacheKeyMode?: 'off' | 'auto'
   usageInjectMode?: 'inherit' | 'on' | 'off'
   continuationMode?: 'off' | 'dry-run' | 'on'

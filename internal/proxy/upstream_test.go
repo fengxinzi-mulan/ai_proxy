@@ -16,7 +16,7 @@ import (
 )
 
 func TestMatchesNoProxy(t *testing.T) {
-	list := []string{"example.com", ".internal.corp", " localhost "}
+	list := []string{"example.com", ".internal.corp", " localhost ", "*.wild.io", "[::1]:8080", "10.0.0.5:3128"}
 
 	cases := map[string]bool{
 		"example.com":         true,
@@ -27,6 +27,11 @@ func TestMatchesNoProxy(t *testing.T) {
 		"notexample.com":      false,
 		"example.com.evil.io": false,
 		"other.io":            false,
+		"api.wild.io":         true,  // 通配只匹配子域
+		"wild.io":             false, // 通配不匹配裸域名
+		"[::1]":               true,  // 方括号写法
+		"::1":                 true,  // 去括号后仍命中
+		"10.0.0.5":            true,  // 带端口的写法按 host 比较
 	}
 	for host, want := range cases {
 		if got := matchesNoProxy(host, list); got != want {

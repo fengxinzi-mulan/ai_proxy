@@ -139,13 +139,20 @@ func trimExcessImages(obj map[string]any, maxImages, batch int) int {
 			collectImageSlots(item, &slots, true, true)
 		}
 		for _, key := range sortedKeys(obj) {
-			if key == "input" {
+			if key == "input" || skipTrimField(key) {
 				continue
 			}
 			collectImageSlots(obj[key], &slots, false, false)
 		}
 	} else {
-		collectImageSlots(obj, &slots, false, false)
+		// 顶层直接按字段遍历：tools / response_format 这些不是对话内容，
+		// 里面的图片是工具定义或响应格式，替换掉会弄坏请求本身。
+		for _, key := range sortedKeys(obj) {
+			if skipTrimField(key) {
+				continue
+			}
+			collectImageSlots(obj[key], &slots, false, false)
+		}
 	}
 	if len(slots) <= maxImages {
 		return 0
@@ -238,6 +245,19 @@ func collectImageSlots(node any, out *[]imageSlot, inArray, topLevelInput bool) 
 	}
 }
 
+// skipTrimField 报告顶层字段不属于对话内容，裁剪时不应改动。
+//
+// tools / tool_choice / response_format / metadata 是请求的配置部分：里面出现的
+// 图片属于工具定义或结构化输出约束，把它们换成占位文本会直接让上游判非法，
+// 而它们本来也不计入上游的图片张数。
+func skipTrimField(key string) bool {
+	switch key {
+	case "tools", "tool_choice", "response_format", "metadata":
+		return true
+	}
+	return false
+}
+
 // classifyImagePart 判断这个 map 是不是一个图片 part，以及属于哪种形状。
 //
 // 与 imagecompress.go 认的落点集合同一套，区别是**不做值校验**：压缩只处理能
@@ -254,7 +274,9 @@ func collectImageSlots(node any, out *[]imageSlot, inArray, topLevelInput bool) 
 func classifyImagePart(m map[string]any) (imageSlotKind, bool) {
 	typ, _ := m["type"].(string)
 	switch typ {
-	case "image_url", "input_image":
+	case "image_url", "input_image", "image_data":
+		// image_data 是部分网关（以及图片生成接口的回填）用的类型名，
+		// 压缩侧 imageKeys 同样认这个键。
 		return slotChatImage, true
 	case "image":
 		// Anthropic 的 {"type":"image","source":{…}}。没有 source/data/url
@@ -283,6 +305,10 @@ func classifyImagePart(m map[string]any) (imageSlotKind, bool) {
 	}
 	// {"b64_json": "…"}：图片生成接口的内联返回。
 	if _, ok := m["b64_json"]; ok {
+		return slotChatImage, true
+	}
+	// {"image_data": "data:image/…"}：不带 type 的简写，与压缩侧的 imageKeys 对齐。
+	if v, ok := m["image_data"]; ok && looksLikeImageValue(v) {
 		return slotChatImage, true
 	}
 	for _, key := range []string{"inlineData", "inline_data", "fileData", "file_data"} {

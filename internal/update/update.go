@@ -11,6 +11,7 @@
 package update
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -128,9 +129,9 @@ func splitVersion(v string) ([]int, string) {
 }
 
 // fetchLatest 拉取最新正式版。
-func fetchLatest(client *http.Client, repo, currentVersion string) (Release, error) {
+func fetchLatest(ctx context.Context, client *http.Client, repo, currentVersion string) (Release, error) {
 	url := fmt.Sprintf(apiLatest, repo)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return Release{}, err
 	}

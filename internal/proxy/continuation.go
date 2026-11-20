@@ -48,7 +48,13 @@ type continuationManager struct {
 	chains      map[string][]*continuationChain
 	caps        map[string]*continuationCap
 	generations map[string]uint64
-	active      map[string]uint64
+	// activeCount 记录各分支当前在飞的请求数。
+	//
+	// 不能用一个「最新 generation」占位了事：同一分支上并发两个请求时，后到的
+	// 会覆盖先到的标记，先到的那次结束就会把别人的占用一起清掉，第三个请求
+	// 于是在前两个都没结束时被放进来续传，两路同时引用同一个 response id。
+	// 计数归零才清理，占用关系才与请求生命周期一致。
+	activeCount map[string]int
 	// storeMiss 记录各链最近一次「上游明确回 store:false」的时间：下一轮没有
 	// 可用链时，用它把「没建链」和「上游拒存」区分开，日志才看得出是谁的问题。
 	storeMiss map[string]time.Time
@@ -94,6 +100,9 @@ type continuationAttempt struct {
 	inputLen    int
 	savedBytes  int64
 	model       string
+	// reseed 表示这次回退重发补回了 store:true：全量响应仍会被上游保存，
+	// 成功后必须建链，否则下一轮照样从零开始（见 retryContinuation）。
+	reseed bool
 }
 
 func newContinuationManager() *continuationManager {
@@ -101,7 +110,7 @@ func newContinuationManager() *continuationManager {
 		chains:      map[string][]*continuationChain{},
 		caps:        map[string]*continuationCap{},
 		generations: map[string]uint64{},
-		active:      map[string]uint64{},
+		activeCount: map[string]int{},
 		storeMiss:   map[string]time.Time{},
 		now:         time.Now,
 	}
@@ -117,7 +126,7 @@ func (m *continuationManager) reset() {
 	m.chains = map[string][]*continuationChain{}
 	m.caps = map[string]*continuationCap{}
 	m.generations = map[string]uint64{}
-	m.active = map[string]uint64{}
+	m.activeCount = map[string]int{}
 	m.storeMiss = map[string]time.Time{}
 }
 
@@ -253,7 +262,7 @@ func (m *continuationManager) prepare(in *forwardInput, r *http.Request, key mod
 	if chain != nil {
 		branchKey = chainKey + "\x00" + continuationHashString(strings.Join(chain.prefix, ""))
 	}
-	if active := m.active[branchKey]; active != 0 {
+	if active := m.activeCount[branchKey]; active != 0 {
 		// 同一分支已在飞：改为全量，避免两路同时引用同一个 response id。
 		chain = nil
 		useID = false
@@ -264,7 +273,7 @@ func (m *continuationManager) prepare(in *forwardInput, r *http.Request, key mod
 	m.serial++
 	gen := m.serial
 	m.generations[branchKey] = gen
-	m.active[branchKey] = gen
+	m.activeCount[branchKey]++
 	m.mu.Unlock()
 	attempt.generation = gen
 	attempt.branchKey = branchKey
@@ -297,8 +306,10 @@ func (m *continuationManager) prepare(in *forwardInput, r *http.Request, key mod
 	}
 	out, err := json.Marshal(wire)
 	if err != nil {
+		// 释放的是本次占用的分支键：拿 chainKey 去清会漏掉真正登记的那一条，
+		// 该分支就永久停在 active-inflight。
 		m.mu.Lock()
-		m.releaseLocked(chainKey, gen)
+		m.releaseLocked(branchKey, gen)
 		m.mu.Unlock()
 		return nil
 	}
@@ -336,8 +347,15 @@ func (m *continuationManager) commit(attempt *continuationAttempt, res logResult
 	if res.status != http.StatusOK || res.responseStatus != "completed" || len(res.responseOutput) == 0 {
 		return
 	}
-	if !attempt.dryRun && (!attempt.enabled || res.responseID == "") {
-		return
+	if !attempt.dryRun {
+		if res.responseID == "" {
+			return
+		}
+		// 回退重发补回了 store:true 时（reseed）这次响应同样被保存，
+		// 即使本轮已经不再续传，也要建链。
+		if !attempt.enabled && !attempt.reseed {
+			return
+		}
 	}
 	// 供应商明确回 store:false 说明这条响应没有被保存，id 下次多半不可用
 	// （commandcode 会成片出现）。不要建链，下一轮重新发一次 store:true，
@@ -451,10 +469,9 @@ func (m *continuationManager) drop(attempt *continuationAttempt) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if attempt.branchKey != "" {
-		delete(m.generations, attempt.branchKey)
-		delete(m.active, attempt.branchKey)
-	}
+	// 只清链与冷却，不动 generations / activeCount：这两个记的是「谁还在飞」，
+	// 由 commit / fail 的 releaseLocked 正常收尾。在这里一并删掉会让同一分支上
+	// 并发的其它请求的 gen 对不上，它们的 commit 会静默跳过建链。
 	chains := m.chains[attempt.chainKey]
 	if len(chains) == 0 {
 		return
@@ -477,9 +494,13 @@ func (m *continuationManager) releaseLocked(branchKey string, gen uint64) {
 	if branchKey == "" || gen == 0 {
 		return
 	}
-	if m.active[branchKey] == gen {
-		delete(m.active, branchKey)
+	if n := m.activeCount[branchKey]; n > 1 {
+		m.activeCount[branchKey] = n - 1
+	} else {
+		// 归零就删键：留着 0 会让 activeCount 随分支数无界增长。
+		delete(m.activeCount, branchKey)
 	}
+	// 只有最新那一代结束才清 generation：先结束的请求不该把后来者的登记抹掉。
 	if m.generations[branchKey] == gen {
 		delete(m.generations, branchKey)
 	}
@@ -884,6 +905,10 @@ func (s *Server) retryContinuation(resp *http.Response, in *forwardInput, client
 			in.outBody = withStore
 			in.modifications = append(in.modifications, "responses_store_enabled")
 		}
+		// 客户端本来就带 store:true 时 continuationWithStore 返回 nil（无需改写），
+		// 但这次重发的响应依然会被上游保存 —— 成功后同样要建链，否则下一轮
+		// 还是从零开始。所以按最终 body 的实际取值判断，而不是按「有没有改」。
+		attempt.reseed = continuationStoresResponse(in.outBody)
 	}
 	in.modifications = append(in.modifications, "responses_continuation_fallback")
 	ttl := time.Duration(in.provider.ContinuationCooldownSeconds) * time.Second
@@ -896,7 +921,10 @@ func (s *Server) retryContinuation(resp *http.Response, in *forwardInput, client
 	s.continuation.markUnsupported(attempt.scope, reason, ttl)
 	s.continuation.drop(attempt)
 
-	baseReq, err := buildRequest(ctx, http.MethodPost, target, attempt.baseBody, headers)
+	// 发出去的必须是真正记进 in.outBody 的那份：日志里的
+	// responses_store_enabled 与线上报文对不上，排查时就只能靠猜。
+	retryBody := in.outBody
+	baseReq, err := buildRequest(ctx, http.MethodPost, target, retryBody, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -936,11 +964,15 @@ func continuationRetryBody(status int, body []byte, mode string) (bool, string) 
 	if status == http.StatusBadRequest && strings.Contains(text, "native responses") {
 		return true, "provider-rejected"
 	}
-	if !continuationMentionsFailure(text) {
-		return false, ""
-	}
+	// 先判 invalid，再判 failure：上游的报错经常把 invalid_request_error 和
+	// unsupported 混在同一句里，而这两者的处置完全不同 —— 「id 失效」要重新
+	// 建链，「参数不支持」要关掉续传。把 invalid 判在 failure 之后，这个分支
+	// 会被互斥条件拦死，永远走不到。
 	if continuationMentionsInvalid(text) {
 		return true, "invalid-id"
+	}
+	if !continuationMentionsFailure(text) {
+		return false, ""
 	}
 	return true, "provider-rejected"
 }
@@ -1000,6 +1032,19 @@ func continuationWithStore(body []byte) []byte {
 		return nil
 	}
 	return out
+}
+
+// continuationStoresResponse 报告这份请求体最终是否要求上游保存响应（store:true）。
+//
+// 「已经带 store:true」时 continuationWithStore 返回 nil 表示无需改写，
+// 调用方不能把这个 nil 当成「不建链」。
+func continuationStoresResponse(body []byte) bool {
+	m, err := decodeJSONObject(body)
+	if err != nil || m == nil {
+		return false
+	}
+	v, _ := m["store"].(bool)
+	return v
 }
 
 // replayReadCloser 把「已经读出来的前缀」和「还没读的剩余流」拼成一体，

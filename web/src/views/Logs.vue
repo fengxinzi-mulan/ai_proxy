@@ -80,7 +80,11 @@ const models = ref<string[]>([])
 const detailShow = ref(false)
 const detailId = ref<number | null>(null)
 
+// 请求序号：只认最后一次 load 的响应，避免乱序覆盖。
+let loadSeq = 0
+
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
   try {
     const res = await api.listLogs({
@@ -92,12 +96,13 @@ async function load() {
       status: filter.value.status || undefined,
       q: filter.value.q || undefined,
     })
+    if (seq !== loadSeq) return
     rows.value = res.items ?? []
     total.value = res.total
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    if (seq === loadSeq) message.error(e instanceof Error ? e.message : String(e))
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
@@ -152,8 +157,21 @@ useEvents({
   onLog: (entry) => {
     if (!canStream.value) return
     if (filter.value.providerId && entry.providerId !== filter.value.providerId) return
+    // 同一条日志可能既由 SSE 推送、又被 30 秒的整体刷新带回来（刷新先结束、
+    // 推送后到达时更常见）。按 id 去重，否则表格里会出现两行一模一样的记录，
+    // 而且 NDataTable 的 row-key 重复会让整张表渲染异常。
+    if (rows.value.some((r) => r.id === entry.id)) return
     rows.value = [entry, ...rows.value].slice(0, pageSize.value)
     total.value += 1
+  },
+  onLogsCleared: () => {
+    // 清空可能发生在别的标签页/别的客户端：本地列表必须跟着清，
+    // 否则界面上还留着一批点开就 404 的记录。
+    rows.value = []
+    total.value = 0
+    page.value = 1
+    void load()
+    void loadDBStats()
   },
 })
 

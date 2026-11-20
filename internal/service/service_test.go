@@ -12,6 +12,8 @@ import (
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"ai_proxy/internal/hub"
 )
 
 func testLogger() *slog.Logger {
@@ -217,5 +219,51 @@ func TestNegativePortFallsBackToSetting(t *testing.T) {
 	}()
 	if s.Port() == 0 {
 		t.Fatal("端口不应为 0")
+	}
+}
+
+// Bug 36：IPv6 监听地址必须经 net.JoinHostPort 拼装，通配地址折回回环。
+func TestURLJoinsHostAndPort(t *testing.T) {
+	cases := []struct {
+		host string
+		port int
+		want string
+	}{
+		{"", 8080, "http://127.0.0.1:8080/"},
+		{"0.0.0.0", 8080, "http://127.0.0.1:8080/"},
+		{"::", 8080, "http://127.0.0.1:8080/"},
+		{"127.0.0.1", 8080, "http://127.0.0.1:8080/"},
+		{"localhost", 3000, "http://localhost:3000/"},
+		{"::1", 8080, "http://[::1]:8080/"},
+		{"[::1]", 8080, "http://[::1]:8080/"},
+		{"2001:db8::1", 9000, "http://[2001:db8::1]:9000/"},
+	}
+	for _, c := range cases {
+		s := &Service{host: c.host, port: c.port}
+		if got := s.URL(); got != c.want {
+			t.Errorf("host=%q: URL() = %q, want %q", c.host, got, c.want)
+		}
+	}
+}
+
+// Bug 31 依赖：桌面端靠 SubscriberCount 判断关闭确认框能不能送到界面上。
+func TestSubscriberCount(t *testing.T) {
+	s := &Service{hub: hub.New()}
+	if n := s.SubscriberCount(); n != 0 {
+		t.Fatalf("初始订阅者应为 0，实际 %d", n)
+	}
+	ch := s.hub.Subscribe()
+	if n := s.SubscriberCount(); n != 1 {
+		t.Errorf("订阅后应为 1，实际 %d", n)
+	}
+	s.hub.Unsubscribe(ch)
+	if n := s.SubscriberCount(); n != 0 {
+		t.Errorf("退订后应为 0，实际 %d", n)
+	}
+
+	// 没有 hub 时不能 panic（桌面端刚启动就关窗口的场景）。
+	empty := &Service{}
+	if n := empty.SubscriberCount(); n != 0 {
+		t.Errorf("无 hub 时应返回 0，实际 %d", n)
 	}
 }

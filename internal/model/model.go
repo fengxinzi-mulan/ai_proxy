@@ -256,6 +256,13 @@ type Provider struct {
 	// 默认关闭：不少兼容网关确实认 thinking，不能替用户做主。
 	StripUnsupportedParams bool `json:"stripUnsupportedParams"`
 
+	// ReplayReasoningAsThinkChunk 开启后，在 OpenAI Chat 请求改写阶段会把
+	// assistant 消息里回放的 reasoning_content 对称还原成 Mistral 原生 ThinkChunk
+	// （{"type":"thinking","thinking":[{"type":"text","text":"..."}],"closed":true}）
+	// 合并进 content 数组，而不是直接删掉 —— 避免多步 tool_calls 之间思维链断裂，
+	// 同时保持历史前缀稳定以命中前缀缓存。
+	ReplayReasoningAsThinkChunk bool `json:"replayReasoningAsThinkChunk"`
+
 	// PromptCacheKeyMode 控制是否给请求注入 prompt_cache_key（off | auto）。
 	// 只对 OpenAI 系格式生效；客户端自己带了 key 时不覆盖。
 	PromptCacheKeyMode string `json:"promptCacheKeyMode"`

@@ -59,7 +59,12 @@ const byModel = ref<ModelStatsRow[]>([])
 const byProvider = ref<ProviderStatsRow[]>([])
 const bucket = ref('hour')
 
+// 请求序号：切范围时会连发多次请求，慢的那个若后到会把新范围的数据盖回去。
+let loadSeq = 0
+
 async function load() {
+  // 只认最后一次发起的请求，其余响应直接丢弃。
+  const seq = ++loadSeq
   loading.value = true
   try {
     const [ov, ts, bm, bp] = await Promise.all([
@@ -68,6 +73,7 @@ async function load() {
       api.byModel(range.value, 8),
       api.byProvider(range.value, 8),
     ])
+    if (seq !== loadSeq) return
     stats.value = ov.stats
     if (ov.activeProvider) {
       const activeId = ov.activeProvider.id
@@ -80,16 +86,28 @@ async function load() {
     byModel.value = bm
     byProvider.value = bp
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    if (seq === loadSeq) message.error(e instanceof Error ? e.message : String(e))
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 // 后端只返回有请求的时间桶，这里补齐空桶，让横轴覆盖完整的所选区间。
 const points = computed<TimeSeriesPoint[]>(() => {
-  const keys = enumerateBuckets(rangeFrom.value, rangeTo.value, bucket.value)
-  if (!keys.length) return rawPoints.value
+  // 一条真实数据都没有时直接给空：否则「全部」范围会拿零值时间做起点，
+  // 补出一整片空桶，NEmpty 永远不触发，界面上是一张全零的图。
+  if (!rawPoints.value.length) return []
+
+  // 「全部」的范围起点是服务端的零值时间（0001-01-01），不能用来枚举。
+  // 以第一条真实数据所在桶为起点，横轴才从「第一次请求」开始画。
+  const from = range.value === 'all' ? rawPoints.value[0].bucket : rangeFrom.value
+  const keys = enumerateBuckets(from, rangeTo.value, bucket.value)
+  if (!keys.length) {
+    // 刚切范围、新数据还没回来时 rangeFrom 可能仍是「全部」的零值：
+    // 这时直接留空，别把上一轮的全量数据挂在新范围的刻度上短暂显示。
+    if (range.value !== 'all' && new Date(rangeFrom.value).getUTCFullYear() < 1970) return []
+    return rawPoints.value
+  }
   const byKey = new Map(rawPoints.value.map((p) => [p.bucket, p]))
   return keys.map(
     (k) =>

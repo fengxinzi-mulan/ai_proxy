@@ -182,6 +182,19 @@ func parseContBody(t *testing.T, raw string) map[string]any {
 	return body
 }
 
+// contChainIDs 列出当前所有已建链的 response id，用于断言「回退后是否重新建链」。
+func contChainIDs(srv *Server) []string {
+	srv.continuation.mu.Lock()
+	defer srv.continuation.mu.Unlock()
+	var out []string
+	for _, chains := range srv.continuation.chains {
+		for _, c := range chains {
+			out = append(out, c.responseID)
+		}
+	}
+	return out
+}
+
 func contInput(t *testing.T, body map[string]any) []any {
 	t.Helper()
 	input, ok := body["input"].([]any)
@@ -738,12 +751,22 @@ func TestContinuationContinuedGeneric400FallsBack(t *testing.T) {
 	if _, ok := b3["previous_response_id"]; ok {
 		t.Errorf("回退不应带 previous_response_id")
 	}
-	if b3["store"] != false {
-		t.Errorf("回退应恢复 store:false，实际 %#v", b3["store"])
+	// 续传轮失败说明上游接受过 store:true，回退重发要把 store 补回去：
+	// 这次全量响应会被保存，下一轮才有链可用。线上报文与日志必须一致。
+	if b3["store"] != true {
+		t.Errorf("续传轮回退应补回 store:true，实际 %#v", b3["store"])
 	}
 	log := lastLog(t, st)
 	if log.ContinuationMode != "fallback" || log.ContinuationReason != "invalid-id" {
 		t.Errorf("应记 fallback/invalid-id，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+	if !strings.Contains(log.ReqBody, `"store":true`) {
+		t.Errorf("日志里的请求体应与线上报文一致（含 store:true），实际 %s", log.ReqBody)
+	}
+	// 补回的 store:true 真生效了，所以回退成功的那次响应必须重新建链，
+	// 否则下一轮照样从零开始。
+	if ids := contChainIDs(srv); len(ids) != 1 || ids[0] != "resp_generic_3" {
+		t.Errorf("回退成功后应重建链到 resp_generic_3，实际 %v", ids)
 	}
 
 	// 冷却期内直接透传，不再拿坏 id 去撞。
@@ -761,6 +784,71 @@ func TestContinuationContinuedGeneric400FallsBack(t *testing.T) {
 	}
 	if log := lastLog(t, st); log.ContinuationMode != "unsupported" || log.ContinuationReason != "invalid-id" {
 		t.Errorf("冷却期应记 unsupported/invalid-id，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	}
+}
+
+// 客户端自己就带 store:true 时，回退重发不需要改写 store（continuationWithStore
+// 返回 nil 表示「无需改动」），但这次全量响应同样会被上游保存。成功后必须
+// 照样重建链，否则下一轮还是从零开始 —— 把 nil 当成「不建链」就会漏掉这条路径。
+func TestContinuationFallbackRebuildsChainWhenClientStores(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		n := len(bodies)
+		mu.Unlock()
+		if n == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":{"message":"invalid request error","type":"invalid_request_error"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, contSSE(fmt.Sprintf("resp_store_%d", n), "OK"))
+	}))
+	defer upstream.Close()
+
+	srv, st := newTestServer(t)
+	newContinuationProvider(t, st, upstream.URL, model.ContinuationOn)
+
+	// 与 contBody 相同，只是客户端一开始就把 store 写成 true。
+	body := func(input ...any) string {
+		raw, err := json.Marshal(map[string]any{
+			"model":  "test-model",
+			"input":  input,
+			"store":  true,
+			"stream": true,
+		})
+		if err != nil {
+			t.Fatalf("构造请求体失败: %v", err)
+		}
+		return string(raw)
+	}
+
+	user1 := contUser("hello")
+	if rec := postContinuation(t, srv, body(user1), "client-store"); rec.Code != http.StatusOK {
+		t.Fatalf("首轮应 200，实际 %d", rec.Code)
+	}
+	input2 := []any{user1, contAssistant("OK"), contUser("again")}
+	if rec := postContinuation(t, srv, body(input2...), "client-store"); rec.Code != http.StatusOK {
+		t.Fatalf("回退后应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	if len(bodies) != 3 {
+		t.Fatalf("应发生一次回退（3 次上游调用），实际 %d", len(bodies))
+	}
+	b3 := parseContBody(t, bodies[2])
+	mu.Unlock()
+	if b3["store"] != true {
+		t.Errorf("客户端本来就带 store:true，回退报文应保持，实际 %#v", b3["store"])
+	}
+	if _, ok := b3["previous_response_id"]; ok {
+		t.Error("回退不应带 previous_response_id")
+	}
+	if ids := contChainIDs(srv); len(ids) != 1 || ids[0] != "resp_store_3" {
+		t.Errorf("回退成功后应按客户端的 store:true 重建链到 resp_store_3，实际 %v", ids)
 	}
 }
 
@@ -804,7 +892,9 @@ func TestContinuationZeroInvalidCooldownReseeds(t *testing.T) {
 		t.Fatalf("应记 fallback/invalid-id，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
 	}
 
-	// 冷却为 0：同一 scope 的下一轮应立刻 seed（store:true + 全量），不是 unsupported。
+	// 冷却为 0：同一 scope 的下一轮应立刻重建（store:true + 全量），不是 unsupported。
+	// 回退那次已经补回 store:true 并建了链，所以这一轮是「链在但接不上」
+	// （input 没有新增项），记 prefix-mismatch；关键是仍然发全量 + store:true。
 	if rec := postContinuation(t, srv, contBody(true, input2...), "zero-cool"); rec.Code != http.StatusOK {
 		t.Fatalf("冷却 0 的下一轮应 200，实际 %d", rec.Code)
 	}
@@ -823,8 +913,8 @@ func TestContinuationZeroInvalidCooldownReseeds(t *testing.T) {
 	if got := contInput(t, b4); len(got) != 3 {
 		t.Errorf("重新建链应发全量 3 项，实际 %d", len(got))
 	}
-	if log := lastLog(t, st); log.ContinuationMode != "seed" || log.ContinuationReason != "no-chain" {
-		t.Errorf("应记 seed/no-chain，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
+	if log := lastLog(t, st); log.ContinuationMode != "seed" || log.ContinuationReason != "prefix-mismatch" {
+		t.Errorf("应记 seed/prefix-mismatch，实际 %s/%s", log.ContinuationMode, log.ContinuationReason)
 	}
 }
 
@@ -1072,15 +1162,157 @@ func TestContinuationSkippedNoSession(t *testing.T) {
 func TestContinuationFailReleasesActive(t *testing.T) {
 	m := newContinuationManager()
 	m.mu.Lock()
-	m.active["chain"] = 7
+	m.activeCount["chain"] = 1
 	m.generations["chain"] = 7
 	m.mu.Unlock()
 
 	m.fail(&continuationAttempt{chainKey: "chain", generation: 7})
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.active) != 0 || len(m.generations) != 0 {
-		t.Errorf("失败后应释放 active/generation，实际 active=%v generations=%v", m.active, m.generations)
+	if len(m.activeCount) != 0 || len(m.generations) != 0 {
+		t.Errorf("失败后应释放占用，实际 activeCount=%v generations=%v", m.activeCount, m.generations)
+	}
+}
+
+// 同一分支并发两个请求时，占用必须按次数计：先结束的那个不能把后一个的
+// 占用一起清掉，否则第三个请求会在前两个都没结束时也进来续传。
+func TestContinuationActiveCountReleasesPerRequest(t *testing.T) {
+	m := newContinuationManager()
+	m.mu.Lock()
+	m.activeCount["branch"] = 2
+	m.generations["branch"] = 9
+	m.mu.Unlock()
+
+	// 先结束的旧请求（gen 7）：计数减一，仍被占用，最新 generation 留着。
+	m.fail(&continuationAttempt{branchKey: "branch", generation: 7})
+	m.mu.Lock()
+	if m.activeCount["branch"] != 1 {
+		t.Errorf("还有一个请求在飞时计数应为 1，实际 %d", m.activeCount["branch"])
+	}
+	if m.generations["branch"] != 9 {
+		t.Errorf("早结束的请求不该清掉最新 generation，实际 %d", m.generations["branch"])
+	}
+	m.mu.Unlock()
+
+	// 后结束的请求（gen 9）：归零后两条记录一起清掉。
+	m.fail(&continuationAttempt{branchKey: "branch", generation: 9})
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.activeCount) != 0 || len(m.generations) != 0 {
+		t.Errorf("归零后应清理，实际 activeCount=%v generations=%v", m.activeCount, m.generations)
+	}
+}
+
+// prepare 的判定要按「该分支还有几个请求在飞」来看：后到的那次先结束，
+// 不能把先到的那次还在占用的分支放行给第三个请求。
+func TestContinuationPrepareBlocksWhileAnyInflight(t *testing.T) {
+	m := newContinuationManager()
+	prov := model.Provider{ID: 1, APIFormat: model.FormatResponses, ContinuationMode: model.ContinuationOn}
+	raw := contBody(true, contUser("hello"))
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+	r.Header.Set("X-Session-Id", "inflight-session")
+
+	newInput := func() *forwardInput {
+		return &forwardInput{
+			provider:     prov,
+			upstreamPath: "/v1/responses",
+			model:        "test-model",
+			outBody:      []byte(raw),
+		}
+	}
+	key := model.APIKey{ID: "k1", Key: "sk-test"}
+
+	first := m.prepare(newInput(), r, key)
+	if first == nil || first.mode != "seed" {
+		t.Fatalf("首个请求应建链（seed），实际 %+v", first)
+	}
+	second := m.prepare(newInput(), r, key)
+	if second.reason != "active-inflight" {
+		t.Fatalf("同分支第二个请求应记为 active-inflight，实际 %q", second.reason)
+	}
+
+	// 后到的先结束：分支仍被第一个请求占着，第三个请求不能进来续传。
+	m.fail(second)
+	third := m.prepare(newInput(), r, key)
+	if third.reason != "active-inflight" {
+		t.Errorf("先到的请求还在飞时，第三个请求应仍是 active-inflight，实际 %q", third.reason)
+	}
+	m.fail(third)
+
+	// 全部结束且没有任何链提交过：退化为 no-chain，而不是继续被占住。
+	m.fail(first)
+	fourth := m.prepare(newInput(), r, key)
+	if fourth.reason != "no-chain" {
+		t.Errorf("占用释放后应回到 no-chain，实际 %q", fourth.reason)
+	}
+	m.fail(fourth)
+}
+
+// continuationRetryBody 里「id 失效」与「参数不支持」是两条独立判据。
+// 早期实现把 invalid 判在 failure 之后，于是只报 invalid 的响应永远走不到
+// 那个分支：客户端直接吃 400，续传也不会被关掉。
+func TestContinuationRetryBodyJudgement(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		mode   string
+		retry  bool
+		reason string
+	}{
+		{
+			name:   "只提 invalid 不提 unsupported",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"previous_response_id is invalid"}}`,
+			retry:  true, reason: "invalid-id",
+		},
+		{
+			name:   "过期但没提 unsupported",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"response id has expired"}}`,
+			retry:  true, reason: "invalid-id",
+		},
+		{
+			name:   "store 不被支持",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"store is unsupported on this route"}}`,
+			retry:  true, reason: "provider-rejected",
+		},
+		{
+			name:   "native responses 提示",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"store: stored responses require a native Responses target"}}`,
+			retry:  true, reason: "provider-rejected",
+		},
+		{
+			name:   "与续传无关的报错",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"model not available"}}`,
+			retry:  false,
+		},
+		{
+			name:   "续传相关但两类关键字都没有",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"bad request with previous_response_id"}}`,
+			retry:  false,
+		},
+		{
+			name:   "503 一律回退",
+			status: http.StatusServiceUnavailable,
+			body:   `{}`,
+			retry:  true, reason: "provider-rejected",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			retry, reason := continuationRetryBody(tc.status, []byte(strings.ToLower(tc.body)), tc.mode)
+			if retry != tc.retry {
+				t.Fatalf("retry 应为 %v，实际 %v（reason=%q）", tc.retry, retry, reason)
+			}
+			if tc.reason != "" && reason != tc.reason {
+				t.Errorf("reason 应为 %q，实际 %q", tc.reason, reason)
+			}
+		})
 	}
 }
 

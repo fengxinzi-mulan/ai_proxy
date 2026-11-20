@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 
@@ -145,12 +146,18 @@ func getMap(root any, path string) (map[string]any, bool) {
 }
 
 // decodeJSONObject 用 UseNumber 解析，避免大整数被转成 float64 丢精度。
+//
+// 解析出 nil map 时返回错误：JSON 的 `null` 会成功解成 nil map，而调用方
+// 拿到它再读键就会 panic。把「不是对象」当成解析失败，调用方只需处理 error。
 func decodeJSONObject(body []byte) (map[string]any, error) {
 	dec := json.NewDecoder(strings.NewReader(string(body)))
 	dec.UseNumber()
 	var m map[string]any
 	if err := dec.Decode(&m); err != nil {
 		return nil, err
+	}
+	if m == nil {
+		return nil, errors.New("JSON 不是对象")
 	}
 	return m, nil
 }
@@ -214,10 +221,15 @@ func extractUsageFromObject(format model.APIFormat, cu *model.CustomUsageMapping
 		}
 		u.Found = true
 		u.PromptTokens, _ = getPath(usage, "promptTokenCount")
+		u.ReasoningTokens, _ = getPath(usage, "thoughtsTokenCount")
+		// Gemini 的 candidatesTokenCount 只算候选输出，不含思考 token；
+		// 统一口径要求 CompletionTokens 含思维链，所以在这里加回去。
+		// 不加的话 normalize 会把 ReasoningTokens 收敛到 CompletionTokens
+		// 以内，思考 token 直接丢失，TPS 会算得偏低。
 		u.CompletionTokens, _ = getPath(usage, "candidatesTokenCount")
+		u.CompletionTokens += u.ReasoningTokens
 		u.TotalTokens, _ = getPath(usage, "totalTokenCount")
 		u.CachedTokens, _ = getPath(usage, "cachedContentTokenCount")
-		u.ReasoningTokens, _ = getPath(usage, "thoughtsTokenCount")
 		// Gemini 的 promptTokenCount 已含 cachedContentTokenCount，无需补齐。
 
 	case model.FormatCustom:

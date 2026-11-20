@@ -775,6 +775,81 @@ func TestTrimExcessImagesBatchLargerThanMaxDoesNotPanic(t *testing.T) {
 	}
 }
 
+// classifyImagePart 要认 {"type":"image_data"}：部分网关与图片生成接口用这个
+// 类型名，认不出来就会漏掉裁剪，会话攒够上限后被上游硬拒。
+func TestTrimExcessImagesCountsImageDataType(t *testing.T) {
+	part := func() map[string]any {
+		return map[string]any{
+			"type":       "image_data",
+			"image_data": "data:image/png;base64,iVBORw0KGgo=",
+		}
+	}
+	parts := []any{part(), part(), part()}
+	body := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": parts},
+	}}
+	if n := trimExcessImages(body, 2, 0); n != 1 {
+		t.Errorf("image_data 类型应计入图片张数，3 张上限 2 时应裁 1 张，实际 %d", n)
+	}
+
+	// 简写形态（不带 type）同样要认。
+	shorthand := []any{
+		map[string]any{"image_data": "data:image/png;base64,iVBORw0KGgo="},
+		map[string]any{"image_data": "data:image/png;base64,iVBORw0KGgo="},
+	}
+	body2 := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": shorthand},
+	}}
+	if n := trimExcessImages(body2, 1, 0); n != 1 {
+		t.Errorf("image_data 简写应计入图片张数，2 张上限 1 时应裁 1 张，实际 %d", n)
+	}
+}
+
+// tools / tool_choice / response_format / metadata 是请求配置，不是对话内容。
+// 里面的图片（例如 JSON Schema 的 anyOf 分支）被换成占位文本会让上游直接判
+// 非法，而它们本来也不计入上游的图片张数。
+func TestTrimExcessImagesSkipsNonConversationFields(t *testing.T) {
+	configPart := func() map[string]any {
+		return map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": "https://example.com/schema.png"},
+		}
+	}
+	messagePart := func() map[string]any {
+		return map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": "data:image/png;base64,iVBORw0KGgo="},
+		}
+	}
+
+	for _, field := range []string{"tools", "tool_choice", "response_format", "metadata"} {
+		t.Run(field, func(t *testing.T) {
+			body := map[string]any{
+				"messages": []any{map[string]any{"role": "user", "content": []any{
+					messagePart(), messagePart(), messagePart(),
+				}}},
+				// 数组元素里嵌一层数组，正是工具 schema 里 anyOf / oneOf 的形状。
+				field: []any{map[string]any{"anyOf": []any{configPart(), configPart()}}},
+			}
+			before, err := json.Marshal(body[field])
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if n := trimExcessImages(body, 2, 0); n != 1 {
+				t.Fatalf("只该裁 messages 里的 1 张，实际 %d", n)
+			}
+			after, err := json.Marshal(body[field])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Errorf("%s 不该被裁剪改动: %s", field, after)
+			}
+		})
+	}
+}
+
 func TestLooksLikeItHasImages(t *testing.T) {
 	cases := []struct {
 		name string

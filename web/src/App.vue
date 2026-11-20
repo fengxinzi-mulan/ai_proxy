@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 import {
   NConfigProvider,
@@ -20,6 +20,7 @@ import {
   NCheckbox,
   NSpin,
   NResult,
+  NAlert,
   NModal,
   NInput,
   NIcon,
@@ -99,11 +100,17 @@ const providerOptions = computed(() =>
 )
 const selectedProvider = computed(() => store.activeProvider?.id ?? null)
 const switching = ref(false)
+const providerSwitchError = ref('')
 
 async function onProviderChange(id: number) {
   switching.value = true
+  providerSwitchError.value = ''
   try {
     await store.activate(id)
+  } catch (e) {
+    // useMessage 在 App 的 setup 里取不到（provider 由本组件模板渲染），
+    // 所以错误落在顶栏下方的提示条上，而不是静默失败。
+    providerSwitchError.value = e instanceof Error ? e.message : String(e)
   } finally {
     switching.value = false
   }
@@ -125,7 +132,7 @@ function onCollapseToggle(v: boolean) {
   collapsed.value = v
 }
 
-const { connected, reconnect } = useEvents({
+const { connected } = useEvents({
   onLog: () => {
     // 日志页与实时页各自订阅，这里只维护顶栏的进行中数量。
   },
@@ -137,6 +144,13 @@ const { connected, reconnect } = useEvents({
   },
   onSettingsChanged: (s) => {
     store.settings = s
+    // 别的客户端（另一个标签页/桌面端）改了访问密钥：本地必须跟上，
+    // 否则本页后续请求与 SSE 会一直 401。只在值确实变化时重建连接。
+    const next = s.accessKey ?? ''
+    if (next !== getAccessKey()) {
+      setAccessKey(next)
+      store.bumpAuthVersion()
+    }
   },
   onUpdate: onUpdateEvent,
   onDesktopCloseAsk: showCloseAsk,
@@ -154,14 +168,25 @@ const themeLabel = computed(() => {
 
 onMounted(async () => {
   store.applyTheme()
-  store.watchSystemTheme()
+  // 主题与窗口宽度监听都记下取消函数：热更新与实例重建时不摘监听会叠成多份回调。
+  offSystemTheme = store.watchSystemTheme()
   updateAutoCollapse()
   window.addEventListener('resize', updateAutoCollapse)
   await store.bootstrap()
+  // 更新状态是 bootstrap 之后单独拉的：等它回来再判断页面加载时是否正在安装，
+  // 否则错过那次 SSE 事件后，弹框永远不出现。
+  void store.loadUpdate().then(() => updateDialogRef.value?.syncInstalling())
   if (store.error === '访问密钥无效' || store.error.includes('密钥')) {
     promptForKey()
   }
 })
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', updateAutoCollapse)
+  offSystemTheme?.()
+})
+
+let offSystemTheme: (() => void) | undefined
 
 /** 访问密钥失效时弹出输入框，避免用户卡在空白页。 */
 const keyDialog = ref(false)
@@ -177,8 +202,9 @@ function submitKey() {
   keyDialog.value = false
   void store.bootstrap()
   // 页面加载时还没有密钥，实时通道当时是被拒的；EventSource 遇到非 2xx 不会自动重连，
-  // 所以这里必须把它整个重建一次，否则顶栏会一直显示「实时断开」。
-  reconnect()
+  // 所以必须重建连接。走 store 的版本号而不是本地 reconnect：日志页等其它订阅方
+  // 也各自持有一条 EventSource，只重连这一条等于把它们留在 401 上。
+  store.bumpAuthVersion()
 }
 
 /* ---------- 桌面关闭确认 ---------- */
@@ -375,6 +401,16 @@ const routeTitle = computed(() => String(route.meta.title ?? 'AI Proxy'))
               </NLayoutHeader>
 
               <NLayoutContent class="content" :native-scrollbar="false">
+                <NAlert
+                  v-if="providerSwitchError"
+                  type="error"
+                  closable
+                  :bordered="false"
+                  class="switch-error"
+                  @close="providerSwitchError = ''"
+                >
+                  切换供应商失败：{{ providerSwitchError }}
+                </NAlert>
                 <div v-if="store.loading && !store.settings" class="center">
                   <NSpin size="large" />
                 </div>
@@ -694,6 +730,11 @@ const routeTitle = computed(() => String(route.meta.title ?? 'AI Proxy'))
 
 .content {
   padding: 20px 24px;
+}
+
+.switch-error {
+  margin-bottom: var(--space-3, 12px);
+  font-size: var(--text-xs);
 }
 
 .center {

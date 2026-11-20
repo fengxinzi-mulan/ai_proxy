@@ -124,7 +124,9 @@ type Manager struct {
 	restart       func() error
 	// fetch 拉取最新发布。默认是 fetchLatest；测试注入假实现，
 	// 这样不必为了跑单测去改包级常量或真的联网。
-	fetch func(*http.Client, string, string) (Release, error)
+	// ctx 必须一路带到 http.Request 上，否则界面点了「取消」或服务关停后
+	// 这个请求还会自己跑到超时。
+	fetch func(context.Context, *http.Client, string, string) (Release, error)
 
 	mu    sync.Mutex
 	state State
@@ -279,6 +281,12 @@ func (m *Manager) client() (*http.Client, error) {
 //
 // 返回的 error 只用于日志与界面提示，调用方不该因为它阻断任何主流程。
 func (m *Manager) Check(ctx context.Context, force bool) (State, error) {
+	// 安装流程进行中不要碰 State：Phase/Progress 归 Install 推进，
+	// 这里一覆盖就会出现「进度条跑着跑着跳回 idle」或者把失败原因抹掉。
+	if m.Installing() {
+		return m.State(), nil
+	}
+
 	p := m.loadPersist()
 	if !force && p.LastCheckAt != "" {
 		if last, err := time.Parse(time.RFC3339, p.LastCheckAt); err == nil {
@@ -301,9 +309,15 @@ func (m *Manager) Check(ctx context.Context, force bool) (State, error) {
 		return m.fail("初始化网络连接失败: " + err.Error())
 	}
 
-	rel, err := m.fetch(client, m.repo, m.current)
+	rel, err := m.fetch(ctx, client, m.repo, m.current)
 	if err != nil {
 		return m.fail(err.Error())
+	}
+
+	// 拉取期间用户点了「立即更新」：此时 State 已经属于 Install，
+	// 再把检查结果写回去会把下载进度顶掉。
+	if m.Installing() {
+		return m.State(), nil
 	}
 
 	asset, hasAsset := rel.AssetByName(m.assetName())
@@ -381,6 +395,10 @@ func (m *Manager) restoreFromPersist(p persist) {
 
 // fail 记录失败并返回当前状态。
 func (m *Manager) fail(msg string) (State, error) {
+	// 安装期间失败原因由 Install 负责写，这里不能把它覆盖掉。
+	if m.Installing() {
+		return m.State(), errors.New(msg)
+	}
 	m.setState(func(s *State) {
 		s.Phase = PhaseFailed
 		s.Error = msg
@@ -413,6 +431,17 @@ func (m *Manager) ClearSkip() State {
 	return m.State()
 }
 
+// fetchReleaseForInstall 在安装流程内补拉一次 release 元数据。
+//
+// 只取 Release，不写 State：安装期间 Phase/Progress 归 Install 推进。
+func (m *Manager) fetchReleaseForInstall(ctx context.Context) (Release, error) {
+	client, err := m.client()
+	if err != nil {
+		return Release{}, err
+	}
+	return m.fetch(ctx, client, m.repo, m.current)
+}
+
 // Installing 报告安装流程是否正在进行。
 func (m *Manager) Installing() bool {
 	m.mu.Lock()
@@ -440,10 +469,10 @@ func (m *Manager) Install(ctx context.Context) error {
 
 	st := m.State()
 	if !st.HasUpdate {
-		return errors.New("当前没有可安装的新版本")
+		return m.installFail("当前没有可安装的新版本")
 	}
 	if !st.CanAutoInstall {
-		return errors.New("当前形态不支持自动安装，请手动下载")
+		return m.installFail("当前形态不支持自动安装，请手动下载")
 	}
 
 	// 复用最近一次检查的结果；没有（例如刚重启）就现查一次。
@@ -451,12 +480,16 @@ func (m *Manager) Install(ctx context.Context) error {
 	rel := m.latest
 	m.mu.Unlock()
 	if rel.Tag == "" {
-		var err error
-		if _, err = m.Check(ctx, true); err != nil {
-			return err
+		// 不能走 Check：安装期间它刻意不碰 State、直接返回，m.latest 会一直是
+		// 空的 —— 重启后从持久化恢复的状态只带 HasUpdate，用户点「立即更新」
+		// 就必然报「发布里没有找到 ai_proxy-desktop.exe」。这里只补拉 Release。
+		fetched, err := m.fetchReleaseForInstall(ctx)
+		if err != nil {
+			return m.installFail("重新获取发布信息失败: " + err.Error())
 		}
+		rel = fetched
 		m.mu.Lock()
-		rel = m.latest
+		m.latest = rel
 		m.mu.Unlock()
 	}
 
@@ -542,7 +575,13 @@ func (m *Manager) download(ctx context.Context, client *http.Client, rel Release
 		return "", err
 	}
 	req.Header.Set("User-Agent", "ai-proxy/"+m.current)
-	resp, err := client.Do(req)
+	// 客户端是按普通 API 请求配的（15～30 秒全局 Timeout），对几十 MB 的
+	// 升级包来说太短：慢网下下载一定会在中途被当成失败，重试也永远装不完。
+	// 这里浅拷贝一份并关掉它的硬超时，改由调用方传入的 ctx（10 分钟）兜底。
+	client = clientOrDefault(client)
+	dl := *client
+	dl.Timeout = 0
+	resp, err := dl.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("下载失败: %w", err)
 	}
@@ -595,7 +634,7 @@ func (m *Manager) download(ctx context.Context, client *http.Client, rel Release
 	want := normalizeDigest(asset.Digest)
 	if want == "" {
 		if sumsAsset, ok := rel.AssetByName(assetSums); ok {
-			if got, err := fetchChecksums(client, sumsAsset, m.current); err == nil {
+			if got, err := fetchChecksums(ctx, client, sumsAsset, m.current); err == nil {
 				want = got[asset.Name]
 			} else {
 				m.logger.Warn("下载校验文件失败", "err", err)
@@ -623,9 +662,17 @@ func (m *Manager) dataDir() string {
 	return m.store.DataDir()
 }
 
+// clientOrDefault 兜住注入的 ClientFactory 返回 (nil, nil) 的情况。
+func clientOrDefault(client *http.Client) *http.Client {
+	if client == nil {
+		return &http.Client{}
+	}
+	return client
+}
+
 // fetchChecksums 下载并解析 SHA256SUMS.txt。
-func fetchChecksums(client *http.Client, asset Asset, version string) (map[string]string, error) {
-	req, err := http.NewRequest(http.MethodGet, asset.URL, nil)
+func fetchChecksums(ctx context.Context, client *http.Client, asset Asset, version string) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.URL, nil)
 	if err != nil {
 		return nil, err
 	}

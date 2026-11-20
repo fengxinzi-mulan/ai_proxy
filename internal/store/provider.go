@@ -28,7 +28,7 @@ const providerColumns = `id, name, display_name, remark, enabled, active, sort_o
 	proxy_mode, proxy_json, prompt_mode, prompt_json, prompt_rules_json,
 	model_map_json, continuation_mode, continuation_models_json,
 	continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
-	usage_inject_mode, strip_usage_chunk, strip_unsupported_params, prompt_cache_key_mode,
+	usage_inject_mode, strip_usage_chunk, strip_unsupported_params, replay_reasoning_as_think_chunk, prompt_cache_key_mode,
 	max_images_per_request, image_trim_batch,
 	custom_usage_json, usage_query_json, usage_account, usage_password, tags_json,
 	created_at, updated_at`
@@ -105,12 +105,17 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 	p.ApplyDefaults()
 	now := time.Now()
 	p.CreatedAt, p.UpdatedAt = now, now
+	p.Name = NormalizeProviderName(p.Name)
 	if p.Name == "" {
 		return p, ErrEmptyName
 	}
 	if p.DisplayName == "" {
 		p.DisplayName = p.Name
 	}
+	wantActive := p.Active
+	// 插入时一律先写 active=0，避免与已有 active=1 冲突产生多条生效记录；
+	// 确实需要激活时在下方通过事务性的 ActivateProvider 统一切换。
+	p.Active = false
 
 	keysJSON, headersJSON, rulesJSON, modelMapJSON, tagsJSON, proxyJSON, promptJSON, customUsageJSON, usageQueryJSON, contModelsJSON, err := marshalProviderParts(p)
 	if err != nil {
@@ -125,12 +130,12 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		proxy_mode, proxy_json, prompt_mode, prompt_json, prompt_rules_json,
 		model_map_json, continuation_mode, continuation_models_json,
 		continuation_cooldown_seconds, continuation_invalid_cooldown_seconds,
-		usage_inject_mode, strip_usage_chunk, strip_unsupported_params, prompt_cache_key_mode,
+		usage_inject_mode, strip_usage_chunk, strip_unsupported_params, replay_reasoning_as_think_chunk, prompt_cache_key_mode,
 		max_images_per_request, image_trim_batch,
 		custom_usage_json, usage_query_json, usage_account, usage_password, tags_json,
 		created_at, updated_at
-	) VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)`,
-		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), boolToInt(p.Active), p.SortOrder,
+	) VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?)`,
+		p.Name, p.DisplayName, p.Remark, boolToInt(p.Enabled), 0, p.SortOrder,
 		p.BaseURL, string(p.APIFormat), p.CustomPath, p.AuthHeader, p.AuthPrefix,
 		keysJSON, headersJSON,
 		p.TimeoutSeconds, p.ConnectTimeoutSeconds, boolToInt(p.InsecureSkipTLS),
@@ -138,7 +143,7 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 		modelMapJSON, p.ContinuationMode, contModelsJSON,
 		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), boolToInt(p.StripUnsupportedParams),
-		p.PromptCacheKeyMode,
+		boolToInt(p.ReplayReasoningAsThinkChunk), p.PromptCacheKeyMode,
 		p.MaxImagesPerRequest,
 		p.ImageTrimBatch,
 		customUsageJSON, usageQueryJSON, p.UsageQuery.Account, p.UsageQuery.Password, tagsJSON,
@@ -156,9 +161,10 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 	}
 	p.ID = id
 
-	// 第一个创建的供应商自动成为「当前生效」。
+	// 第一个创建的供应商自动成为「当前生效」；调用方显式要求 active 时同样走原子切换。
 	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM providers`).Scan(&count); err == nil && count == 1 {
+	firstProvider := s.db.QueryRow(`SELECT COUNT(*) FROM providers`).Scan(&count) == nil && count == 1
+	if firstProvider || wantActive {
 		if err := s.ActivateProvider(id); err != nil {
 			return p, err
 		}
@@ -170,6 +176,13 @@ func (s *Store) CreateProvider(p model.Provider) (model.Provider, error) {
 // UpdateProvider 全量覆盖供应商配置。
 func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 	p.ApplyDefaults()
+	p.Name = NormalizeProviderName(p.Name)
+	if p.Name == "" {
+		return p, ErrEmptyName
+	}
+	if p.DisplayName == "" {
+		p.DisplayName = p.Name
+	}
 	existing, err := s.GetProvider(p.ID)
 	if err != nil {
 		return p, err
@@ -193,7 +206,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		proxy_mode=?, proxy_json=?, prompt_mode=?, prompt_json=?, prompt_rules_json=?,
 		model_map_json=?, continuation_mode=?, continuation_models_json=?,
 		continuation_cooldown_seconds=?, continuation_invalid_cooldown_seconds=?,
-		usage_inject_mode=?, strip_usage_chunk=?, strip_unsupported_params=?, prompt_cache_key_mode=?,
+		usage_inject_mode=?, strip_usage_chunk=?, strip_unsupported_params=?, replay_reasoning_as_think_chunk=?, prompt_cache_key_mode=?,
 		max_images_per_request=?, image_trim_batch=?,
 		custom_usage_json=?, usage_query_json=?, usage_account=?, usage_password=?, tags_json=?,
 		updated_at=?
@@ -206,7 +219,7 @@ func (s *Store) UpdateProvider(p model.Provider) (model.Provider, error) {
 		modelMapJSON, p.ContinuationMode, contModelsJSON,
 		p.ContinuationCooldownSeconds, p.ContinuationInvalidCooldownSeconds,
 		p.UsageInjectMode, boolToInt(p.StripUsageChunk), boolToInt(p.StripUnsupportedParams),
-		p.PromptCacheKeyMode,
+		boolToInt(p.ReplayReasoningAsThinkChunk), p.PromptCacheKeyMode,
 		p.MaxImagesPerRequest, p.ImageTrimBatch,
 		customUsageJSON, usageQueryJSON, p.UsageQuery.Account, p.UsageQuery.Password, tagsJSON,
 		tsToDB(p.UpdatedAt), p.ID,
@@ -348,7 +361,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 	var (
 		p                                        model.Provider
 		enabled, active, insecureTLS, stripUsage int
-		stripUnsupported                         int
+		stripUnsupported, replayThinkChunk       int
 		keysJSON, headersJSON, rulesJSON         string
 		modelMapJSON, tagsJSON, proxyJSON        string
 		contModelsJSON                           string
@@ -365,7 +378,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 		&p.ProxyMode, &proxyJSON, &p.PromptMode, &promptJSON, &rulesJSON,
 		&modelMapJSON, &p.ContinuationMode, &contModelsJSON,
 		&p.ContinuationCooldownSeconds, &p.ContinuationInvalidCooldownSeconds,
-		&p.UsageInjectMode, &stripUsage, &stripUnsupported, &p.PromptCacheKeyMode,
+		&p.UsageInjectMode, &stripUsage, &stripUnsupported, &replayThinkChunk, &p.PromptCacheKeyMode,
 		&p.MaxImagesPerRequest, &p.ImageTrimBatch,
 		&customUsageJSON, &usageQueryJSON, &p.UsageQuery.Account, &p.UsageQuery.Password, &tagsJSON,
 		&createdAt, &updatedAt,
@@ -382,6 +395,7 @@ func scanProvider(sc rowScanner) (model.Provider, error) {
 	p.InsecureSkipTLS = insecureTLS == 1
 	p.StripUsageChunk = stripUsage == 1
 	p.StripUnsupportedParams = stripUnsupported == 1
+	p.ReplayReasoningAsThinkChunk = replayThinkChunk == 1
 	p.APIFormat = model.APIFormat(apiFormat)
 
 	// 任何一段 JSON 坏掉都不应让整个列表读不出来，因此逐段容错。

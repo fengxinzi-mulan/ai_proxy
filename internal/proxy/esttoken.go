@@ -19,10 +19,16 @@ import (
 
 // estimateTokens 估算一段文本的 token 数。
 func estimateTokens(s string) int {
-	if s == "" {
-		return 0
-	}
-	var wide, narrow int
+	wide, narrow := tokenClassCounts(s)
+	return wide + (narrow+3)/4
+}
+
+// tokenClassCounts 把文本拆成「按字计数」与「按 4 字符计数」两类字符数。
+//
+// 拆成原始计数而不是每段各自估算再加总：流式响应是一个片段一个片段喂进来的，
+// 每段都自己 (narrow+3)/4 会把每段的零头都向上取整，一段一个 token 地累积
+// 膨胀，短片段多时估出来的输出量能高出一大截。
+func tokenClassCounts(s string) (wide, narrow int) {
 	for _, r := range s {
 		if isWideRune(r) {
 			wide++
@@ -30,7 +36,7 @@ func estimateTokens(s string) int {
 			narrow++
 		}
 	}
-	return wide + (narrow+3)/4
+	return wide, narrow
 }
 
 // isWideRune 判断是否属于按字计数的表意文字区段。
@@ -67,7 +73,15 @@ func estimatePromptTokens(format model.APIFormat, body []byte) int {
 		messages = appendGeminiContents(obj["contents"], &sb)
 	case model.FormatResponses:
 		appendTextValue(obj["instructions"], &sb)
-		messages = appendMessages(obj["input"], &sb)
+		// Responses 的 input 既可以是消息数组，也可以是一整段字符串
+		// （{"input":"你好"} 是最简写法，probe 里也用它）。字符串形式
+		// 不处理就会把全部输入算成 0。
+		if text, ok := obj["input"].(string); ok {
+			sb.WriteString(text)
+			messages = 1
+		} else {
+			messages = appendMessages(obj["input"], &sb)
+		}
 		if messages == 0 {
 			messages = appendMessages(obj["messages"], &sb)
 		}
